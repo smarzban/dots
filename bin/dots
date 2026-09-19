@@ -15,13 +15,16 @@ DOTS_DATA=${DOTS_DATA_DIR:-"$DOTS_HOME/.local/share/dots"}
 REPO="$DOTS_DATA/repo.git"
 GIT=${DOTS_GIT:-/usr/bin/git}
 GITLEAKS=${DOTS_GITLEAKS:-gitleaks}
+GH=${DOTS_GH:-gh}
+DEFAULT_REMOTE=${DOTS_DEFAULT_REMOTE:-https://github.com/smarzban/dotfiles.git}
+DEFAULT_GITHUB_REPO=${DOTS_DEFAULT_GITHUB_REPO:-smarzban/dotfiles}
 MANIFEST=.config/dots/manifest
 
 say() { printf '%s\n' "$*"; }
 fail() { printf 'dots: %s\n' "$*" >&2; exit 1; }
 usage() { cat <<'EOF'
 Usage:
-  dots init <remote> [branch]
+  dots init [remote] [branch]
   dots status
   dots sync
 EOF
@@ -264,6 +267,44 @@ ensure_identity() {
   git_repo var GIT_AUTHOR_IDENT >/dev/null 2>&1 || return 1
 }
 
+# A newly created remote needs one safe, versioned object before init can validate it.
+# This is metadata bootstrap, not a configuration template or an import of HOME.
+seed_new_repository() {
+  remote=$1
+  branch=$2
+  seed=$3
+  "$GIT" init --quiet "$seed" || return 1
+  "$GIT" -C "$seed" config user.name "dots bootstrap" || return 1
+  "$GIT" -C "$seed" config user.email "dots@local.invalid" || return 1
+  mkdir -p "$seed/.config/dots" || return 1
+  : >"$seed/$MANIFEST" || return 1
+  "$GIT" -C "$seed" add -- "$MANIFEST" || return 1
+  "$GIT" -C "$seed" commit --quiet -m "Initialize dots manifest" || return 1
+  "$GIT" -C "$seed" branch -M "$branch" || return 1
+  "$GIT" -C "$seed" remote add origin "$remote" || return 1
+  "$GIT" -C "$seed" push --quiet origin "HEAD:refs/heads/$branch"
+}
+
+create_default_github_repository() {
+  remote=$1
+  branch=$2
+  temp=$3
+  test "$remote" = "$DEFAULT_REMOTE" || return 1
+  require_tool "$GH"
+  "$GH" auth status >/dev/null 2>&1 || fail "GitHub CLI is not authenticated; run gh auth login or initialize an existing remote"
+  if "$GH" repo view "$DEFAULT_GITHUB_REPO" --json nameWithOwner >/dev/null 2>&1; then
+    fail "could not clone the existing default repository; check network access and permissions"
+  fi
+  test -t 0 && test -t 1 || fail "default repository is missing; rerun dots init from an interactive terminal to create it"
+  printf 'GitHub repository %s is unavailable. Create it privately with an empty dots manifest? [y/N] ' "$DEFAULT_GITHUB_REPO" >&2
+  IFS= read -r answer || fail "repository creation cancelled"
+  case $answer in y|Y|yes|YES) ;; *) say "init cancelled"; exit 0 ;; esac
+  "$GH" repo create "$DEFAULT_GITHUB_REPO" --private --description "Allowlisted dots configuration" >/dev/null 2>&1 || fail "could not create private GitHub repository $DEFAULT_GITHUB_REPO"
+  seed_new_repository "$remote" "$branch" "$temp/seed" || fail "repository was created but its initial manifest could not be pushed"
+  say "created private GitHub repository $DEFAULT_GITHUB_REPO"
+  return 0
+}
+
 check_new_tree_collisions() {
   base=$1
   candidate=$2
@@ -281,8 +322,8 @@ check_new_tree_collisions() {
 }
 
 init_command() {
-  test $# -ge 1 && test $# -le 2 || { usage >&2; exit 2; }
-  remote=$1
+  test $# -le 2 || { usage >&2; exit 2; }
+  remote=${1:-$DEFAULT_REMOTE}
   requested_branch=${2:-}
   test -n "$requested_branch" && safe_branch "$requested_branch"
   require_dependencies
@@ -300,14 +341,21 @@ init_command() {
   mkdir -p "$DOTS_DATA" || fail "cannot create data directory"
   temp=$(mktemp_dir); trap 'rm -rf "$temp"' EXIT HUP INT TERM
   candidate_repo=$temp/repo.git
-  "$GIT" clone --bare -- "$remote" "$candidate_repo" >/dev/null 2>&1 || fail "could not clone remote"
-  if test -n "$requested_branch"; then
-    branch=$requested_branch
-  else
+  # The no-argument default is a private GitHub repository. For a missing default,
+  # gh can create a minimal safe repository only after explicit confirmation.
+  branch=${requested_branch:-main}
+  safe_branch "$branch"
+  created_default=false
+  if ! "$GIT" clone --bare -- "$remote" "$candidate_repo" >/dev/null 2>&1; then
+    create_default_github_repository "$remote" "$branch" "$temp" || fail "could not clone remote"
+    created_default=true
+    "$GIT" clone --bare -- "$remote" "$candidate_repo" >/dev/null 2>&1 || fail "could not clone newly created remote"
+  fi
+  if test -z "$requested_branch" && test "$created_default" != true; then
     branch=$(git_dir "$candidate_repo" symbolic-ref --short HEAD 2>/dev/null || true)
     test -n "$branch" || fail "remote has no usable default branch; specify a branch"
+    safe_branch "$branch"
   fi
-  safe_branch "$branch"
   git_dir "$candidate_repo" fetch --no-tags origin "refs/heads/$branch:refs/heads/$branch" >/dev/null 2>&1 || fail "could not fetch requested branch"
   revision=$(git_dir "$candidate_repo" rev-parse "refs/heads/$branch" 2>/dev/null) || fail "requested branch has no revision"
   validate_tree "$candidate_repo" "$revision" "$temp/manifest-paths" "$temp" || fail "candidate manifest or repository tree is unsafe"

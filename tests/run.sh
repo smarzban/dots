@@ -60,6 +60,20 @@ remote_edit() {
   /usr/bin/git -C "$work" add -A && /usr/bin/git -C "$work" commit -qm edit && /usr/bin/git -C "$work" push -q origin main
 }
 
+make_mock_gh() {
+  MOCK_GH=$TMP/mock-gh
+  cat >"$MOCK_GH" <<'EOF'
+#!/bin/sh
+case "$1:$2" in
+  auth:status) exit 0 ;;
+  repo:view) exit 1 ;;
+  repo:create) /usr/bin/git init -q --bare "$DOTS_TEST_GH_REMOTE" ;;
+  *) exit 2 ;;
+esac
+EOF
+  chmod 755 "$MOCK_GH"
+}
+
 run_dots() {
   home=$1
   shift
@@ -73,7 +87,20 @@ run_sync() {
   (sleep 2; printf '%s' "$input") | HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid /usr/bin/script -q /dev/null /bin/sh -c "$DOTS sync"
 }
 
+run_default_init() {
+  home=$1
+  remote=$2
+  (sleep 2; printf 'y\n') | HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK DOTS_GH=$MOCK_GH DOTS_DEFAULT_REMOTE=$remote DOTS_DEFAULT_GITHUB_REPO=smarzban/dotfiles DOTS_TEST_GH_REMOTE=$remote GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid /usr/bin/script -q /dev/null /bin/sh -c "$DOTS init"
+}
+
+run_existing_default_init() {
+  home=$1
+  remote=$2
+  HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK DOTS_DEFAULT_REMOTE=$remote GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid "$DOTS" init
+}
+
 make_mock_gitleaks
+make_mock_gh
 chmod 755 "$DOTS"
 
 # Manifest attacks: traversal, globs, duplicates, controls, and symlink entries all fail before checkout.
@@ -92,6 +119,14 @@ remote=$TMP/symlink.git; new_remote "$remote"
 remote_edit "$remote" "ln -sf /tmp/x \"\$1/.gitconfig\"" || exit 1
 home=$TMP/home-symlink; mkdir -p "$home"
 if expect_fail run_dots "$home" init "$remote" main; then pass "symlink candidate refused"; else fail "symlink candidate refused"; fi
+
+# The default missing GitHub repository is explicitly confirmed, made private, and seeded only with its empty manifest.
+remote=$TMP/default-created.git; home=$TMP/home-default-created; mkdir -p "$home"
+if run_default_init "$home" "$remote" >/dev/null 2>&1 && test -f "$home/.config/dots/manifest" && /usr/bin/git --git-dir="$remote" show main:.config/dots/manifest >/dev/null; then pass "default GitHub repository creation"; else fail "default GitHub repository creation"; fi
+# An existing default uses its remote HEAD rather than assuming main.
+remote=$TMP/default-trunk.git; new_remote "$remote"; work=$TMP/default-trunk-work; /usr/bin/git clone -q "$remote" "$work"; /usr/bin/git -C "$work" branch -m main trunk; /usr/bin/git -C "$work" push -q origin trunk; /usr/bin/git --git-dir="$remote" symbolic-ref HEAD refs/heads/trunk
+home=$TMP/home-default-trunk; mkdir -p "$home"
+if expect_ok run_existing_default_init "$home" "$remote" && test "$(/usr/bin/git --git-dir="$home/data/repo.git" config --get dots.branch)" = trunk; then pass "existing default branch"; else fail "existing default branch"; fi
 
 # Initial collisions are never overwritten, and repeating a successful init is a no-op.
 remote=$TMP/collision.git; new_remote "$remote"; home=$TMP/home-collision; mkdir -p "$home/.config/example"; printf old >"$home/.config/example/settings"

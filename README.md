@@ -6,15 +6,15 @@ It is intentionally not a replacement for chezmoi or yadm. Snapshots, restore, c
 
 ## Install
 
-Copy the single executable, then ensure `~/.local/bin` is on your `PATH`:
+After a release is published, install the checksum-verified release asset:
 
 ```sh
-mkdir -p ~/.local/bin
-cp bin/dots ~/.local/bin/dots
-chmod 755 ~/.local/bin/dots
+curl -fsSL https://github.com/smarzban/dots/releases/latest/download/install.sh | sh
 ```
 
-The command never performs this installation itself. It requires `/usr/bin/git` and `gitleaks` at runtime. For commits and non-fast-forward merges, provide Git identity through `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL` or repository-local config, `git --git-dir="$HOME/.local/share/dots/repo.git" config user.name "Your Name"` (and `user.email`). `dots` deliberately ignores `$HOME/.gitconfig` while running Git, so a managed configuration file cannot alter its own operations.
+It installs `dots` to `~/.local/bin`; ensure that directory is on your `PATH`. To select a release or destination, set `DOTS_VERSION=v0.1.0` or `DOTS_BIN_DIR=/some/bin` before running the installer.
+
+The command requires `/usr/bin/git` and `gitleaks` at runtime. For commits and non-fast-forward merges, provide Git identity through `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL` or repository-local config, `git --git-dir="$HOME/.local/share/dots/repo.git" config user.name "Your Name"` (and `user.email`). `dots` deliberately ignores `$HOME/.gitconfig` while running Git, so a managed configuration file cannot alter its own operations.
 
 ## Repository model
 
@@ -28,7 +28,15 @@ A manifest contains one relative file path per line. Blank lines and `#` comment
 .config/example/settings.toml
 ```
 
-Start from a clean target home directory or move existing files out yourself:
+For the default private configuration repository, run this from a terminal:
+
+```sh
+dots init
+```
+
+If `smarzban/dotfiles` is missing and `gh` is available and authenticated, `dots` asks before creating that private repository. It seeds only an empty versioned manifest, then you can add approved paths to `.config/dots/manifest` and run `dots sync` to adopt their current contents. `gh` is optional for every other operation.
+
+You can also initialize an existing repository:
 
 ```sh
 dots init git@github.com:example/config.git main
@@ -36,7 +44,7 @@ dots status
 dots sync
 ```
 
-`init` clones into its private data location, validates the remote tree and manifest, scans it with gitleaks, and refuses any existing target collision before it checks out only approved paths. Running the same `init` again is a no-op. A different remote or branch is refused.
+An existing configuration repository must already contain a valid manifest. `init` clones into its private data location, validates the remote tree and manifest, scans it with gitleaks, and refuses any existing target collision before it checks out only approved paths. Running the same `init` again is a no-op. A different remote or branch is refused.
 
 `status` validates both the repository and live manifest, fetches only remote metadata for an accurate ahead/behind report, then reports only allowlisted files. It never runs an unscoped home-directory status.
 
@@ -47,6 +55,15 @@ dots sync
 Incoming paths, manifests, revision names, and filenames are treated as untrusted. Any invalid manifest/tree, symlink, unapproved tracked file, credential scan failure, collision, or unsafe parent fails closed without printing file contents or scanner findings.
 
 All checkable preflight happens before `$HOME` is changed. A disk, permission, or process failure while Git is actually checking out or merging can still interrupt multi-file filesystem changes, Git's normal recovery state is retained in that case. `gitleaks` reduces accidental secret commits, it is not a proof that a value is non-sensitive.
+
+## Publishing a release
+
+Maintainers tag the release commit, create the assets from that clean checkout, then upload `dist/dots`, `dist/dots.sha256`, and `dist/install.sh` to the matching GitHub release:
+
+```sh
+git tag v0.1.0
+scripts/package.sh v0.1.0
+```
 
 ## Verification
 
