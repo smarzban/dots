@@ -1,0 +1,419 @@
+#!/bin/bash
+# dots: intentionally small, allowlist-only dotfile synchronization.
+# Compatible with macOS /bin/bash 3.2.
+
+set -u
+umask 077
+# Never allow a Git pager to consume sync confirmation input on a terminal.
+GIT_PAGER='cat'
+# Do not let a managed $HOME/.gitconfig alter dots' own Git operations.
+GIT_CONFIG_GLOBAL=/dev/null
+export GIT_PAGER GIT_CONFIG_GLOBAL
+
+DOTS_HOME=${HOME:?HOME must be set}
+DOTS_DATA=${DOTS_DATA_DIR:-"$DOTS_HOME/.local/share/dots"}
+REPO="$DOTS_DATA/repo.git"
+GIT=${DOTS_GIT:-/usr/bin/git}
+GITLEAKS=${DOTS_GITLEAKS:-gitleaks}
+MANIFEST=.config/dots/manifest
+
+say() { printf '%s\n' "$*"; }
+fail() { printf 'dots: %s\n' "$*" >&2; exit 1; }
+usage() { cat <<'EOF'
+Usage:
+  dots init <remote> [branch]
+  dots status
+  dots sync
+EOF
+}
+
+require_tool() {
+  case $1 in
+    */*) test -x "$1" || fail "required dependency is unavailable: $1" ;;
+    *) command -v "$1" >/dev/null 2>&1 || fail "required dependency is unavailable: $1" ;;
+  esac
+}
+
+require_dependencies() {
+  require_tool "$GIT"
+  require_tool "$GITLEAKS"
+}
+
+git_repo() { "$GIT" --no-pager --git-dir="$REPO" --work-tree="$DOTS_HOME" "$@"; }
+git_dir() { "$GIT" --no-pager --git-dir="$1" "${@:2}"; }
+
+safe_branch() {
+  "$GIT" check-ref-format --branch "$1" >/dev/null 2>&1 || fail "invalid branch name"
+}
+
+mktemp_dir() {
+  mktemp -d "${TMPDIR:-/tmp}/dots.XXXXXX" || fail "cannot create temporary directory"
+}
+
+# A manifest is parsed into a private newline-delimited file. Paths cannot contain
+# controls, so this representation is unambiguous.
+validate_manifest_file() {
+  manifest_file=$1
+  out_file=$2
+  test -f "$manifest_file" && test ! -L "$manifest_file" || return 1
+  : >"$out_file" || return 1
+  while IFS= read -r line || test -n "$line"; do
+    case $line in ''|'#'*) continue ;; esac
+    printf '%s' "$line" | LC_ALL=C grep '[[:cntrl:]]' >/dev/null && return 1
+    case $line in
+      :*|.gitleaks.toml|/*|./*|*/|*'//'*|*'..'*|*'?'*|*'*'*|*'['*|*']'*|*'{'*|*'}'*) return 1 ;;
+    esac
+    # Reject a dot or dot-dot component, rather than accepting prefix lookalikes.
+    case "/$line/" in */./*|*/../*) return 1 ;; esac
+    # Spaces make review and shell output ambiguous. They are deliberately not v1 paths.
+    case $line in *' '*|*$'\t'*) return 1 ;; esac
+    grep -F -x -- "$line" "$out_file" >/dev/null 2>&1 && return 1
+    printf '%s\n' "$line" >>"$out_file" || return 1
+  done <"$manifest_file"
+  return 0
+}
+
+# Reject symlinked parents as well as a symlink at the final name. This prevents an
+# allowlisted relative path from escaping HOME through an existing parent link.
+safe_live_path() {
+  rel=$1
+  current=$DOTS_HOME
+  oldifs=$IFS
+  IFS=/
+  set -- $rel
+  IFS=$oldifs
+  remaining=$#
+  for component in "$@"; do
+    current=$current/$component
+    remaining=$((remaining - 1))
+    if test -L "$current"; then return 1; fi
+    if test "$remaining" -gt 0 && test -e "$current" && test ! -d "$current"; then return 1; fi
+  done
+  return 0
+}
+
+validate_live_paths() {
+  list=$1
+  safe_live_path "$MANIFEST" || return 1
+  test -f "$DOTS_HOME/$MANIFEST" && test ! -L "$DOTS_HOME/$MANIFEST" || return 1
+  while IFS= read -r path; do
+    safe_live_path "$path" || return 1
+    if test -e "$DOTS_HOME/$path" && { test -d "$DOTS_HOME/$path" || test -L "$DOTS_HOME/$path"; }; then return 1; fi
+  done <"$list"
+  return 0
+}
+
+manifest_from_revision() {
+  gitdir=$1
+  rev=$2
+  out=$3
+  tmp=$4
+  git_dir "$gitdir" show "$rev:$MANIFEST" >"$tmp" 2>/dev/null || return 1
+  validate_manifest_file "$tmp" "$out"
+}
+
+path_in_list() { grep -F -x -- "$1" "$2" >/dev/null 2>&1; }
+
+# Check the entire candidate tree. Git path output is NUL-delimited, and failures
+# intentionally do not repeat an untrusted filename or file body.
+validate_tree() {
+  gitdir=$1
+  rev=$2
+  list=$3
+  temp=$4
+  manifest_from_revision "$gitdir" "$rev" "$list" "$temp/manifest" || return 1
+  entry_file=$temp/tree
+  git_dir "$gitdir" ls-tree -r -z "$rev" >"$entry_file" || return 1
+  while IFS= read -r -d '' entry; do
+    meta=${entry%%$'\t'*}
+    path=${entry#*$'\t'}
+    mode=${meta%% *}
+    test "$path" = "$MANIFEST" && {
+      test "$mode" = 100644 -o "$mode" = 100755 || return 1
+      continue
+    }
+    test "$mode" = 100644 -o "$mode" = 100755 || return 1
+    path_in_list "$path" "$list" || return 1
+  done <"$entry_file"
+  return 0
+}
+
+scan_git_revision() {
+  gitdir=$1
+  rev=$2
+  # gitleaks receives only a revision, its report is suppressed and fully redacted.
+  (unset GITLEAKS_CONFIG GITLEAKS_CONFIG_TOML; "$GITLEAKS" git --no-banner --no-color --redact=100 --log-opts "$rev" "$gitdir" >/dev/null 2>&1)
+}
+
+copy_live_candidates_for_scan() {
+  list=$1
+  destination=$2
+  while IFS= read -r path; do
+    test -e "$DOTS_HOME/$path" || continue
+    test -f "$DOTS_HOME/$path" && test ! -L "$DOTS_HOME/$path" || return 1
+    mkdir -p "$destination/$(dirname "$path")" || return 1
+    cp -p "$DOTS_HOME/$path" "$destination/$path" || return 1
+  done <"$list"
+}
+
+scan_live_candidates() {
+  list=$1
+  temp=$2
+  scan=$temp/live-scan
+  mkdir -p "$scan" || return 1
+  copy_live_candidates_for_scan "$list" "$scan" || return 1
+  (unset GITLEAKS_CONFIG GITLEAKS_CONFIG_TOML; "$GITLEAKS" dir --no-banner --no-color --redact=100 "$scan" >/dev/null 2>&1)
+}
+
+scan_directory() {
+  (unset GITLEAKS_CONFIG GITLEAKS_CONFIG_TOML; "$GITLEAKS" dir --no-banner --no-color --redact=100 "$1" >/dev/null 2>&1)
+}
+
+append_unique_list() {
+  source=$1
+  target=$2
+  while IFS= read -r path; do
+    path_in_list "$path" "$target" || printf '%s\n' "$path" >>"$target"
+  done <"$source"
+}
+
+list_with_manifest() {
+  list=$1
+  out=$2
+  : >"$out"
+  printf '%s\n' "$MANIFEST" >>"$out"
+  append_unique_list "$list" "$out"
+}
+
+current_branch() {
+  git_repo config --get dots.branch 2>/dev/null
+}
+
+ensure_initialized() {
+  test -d "$REPO" || fail "not initialized, run: dots init <remote> [branch]"
+  test "$(git_repo config --get dots.initialized 2>/dev/null || true)" = true || fail "repository is not a completed dots initialization"
+  branch=$(current_branch || true)
+  test -n "$branch" || fail "repository has no configured branch"
+  safe_branch "$branch"
+}
+
+live_manifest_list() {
+  out=$1
+  safe_live_path "$MANIFEST" || return 1
+  validate_manifest_file "$DOTS_HOME/$MANIFEST" "$out"
+}
+
+head_revision() { git_repo rev-parse HEAD 2>/dev/null; }
+
+validate_current_state() {
+  temp=$1
+  head=$(head_revision) || return 1
+  validate_tree "$REPO" "$head" "$temp/head-manifest" "$temp" || return 1
+  validate_live_paths "$temp/head-manifest" || return 1
+  live_manifest_list "$temp/live-manifest" || return 1
+  validate_live_paths "$temp/live-manifest" || return 1
+  list_with_manifest "$temp/live-manifest" "$temp/live-paths"
+  list_with_manifest "$temp/head-manifest" "$temp/head-paths"
+  : >"$temp/all-paths"
+  append_unique_list "$temp/head-paths" "$temp/all-paths"
+  append_unique_list "$temp/live-paths" "$temp/all-paths"
+}
+
+show_changes() {
+  paths=$1
+  changes=$2
+  # Construct one argv entry per approved path, never a broad pathspec.
+  : >"$changes"
+  set --
+  while IFS= read -r path; do set -- "$@" "$path"; done <"$paths"
+  git_repo status --porcelain --untracked-files=all -- "$@" >"$changes" || return 2
+  test -s "$changes"
+}
+
+show_change_summary() {
+  paths=$1
+  changes=$2
+  say "Approved changes (content is intentionally not printed):"
+  cat "$changes"
+  # Untracked files are represented by status above. Git's name-status covers tracked diffs.
+  set --
+  while IFS= read -r path; do set -- "$@" "$path"; done <"$paths"
+  git_repo diff --name-status -- "$@" || return 1
+}
+
+stage_approved_paths() {
+  old=$1
+  new=$2
+  # Do not accept a pre-existing partial index or conflict state.
+  git_repo diff --cached --quiet || return 1
+  git_repo diff --name-only --diff-filter=U | grep . >/dev/null 2>&1 && return 1
+  set --
+  while IFS= read -r path; do set -- "$@" "$path"; done <"$new"
+  git_repo add -A -- "$@" || return 1
+  # Removing an allowlist entry means removing it from the repository, not deleting
+  # the live file. The old list is itself a validated manifest.
+  while IFS= read -r path; do
+    test "$path" = "$MANIFEST" && continue
+    path_in_list "$path" "$new" && continue
+    git_repo rm --cached --ignore-unmatch -- "$path" >/dev/null || return 1
+  done <"$old"
+  return 0
+}
+
+ensure_identity() {
+  git_repo var GIT_AUTHOR_IDENT >/dev/null 2>&1 || return 1
+}
+
+check_new_tree_collisions() {
+  base=$1
+  candidate=$2
+  temp=$3
+  # Both trees were validated, so their names contain no controls and can safely
+  # use line-oriented system tools (BSD grep has no -z option).
+  git_dir "$REPO" ls-tree -r --name-only "$base" >"$temp/base-names" || return 1
+  git_dir "$REPO" ls-tree -r --name-only "$candidate" >"$temp/candidate-names" || return 1
+  while IFS= read -r path; do
+    grep -F -x -- "$path" "$temp/base-names" >/dev/null 2>&1 && continue
+    test "$path" = "$MANIFEST" && continue
+    safe_live_path "$path" || return 1
+    test -e "$DOTS_HOME/$path" && return 1
+  done <"$temp/candidate-names"
+}
+
+init_command() {
+  test $# -ge 1 && test $# -le 2 || { usage >&2; exit 2; }
+  remote=$1
+  requested_branch=${2:-}
+  test -n "$requested_branch" && safe_branch "$requested_branch"
+  require_dependencies
+  if test -e "$REPO"; then
+    ensure_initialized
+    existing_remote=$(git_repo remote get-url origin 2>/dev/null || true)
+    test "$existing_remote" = "$remote" || fail "already initialized with a different remote; use dots sync or remove the data directory deliberately"
+    branch=$(current_branch)
+    test -z "$requested_branch" -o "$requested_branch" = "$branch" || fail "already initialized with a different branch"
+    temp=$(mktemp_dir); trap 'rm -rf "$temp"' EXIT HUP INT TERM
+    validate_current_state "$temp" || fail "existing repository or live manifest is unsafe"
+    say "already initialized on $branch; no live files changed"
+    exit 0
+  fi
+  mkdir -p "$DOTS_DATA" || fail "cannot create data directory"
+  temp=$(mktemp_dir); trap 'rm -rf "$temp"' EXIT HUP INT TERM
+  candidate_repo=$temp/repo.git
+  "$GIT" clone --bare -- "$remote" "$candidate_repo" >/dev/null 2>&1 || fail "could not clone remote"
+  if test -n "$requested_branch"; then
+    branch=$requested_branch
+  else
+    branch=$(git_dir "$candidate_repo" symbolic-ref --short HEAD 2>/dev/null || true)
+    test -n "$branch" || fail "remote has no usable default branch; specify a branch"
+  fi
+  safe_branch "$branch"
+  git_dir "$candidate_repo" fetch --no-tags origin "refs/heads/$branch:refs/heads/$branch" >/dev/null 2>&1 || fail "could not fetch requested branch"
+  revision=$(git_dir "$candidate_repo" rev-parse "refs/heads/$branch" 2>/dev/null) || fail "requested branch has no revision"
+  validate_tree "$candidate_repo" "$revision" "$temp/manifest-paths" "$temp" || fail "candidate manifest or repository tree is unsafe"
+  scan_git_revision "$candidate_repo" "$revision" || fail "credential scan failed for candidate revision"
+  # Every target, including the manifest, must be absent for a first initialization.
+  list_with_manifest "$temp/manifest-paths" "$temp/candidate-paths"
+  while IFS= read -r path; do
+    safe_live_path "$path" || fail "candidate path has an unsafe live parent"
+    test ! -e "$DOTS_HOME/$path" && test ! -L "$DOTS_HOME/$path" || fail "refusing to overwrite an existing live file"
+  done <"$temp/candidate-paths"
+  mv "$candidate_repo" "$REPO" || fail "could not install repository metadata"
+  git_repo config status.showUntrackedFiles no || fail "could not configure repository"
+  git_repo config dots.branch "$branch" || fail "could not record branch"
+  # Checkout only validated, explicit paths. This is never a broad checkout.
+  set --
+  while IFS= read -r path; do set -- "$@" "$path"; done <"$temp/candidate-paths"
+  git_repo checkout --quiet "$revision" -- "$@" || fail "checkout failed after preflight; inspect live files before retrying"
+  git_repo config dots.initialized true || fail "could not finalize initialization"
+  say "initialized $branch at $revision"
+}
+
+status_command() {
+  test $# -eq 0 || { usage >&2; exit 2; }
+  require_dependencies
+  ensure_initialized
+  temp=$(mktemp_dir); trap 'rm -rf "$temp"' EXIT HUP INT TERM
+  validate_current_state "$temp" || fail "repository tree or live manifest is unsafe"
+  branch=$(current_branch)
+  head=$(head_revision) || fail "cannot resolve current revision"
+  git_repo fetch --no-tags origin "refs/heads/$branch:refs/remotes/origin/$branch" >/dev/null 2>&1 || fail "could not fetch remote status"
+  remote=$(git_repo rev-parse "refs/remotes/origin/$branch" 2>/dev/null) || fail "remote branch is unavailable"
+  counts=$(git_repo rev-list --left-right --count "$head...$remote" 2>/dev/null) || fail "cannot compute divergence"
+  set -- $counts
+  say "initialized: yes"
+  say "branch: $branch"
+  say "revision: $head"
+  say "divergence: ahead $1, behind $2"
+  if show_changes "$temp/all-paths" "$temp/changes"; then
+    say "tracked configuration changes:"
+    cat "$temp/changes"
+  else
+    result=$?
+    test "$result" -eq 1 || fail "could not inspect approved configuration changes"
+    say "tracked configuration changes: none"
+  fi
+}
+
+sync_command() {
+  test $# -eq 0 || { usage >&2; exit 2; }
+  require_dependencies
+  ensure_initialized
+  test -t 0 && test -t 1 || fail "sync requires an interactive terminal"
+  temp=$(mktemp_dir); trap 'rm -rf "$temp"' EXIT HUP INT TERM
+  validate_current_state "$temp" || fail "repository tree or live manifest is unsafe"
+  # Scan all current allowlisted candidates before displaying even a content-free diff.
+  scan_live_candidates "$temp/live-paths" "$temp" || fail "credential scan failed for local candidates"
+  branch=$(current_branch)
+  base=$(head_revision) || fail "cannot resolve current revision"
+  if show_changes "$temp/all-paths" "$temp/changes"; then
+    show_change_summary "$temp/all-paths" "$temp/changes"
+    printf 'Commit these approved changes? [y/N] ' >&2
+    IFS= read -r answer || fail "confirmation cancelled"
+    case $answer in y|Y|yes|YES) ;; *) say "sync cancelled"; exit 0 ;; esac
+    printf 'Commit message: ' >&2
+    IFS= read -r message || fail "commit message cancelled"
+    test -n "$message" || fail "commit message is required"
+    stage_approved_paths "$temp/head-paths" "$temp/live-paths" || fail "cannot stage approved paths safely (resolve any existing index state first)"
+    git_repo diff --cached --quiet && fail "no approved changes were staged"
+    ensure_identity || fail "Git author identity is required before committing"
+    git_repo commit -m "$message" >/dev/null || fail "could not create local commit"
+    base=$(head_revision) || fail "cannot resolve local commit"
+  else
+    result=$?
+    test "$result" -eq 1 || fail "could not inspect approved configuration changes"
+  fi
+  git_repo fetch --no-tags origin "refs/heads/$branch:refs/remotes/origin/$branch" >/dev/null 2>&1 || fail "could not fetch remote changes"
+  remote=$(git_repo rev-parse "refs/remotes/origin/$branch" 2>/dev/null) || fail "remote branch is unavailable"
+  # Validate and scan the exact incoming revision before it can reach HOME.
+  validate_tree "$REPO" "$remote" "$temp/remote-manifest" "$temp" || fail "incoming manifest or repository tree is unsafe"
+  scan_git_revision "$REPO" "$remote" || fail "credential scan failed for incoming revision"
+  sandbox=$temp/sandbox
+  "$GIT" clone --quiet --no-checkout -- "$REPO" "$sandbox" || fail "could not create integration preflight"
+  "$GIT" --no-pager -C "$sandbox" checkout --quiet "$base" || fail "could not prepare integration preflight"
+  if ! GIT_MERGE_AUTOEDIT=no "$GIT" --no-pager -C "$sandbox" merge --no-commit --no-ff "$remote" >/dev/null 2>&1; then
+    # Re-run on the real worktree solely to leave Git's normal conflict state for the user.
+    GIT_MERGE_AUTOEDIT=no git_repo merge --no-commit --no-ff "$remote" >/dev/null 2>&1 || true
+    fail "incoming changes conflict; Git conflict information has been preserved"
+  fi
+  merged_tree=$("$GIT" --no-pager -C "$sandbox" write-tree 2>/dev/null) || fail "could not write preflight merge tree"
+  validate_tree "$sandbox/.git" "$merged_tree" "$temp/merged-manifest" "$temp" || fail "merged candidate manifest or tree is unsafe"
+  scan_directory "$sandbox" || fail "credential scan failed for merged candidate"
+  check_new_tree_collisions "$base" "$merged_tree" "$temp" || fail "incoming changes would overwrite an untracked live file"
+  if test "$base" != "$remote" && ! git_repo merge-base --is-ancestor "$remote" "$base"; then
+    # A non-fast-forward merge needs an identity. Check before touching HOME.
+    if ! git_repo merge-base --is-ancestor "$base" "$remote"; then ensure_identity || fail "Git author identity is required before merging"; fi
+    GIT_MERGE_AUTOEDIT=no git_repo merge --no-commit --no-ff "$remote" || fail "incoming changes conflict; resolve with Git and retry"
+    if git_repo rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then git_repo commit --no-edit >/dev/null || fail "merge is prepared but could not be committed; resolve with Git"; fi
+  fi
+  git_repo push origin "HEAD:refs/heads/$branch" >/dev/null || fail "integration succeeded locally but push failed"
+  say "sync complete"
+}
+
+case ${1:-} in
+  init) shift; init_command "$@" ;;
+  status) shift; status_command "$@" ;;
+  sync) shift; sync_command "$@" ;;
+  -h|--help|help|'') usage ;;
+  *) usage >&2; exit 2 ;;
+esac
