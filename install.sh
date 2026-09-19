@@ -12,10 +12,14 @@ command -v shasum >/dev/null 2>&1 || { printf '%s\n' 'dots installer: shasum is 
 temp=$(mktemp -d "${TMPDIR:-/tmp}/dots-install.XXXXXX") || exit 1
 trap 'rm -rf "$temp"' EXIT HUP INT TERM
 
-case $VERSION in
-  latest) base="https://github.com/$REPOSITORY/releases/latest/download" ;;
-  *) base="https://github.com/$REPOSITORY/releases/download/$VERSION" ;;
-esac
+if test -n "${DOTS_RELEASE_BASE_URL:-}"; then
+  base=$DOTS_RELEASE_BASE_URL
+else
+  case $VERSION in
+    latest) base="https://github.com/$REPOSITORY/releases/latest/download" ;;
+    *) base="https://github.com/$REPOSITORY/releases/download/$VERSION" ;;
+  esac
+fi
 
 curl --fail --location --silent --show-error "$base/dots" -o "$temp/dots"
 curl --fail --location --silent --show-error "$base/dots.sha256" -o "$temp/dots.sha256"

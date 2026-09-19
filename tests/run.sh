@@ -66,7 +66,8 @@ make_mock_gh() {
 #!/bin/sh
 case "$1:$2" in
   auth:status) exit 0 ;;
-  repo:view) exit 1 ;;
+  api:user) printf '%s\n' example ;;
+  repo:view) if [ "${DOTS_TEST_GH_PUBLIC:-0}" = 1 ]; then printf '%s\n' false; else exit 1; fi ;;
   repo:create) /usr/bin/git init -q --bare "$DOTS_TEST_GH_REMOTE" ;;
   *) exit 2 ;;
 esac
@@ -99,13 +100,18 @@ run_existing_default_init() {
   HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK DOTS_DEFAULT_REMOTE=$remote DOTS_DEFAULT_GITHUB_REPO=example/dotfiles GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid "$DOTS" init
 }
 
+run_public_default_init() {
+  home=$1
+  DOTS_TEST_GH_PUBLIC=1 HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK DOTS_GH=$MOCK_GH GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid "$DOTS" init
+}
+
 make_mock_gitleaks
 make_mock_gh
 chmod 755 "$DOTS"
 
 # Manifest attacks: traversal, globs, duplicates, controls, and symlink entries all fail before checkout.
 remote=$TMP/manifest.git; new_remote "$remote"
-for bad in '../.ssh/id_rsa' '/etc/passwd' '.config/*/x' '.gitconfig
+for bad in '../.ssh/id_rsa' '/etc/passwd' '.config/*/x' '.config/\\*/x' '.gitconfig
 .gitconfig' '.config/dots/manifest'; do
   case $bad in '.config/dots/manifest') continue ;; esac
   remote_edit "$remote" "mkdir -p \"\$1/.config/dots\"; printf '%s\\n' '$bad' > \"\$1/.config/dots/manifest\"" || exit 1
@@ -127,6 +133,9 @@ if run_default_init "$home" "$remote" >/dev/null 2>&1 && test -f "$home/.config/
 remote=$TMP/default-trunk.git; new_remote "$remote"; work=$TMP/default-trunk-work; /usr/bin/git clone -q "$remote" "$work"; /usr/bin/git -C "$work" branch -m main trunk; /usr/bin/git -C "$work" push -q origin trunk; /usr/bin/git --git-dir="$remote" symbolic-ref HEAD refs/heads/trunk
 home=$TMP/home-default-trunk; mkdir -p "$home"
 if expect_ok run_existing_default_init "$home" "$remote" && test "$(/usr/bin/git --git-dir="$home/data/repo.git" config --get dots.branch)" = trunk; then pass "existing default branch"; else fail "existing default branch"; fi
+# Normal no-argument derivation rejects a public <authenticated-user>/dotfiles repo.
+home=$TMP/home-public-default; mkdir -p "$home"
+if expect_fail run_public_default_init "$home"; then pass "derived public default refused"; else fail "derived public default refused"; fi
 
 # Initial collisions are never overwritten, and repeating a successful init is a no-op.
 remote=$TMP/collision.git; new_remote "$remote"; home=$TMP/home-collision; mkdir -p "$home/.config/example"; printf old >"$home/.config/example/settings"
@@ -187,6 +196,40 @@ if ! run_sync "$b" '' >/dev/null 2>&1 && /usr/bin/git --git-dir="$b/data/repo.gi
 remote=$TMP/two-machine.git; new_remote "$remote"; one=$TMP/home-one; two=$TMP/home-two; mkdir -p "$one" "$two"; expect_ok run_dots "$one" init "$remote" main; expect_ok run_dots "$two" init "$remote" main
 printf synced >"$one/.config/example/settings"; run_sync "$one" $'y\nsync one\n' >/dev/null 2>&1 || exit 1
 if run_sync "$two" '' >/dev/null 2>&1 && test "$(cat "$two/.config/example/settings")" = synced; then pass "successful two-machine sync"; else fail "successful two-machine sync"; fi
+
+# Repository internals are never valid manifest targets, even when DOTS_DATA is under HOME.
+remote=$TMP/reserved-path.git; new_remote "$remote"
+remote_edit "$remote" "printf '%s\\n' 'data/repo.git/hooks/pre-commit' > \"\$1/.config/dots/manifest\"; mkdir -p \"\$1/data/repo.git/hooks\"; printf unsafe > \"\$1/data/repo.git/hooks/pre-commit\"" || exit 1
+reserved_home=$TMP/home-reserved-path; mkdir -p "$reserved_home"
+if expect_fail run_dots "$reserved_home" init "$remote" main; then pass "repository internals refused"; else fail "repository internals refused"; fi
+
+# Status fetches remote metadata and reports the resulting divergence.
+remote=$TMP/status-divergence.git; new_remote "$remote"; status_home=$TMP/home-status-divergence; mkdir -p "$status_home"; expect_ok run_dots "$status_home" init "$remote" main
+remote_edit "$remote" "printf remote > \"\$1/.config/example/settings\"" || exit 1
+status=$(run_dots "$status_home" status 2>&1)
+if printf '%s\n' "$status" | grep -Fx 'initialized: yes' >/dev/null && printf '%s\n' "$status" | grep -Fx 'divergence: ahead 0, behind 1' >/dev/null; then pass "status divergence"; else fail "status divergence"; fi
+
+# An incoming allowlisted file cannot overwrite a live untracked file.
+remote=$TMP/incoming-collision.git; new_remote "$remote"; collision_home=$TMP/home-incoming-collision; mkdir -p "$collision_home"; expect_ok run_dots "$collision_home" init "$remote" main
+mkdir -p "$collision_home/.config/example"; printf local >"$collision_home/.config/example/new"
+remote_edit "$remote" "printf '%s\\n' '.config/example/settings' '.config/example/new' > \"\$1/.config/dots/manifest\"; printf remote > \"\$1/.config/example/new\"" || exit 1
+if ! run_sync "$collision_home" '' >/dev/null 2>&1 && test "$(cat "$collision_home/.config/example/new")" = local; then pass "incoming live collision"; else fail "incoming live collision"; fi
+
+# Removing a manifest entry untracks it but never deletes the existing live file.
+remote=$TMP/removal.git; new_remote "$remote"; removal_home=$TMP/home-removal; mkdir -p "$removal_home"; expect_ok run_dots "$removal_home" init "$remote" main
+: >"$removal_home/.config/dots/manifest"
+if run_sync "$removal_home" $'y\nremove approved file\n' >/dev/null 2>&1 && test -f "$removal_home/.config/example/settings" && ! /usr/bin/git --git-dir="$removal_home/data/repo.git" ls-tree -r --name-only HEAD | grep -Fx .config/example/settings >/dev/null; then pass "manifest removal preserves live file"; else fail "manifest removal preserves live file"; fi
+
+# A live symlink is refused during status, without following its target.
+remote=$TMP/live-symlink.git; new_remote "$remote"; symlink_home=$TMP/home-live-symlink; mkdir -p "$symlink_home"; expect_ok run_dots "$symlink_home" init "$remote" main
+rm "$symlink_home/.config/example/settings"; ln -s /tmp "$symlink_home/.config/example/settings"
+if expect_fail run_dots "$symlink_home" status; then pass "live symlink refused"; else fail "live symlink refused"; fi
+
+# The installer verifies release checksums before copying a binary.
+assets=$TMP/release-assets; destination=$TMP/installed-bin; mkdir -p "$assets"; printf '#!/bin/sh\necho dots\n' >"$assets/dots"; shasum -a 256 "$assets/dots" >"$assets/dots.sha256"
+if DOTS_RELEASE_BASE_URL="file://$assets" DOTS_BIN_DIR="$destination" "$ROOT/install.sh" >/dev/null 2>&1 && test -x "$destination/dots"; then pass "installer checksum success"; else fail "installer checksum success"; fi
+printf tampered >"$assets/dots"
+if ! DOTS_RELEASE_BASE_URL="file://$assets" DOTS_BIN_DIR="$TMP/unsafe-bin" "$ROOT/install.sh" >/dev/null 2>&1 && test ! -e "$TMP/unsafe-bin/dots"; then pass "installer checksum refusal"; else fail "installer checksum refusal"; fi
 
 # A real installed gitleaks is exercised for one clean init when available.
 if command -v gitleaks >/dev/null 2>&1; then

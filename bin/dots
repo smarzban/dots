@@ -64,9 +64,11 @@ validate_manifest_file() {
   : >"$out_file" || return 1
   while IFS= read -r line || test -n "$line"; do
     case $line in ''|'#'*) continue ;; esac
-    printf '%s' "$line" | LC_ALL=C grep '[[:cntrl:]]' >/dev/null && return 1
+    # v1 paths are printable ASCII. This avoids ambiguous Unicode whitespace and
+    # platform-dependent normalization, as well as unsafe Git pathspec characters.
+    printf '%s' "$line" | LC_ALL=C grep '[^ -~]' >/dev/null && return 1
     case $line in
-      :*|.gitleaks.toml|/*|./*|*/|*'//'*|*'..'*|*'?'*|*'*'*|*'['*|*']'*|*'{'*|*'}'*) return 1 ;;
+      :*|*'\\'*|.gitleaks.toml|/*|./*|*/|*'//'*|*'..'*|*'?'*|*'*'*|*'['*|*']'*|*'{'*|*'}'*) return 1 ;;
     esac
     # Reject a dot or dot-dot component, rather than accepting prefix lookalikes.
     case "/$line/" in */./*|*/../*) return 1 ;; esac
@@ -97,11 +99,25 @@ safe_live_path() {
   return 0
 }
 
+is_reserved_path() {
+  path=$1
+  case $DOTS_DATA in
+    "$DOTS_HOME"/*)
+      data_path=${DOTS_DATA#"$DOTS_HOME"/}
+      test "$path" = "$data_path" && return 0
+      case $path in "$data_path"/*) return 0 ;; esac
+      ;;
+  esac
+  return 1
+}
+
 validate_live_paths() {
   list=$1
   safe_live_path "$MANIFEST" || return 1
+  is_reserved_path "$MANIFEST" && return 1
   test -f "$DOTS_HOME/$MANIFEST" && test ! -L "$DOTS_HOME/$MANIFEST" || return 1
   while IFS= read -r path; do
+    is_reserved_path "$path" && return 1
     safe_live_path "$path" || return 1
     if test -e "$DOTS_HOME/$path" && { test -d "$DOTS_HOME/$path" || test -L "$DOTS_HOME/$path"; }; then return 1; fi
   done <"$list"
@@ -140,6 +156,12 @@ validate_tree() {
     test "$mode" = 100644 -o "$mode" = 100755 || return 1
     path_in_list "$path" "$list" || return 1
   done <"$entry_file"
+  # A candidate manifest cannot approve nonexistent paths, which would otherwise
+  # make the later path-limited checkout fail after repository metadata is moved.
+  while IFS= read -r path; do
+    is_reserved_path "$path" && return 1
+    git_dir "$gitdir" cat-file -e "$rev:$path" 2>/dev/null || return 1
+  done <"$list"
   return 0
 }
 
@@ -147,7 +169,7 @@ scan_git_revision() {
   gitdir=$1
   rev=$2
   # gitleaks receives only a revision, its report is suppressed and fully redacted.
-  (unset GITLEAKS_CONFIG GITLEAKS_CONFIG_TOML; "$GITLEAKS" git --no-banner --no-color --redact=100 --log-opts "$rev" "$gitdir" >/dev/null 2>&1)
+  (unset GITLEAKS_CONFIG GITLEAKS_CONFIG_TOML; "$GITLEAKS" git --no-banner --no-color --redact=100 --config /dev/null --log-opts "$rev" "$gitdir" >/dev/null 2>&1)
 }
 
 copy_live_candidates_for_scan() {
@@ -167,11 +189,11 @@ scan_live_candidates() {
   scan=$temp/live-scan
   mkdir -p "$scan" || return 1
   copy_live_candidates_for_scan "$list" "$scan" || return 1
-  (unset GITLEAKS_CONFIG GITLEAKS_CONFIG_TOML; "$GITLEAKS" dir --no-banner --no-color --redact=100 "$scan" >/dev/null 2>&1)
+  (unset GITLEAKS_CONFIG GITLEAKS_CONFIG_TOML; "$GITLEAKS" dir --no-banner --no-color --redact=100 --config /dev/null "$scan" >/dev/null 2>&1)
 }
 
 scan_directory() {
-  (unset GITLEAKS_CONFIG GITLEAKS_CONFIG_TOML; "$GITLEAKS" dir --no-banner --no-color --redact=100 "$1" >/dev/null 2>&1)
+  (unset GITLEAKS_CONFIG GITLEAKS_CONFIG_TOML; "$GITLEAKS" dir --no-banner --no-color --redact=100 --config /dev/null "$1" >/dev/null 2>&1)
 }
 
 append_unique_list() {
@@ -277,11 +299,20 @@ safe_github_component() {
 
 github_repository_from_gh() {
   require_tool "$GH"
-  "$GH" auth status >/dev/null 2>&1 || fail "GitHub CLI is not authenticated; run gh auth login or pass an explicit remote"
-  owner=$("$GH" api user --jq .login 2>/dev/null || true)
-  safe_github_component "$owner" || fail "GitHub CLI returned an unsafe account name"
-  safe_github_component "$DEFAULT_GITHUB_REPO_NAME" || fail "default repository name is unsafe"
+  "$GH" auth status >/dev/null 2>&1 || return 1
+  owner=$("$GH" api user --jq .login 2>/dev/null) || return 1
+  safe_github_component "$owner" || return 1
+  safe_github_component "$DEFAULT_GITHUB_REPO_NAME" || return 1
   printf '%s/%s\n' "$owner" "$DEFAULT_GITHUB_REPO_NAME"
+}
+
+enable_gh_git_credentials() {
+  # We ignore a managed ~/.gitconfig, but gh's credential helper is still needed
+  # for the account-derived HTTPS remote. Git 2.18+ supports this env interface.
+  GIT_CONFIG_COUNT=1
+  GIT_CONFIG_KEY_0=credential.helper
+  GIT_CONFIG_VALUE_0='!gh auth git-credential'
+  export GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
 }
 
 # A newly created remote needs one safe, versioned object before init can validate it.
@@ -323,19 +354,21 @@ create_default_github_repository() {
 }
 
 check_new_tree_collisions() {
-  base=$1
-  candidate=$2
-  temp=$3
+  gitdir=$1
+  base=$2
+  candidate=$3
+  temp=$4
   # Both trees were validated, so their names contain no controls and can safely
   # use line-oriented system tools (BSD grep has no -z option).
-  git_dir "$REPO" ls-tree -r --name-only "$base" >"$temp/base-names" || return 1
-  git_dir "$REPO" ls-tree -r --name-only "$candidate" >"$temp/candidate-names" || return 1
+  git_dir "$gitdir" ls-tree -r --name-only "$base" >"$temp/base-names" || return 1
+  git_dir "$gitdir" ls-tree -r --name-only "$candidate" >"$temp/candidate-names" || return 1
   while IFS= read -r path; do
     grep -F -x -- "$path" "$temp/base-names" >/dev/null 2>&1 && continue
     test "$path" = "$MANIFEST" && continue
     safe_live_path "$path" || return 1
     test -e "$DOTS_HOME/$path" && return 1
   done <"$temp/candidate-names"
+  return 0
 }
 
 init_command() {
@@ -352,8 +385,11 @@ init_command() {
       remote=$DEFAULT_REMOTE
       github_repository=$DEFAULT_GITHUB_REPO
     else
-      github_repository=$(github_repository_from_gh)
+      github_repository=$(github_repository_from_gh) || fail "GitHub CLI is unavailable, unauthenticated, or returned an unsafe account name"
       remote=https://github.com/$github_repository.git
+      enable_gh_git_credentials
+      private=$("$GH" repo view "$github_repository" --json isPrivate --jq .isPrivate 2>/dev/null || true)
+      test -z "$private" -o "$private" = true || fail "default GitHub repository must be private"
     fi
   else
     remote=$1
@@ -405,6 +441,8 @@ init_command() {
   mv "$candidate_repo" "$REPO" || fail "could not install repository metadata"
   git_repo config status.showUntrackedFiles no || fail "could not configure repository"
   git_repo config dots.branch "$branch" || fail "could not record branch"
+  git_repo update-ref "refs/heads/$branch" "$revision" || fail "could not set requested branch"
+  git_repo symbolic-ref HEAD "refs/heads/$branch" || fail "could not select requested branch"
   # Checkout only validated, explicit paths. This is never a broad checkout.
   set --
   while IFS= read -r path; do set -- "$@" "$path"; done <"$temp/candidate-paths"
@@ -446,6 +484,9 @@ sync_command() {
   test -t 0 && test -t 1 || fail "sync requires an interactive terminal"
   temp=$(mktemp_dir); trap 'rm -rf "$temp"' EXIT HUP INT TERM
   validate_current_state "$temp" || fail "repository tree or live manifest is unsafe"
+  # Never integrate remote data over a manually staged or conflicted index.
+  git_repo diff --cached --quiet || fail "repository index has staged changes; resolve or unstage them before sync"
+  git_repo diff --name-only --diff-filter=U | grep . >/dev/null 2>&1 && fail "repository index has conflicts; resolve them before sync"
   # Scan all current allowlisted candidates before displaying even a content-free diff.
   scan_live_candidates "$temp/live-paths" "$temp" || fail "credential scan failed for local candidates"
   branch=$(current_branch)
@@ -483,12 +524,16 @@ sync_command() {
   merged_tree=$("$GIT" --no-pager -C "$sandbox" write-tree 2>/dev/null) || fail "could not write preflight merge tree"
   validate_tree "$sandbox/.git" "$merged_tree" "$temp/merged-manifest" "$temp" || fail "merged candidate manifest or tree is unsafe"
   scan_directory "$sandbox" || fail "credential scan failed for merged candidate"
-  check_new_tree_collisions "$base" "$merged_tree" "$temp" || fail "incoming changes would overwrite an untracked live file"
-  if test "$base" != "$remote" && ! git_repo merge-base --is-ancestor "$remote" "$base"; then
-    # A non-fast-forward merge needs an identity. Check before touching HOME.
-    if ! git_repo merge-base --is-ancestor "$base" "$remote"; then ensure_identity || fail "Git author identity is required before merging"; fi
+  check_new_tree_collisions "$sandbox/.git" "$base" "$merged_tree" "$temp" || fail "incoming changes would overwrite an untracked live file"
+  if test "$base" = "$remote" || git_repo merge-base --is-ancestor "$remote" "$base"; then
+    : # Already current, or local history already contains the remote revision.
+  elif git_repo merge-base --is-ancestor "$base" "$remote"; then
+    # Fast-forward needs no identity and cannot create a conflict.
+    git_repo merge --ff-only "$remote" || fail "could not fast-forward incoming changes"
+  else
+    ensure_identity || fail "Git author identity is required before merging"
     GIT_MERGE_AUTOEDIT=no git_repo merge --no-commit --no-ff "$remote" || fail "incoming changes conflict; resolve with Git and retry"
-    if git_repo rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then git_repo commit --no-edit >/dev/null || fail "merge is prepared but could not be committed; resolve with Git"; fi
+    git_repo commit --no-edit >/dev/null || fail "merge is prepared but could not be committed; resolve with Git"
   fi
   git_repo push origin "HEAD:refs/heads/$branch" >/dev/null || fail "integration succeeded locally but push failed"
   say "sync complete"
