@@ -16,8 +16,10 @@ REPO="$DOTS_DATA/repo.git"
 GIT=${DOTS_GIT:-/usr/bin/git}
 GITLEAKS=${DOTS_GITLEAKS:-gitleaks}
 GH=${DOTS_GH:-gh}
-DEFAULT_REMOTE=${DOTS_DEFAULT_REMOTE:-https://github.com/smarzban/dotfiles.git}
-DEFAULT_GITHUB_REPO=${DOTS_DEFAULT_GITHUB_REPO:-smarzban/dotfiles}
+# Test and self-hosting overrides. Normal no-argument init derives its owner from gh.
+DEFAULT_REMOTE=${DOTS_DEFAULT_REMOTE:-}
+DEFAULT_GITHUB_REPO=${DOTS_DEFAULT_GITHUB_REPO:-}
+DEFAULT_GITHUB_REPO_NAME=${DOTS_DEFAULT_GITHUB_REPO_NAME:-dotfiles}
 MANIFEST=.config/dots/manifest
 
 say() { printf '%s\n' "$*"; }
@@ -267,6 +269,21 @@ ensure_identity() {
   git_repo var GIT_AUTHOR_IDENT >/dev/null 2>&1 || return 1
 }
 
+safe_github_component() {
+  test -n "$1" || return 1
+  case $1 in *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-]*) return 1 ;; esac
+  return 0
+}
+
+github_repository_from_gh() {
+  require_tool "$GH"
+  "$GH" auth status >/dev/null 2>&1 || fail "GitHub CLI is not authenticated; run gh auth login or pass an explicit remote"
+  owner=$("$GH" api user --jq .login 2>/dev/null || true)
+  safe_github_component "$owner" || fail "GitHub CLI returned an unsafe account name"
+  safe_github_component "$DEFAULT_GITHUB_REPO_NAME" || fail "default repository name is unsafe"
+  printf '%s/%s\n' "$owner" "$DEFAULT_GITHUB_REPO_NAME"
+}
+
 # A newly created remote needs one safe, versioned object before init can validate it.
 # This is metadata bootstrap, not a configuration template or an import of HOME.
 seed_new_repository() {
@@ -287,21 +304,21 @@ seed_new_repository() {
 
 create_default_github_repository() {
   remote=$1
-  branch=$2
-  temp=$3
-  test "$remote" = "$DEFAULT_REMOTE" || return 1
+  github_repository=$2
+  branch=$3
+  temp=$4
   require_tool "$GH"
-  "$GH" auth status >/dev/null 2>&1 || fail "GitHub CLI is not authenticated; run gh auth login or initialize an existing remote"
-  if "$GH" repo view "$DEFAULT_GITHUB_REPO" --json nameWithOwner >/dev/null 2>&1; then
+  "$GH" auth status >/dev/null 2>&1 || fail "GitHub CLI is not authenticated; run gh auth login or pass an explicit remote"
+  if "$GH" repo view "$github_repository" --json nameWithOwner >/dev/null 2>&1; then
     fail "could not clone the existing default repository; check network access and permissions"
   fi
   test -t 0 && test -t 1 || fail "default repository is missing; rerun dots init from an interactive terminal to create it"
-  printf 'GitHub repository %s is unavailable. Create it privately with an empty dots manifest? [y/N] ' "$DEFAULT_GITHUB_REPO" >&2
+  printf 'GitHub repository %s is unavailable. Create it privately with an empty dots manifest? [y/N] ' "$github_repository" >&2
   IFS= read -r answer || fail "repository creation cancelled"
   case $answer in y|Y|yes|YES) ;; *) say "init cancelled"; exit 0 ;; esac
-  "$GH" repo create "$DEFAULT_GITHUB_REPO" --private --description "Allowlisted dots configuration" >/dev/null 2>&1 || fail "could not create private GitHub repository $DEFAULT_GITHUB_REPO"
+  "$GH" repo create "$github_repository" --private --description "Allowlisted dots configuration" >/dev/null 2>&1 || fail "could not create private GitHub repository $github_repository"
   seed_new_repository "$remote" "$branch" "$temp/seed" || fail "repository was created but its initial manifest could not be pushed"
-  say "created private GitHub repository $DEFAULT_GITHUB_REPO"
+  say "created private GitHub repository $github_repository"
   return 0
 }
 
@@ -323,7 +340,25 @@ check_new_tree_collisions() {
 
 init_command() {
   test $# -le 2 || { usage >&2; exit 2; }
-  remote=${1:-$DEFAULT_REMOTE}
+  auto_default=false
+  if test $# -eq 0 && test -e "$REPO"; then
+    # Repeating init must not require gh merely to rediscover an existing remote.
+    remote=$(git_repo remote get-url origin 2>/dev/null || true)
+    test -n "$remote" || fail "existing repository has no origin remote"
+    github_repository=
+  elif test $# -eq 0; then
+    auto_default=true
+    if test -n "$DEFAULT_REMOTE" && test -n "$DEFAULT_GITHUB_REPO"; then
+      remote=$DEFAULT_REMOTE
+      github_repository=$DEFAULT_GITHUB_REPO
+    else
+      github_repository=$(github_repository_from_gh)
+      remote=https://github.com/$github_repository.git
+    fi
+  else
+    remote=$1
+    github_repository=
+  fi
   requested_branch=${2:-}
   test -n "$requested_branch" && safe_branch "$requested_branch"
   require_dependencies
@@ -341,13 +376,14 @@ init_command() {
   mkdir -p "$DOTS_DATA" || fail "cannot create data directory"
   temp=$(mktemp_dir); trap 'rm -rf "$temp"' EXIT HUP INT TERM
   candidate_repo=$temp/repo.git
-  # The no-argument default is a private GitHub repository. For a missing default,
-  # gh can create a minimal safe repository only after explicit confirmation.
+  # The no-argument default is an account-derived private GitHub repository. For a
+  # missing default, gh can create a minimal safe repository after confirmation.
   branch=${requested_branch:-main}
   safe_branch "$branch"
   created_default=false
   if ! "$GIT" clone --bare -- "$remote" "$candidate_repo" >/dev/null 2>&1; then
-    create_default_github_repository "$remote" "$branch" "$temp" || fail "could not clone remote"
+    test "$auto_default" = true || fail "could not clone remote"
+    create_default_github_repository "$remote" "$github_repository" "$branch" "$temp"
     created_default=true
     "$GIT" clone --bare -- "$remote" "$candidate_repo" >/dev/null 2>&1 || fail "could not clone newly created remote"
   fi

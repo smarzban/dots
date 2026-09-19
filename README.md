@@ -34,7 +34,7 @@ For the default private configuration repository, run this from a terminal:
 dots init
 ```
 
-If `smarzban/dotfiles` is missing and `gh` is available and authenticated, `dots` asks before creating that private repository. It seeds only an empty versioned manifest, then you can add approved paths to `.config/dots/manifest` and run `dots sync` to adopt their current contents. `gh` is optional for every other operation.
+`dots` derives the authenticated GitHub account from `gh`, then uses `<account>/dotfiles`. If that repository is missing, it asks before creating it privately. It seeds only an empty versioned manifest, then you can add approved paths to `.config/dots/manifest` and run `dots sync` to adopt their current contents. `gh` is needed only for no-argument initialization and automatic creation.
 
 You can also initialize an existing repository:
 
