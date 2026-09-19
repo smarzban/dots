@@ -62,17 +62,29 @@ remote_edit() {
 
 make_mock_gh() {
   MOCK_GH=$TMP/mock-gh
+  MOCK_GIT=$TMP/mock-git
   cat >"$MOCK_GH" <<'EOF'
 #!/bin/sh
 case "$1:$2" in
   auth:status) exit 0 ;;
   api:user) printf '%s\n' example ;;
   repo:view) if [ "${DOTS_TEST_GH_PUBLIC:-0}" = 1 ]; then printf '%s\n' false; else exit 1; fi ;;
-  repo:create) /usr/bin/git init -q --bare "$DOTS_TEST_GH_REMOTE" ;;
+  repo:create) printf '%s\n' "$*" >>"$DOTS_TEST_GH_LOG"; /usr/bin/git init -q --bare "$DOTS_TEST_GH_REMOTE" ;;
   *) exit 2 ;;
 esac
 EOF
-  chmod 755 "$MOCK_GH"
+  cat >"$MOCK_GIT" <<'EOF'
+#!/bin/sh
+# Map the derived GitHub HTTPS URL to the test-local bare remote.
+if [ "$1" = clone ] && [ "${4:-}" = https://github.com/example/dotfiles.git ]; then
+  exec /usr/bin/git clone "$2" "$3" "$DOTS_TEST_GH_REMOTE" "$5"
+fi
+if [ "$1" = -C ] && [ "${3:-}" = remote ] && [ "${4:-}" = add ] && [ "${6:-}" = https://github.com/example/dotfiles.git ]; then
+  exec /usr/bin/git -C "$2" remote add "$5" "$DOTS_TEST_GH_REMOTE"
+fi
+exec /usr/bin/git "$@"
+EOF
+  chmod 755 "$MOCK_GH" "$MOCK_GIT"
 }
 
 run_dots() {
@@ -85,13 +97,13 @@ run_sync() {
   home=$1
   input=$2
   # BSD script supplies a pseudo-terminal, needed by the intentional sync guard.
-  (sleep 2; printf '%s' "$input") | HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid /usr/bin/script -q /dev/null /bin/sh -c "$DOTS sync"
+  (sleep 3; printf '%s' "$input") | HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid /usr/bin/script -q /dev/null /bin/sh -c "$DOTS sync"
 }
 
 run_default_init() {
   home=$1
   remote=$2
-  (sleep 2; printf 'y\n') | HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK DOTS_GH=$MOCK_GH DOTS_DEFAULT_REMOTE=$remote DOTS_DEFAULT_GITHUB_REPO=smarzban/dotfiles DOTS_TEST_GH_REMOTE=$remote GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid /usr/bin/script -q /dev/null /bin/sh -c "$DOTS init"
+  (sleep 3; printf 'y\n') | HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK DOTS_GH=$MOCK_GH DOTS_DEFAULT_REMOTE=$remote DOTS_DEFAULT_GITHUB_REPO=smarzban/dotfiles DOTS_TEST_GH_REMOTE=$remote GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid /usr/bin/script -q /dev/null /bin/sh -c "$DOTS init"
 }
 
 run_existing_default_init() {
@@ -103,6 +115,15 @@ run_existing_default_init() {
 run_public_default_init() {
   home=$1
   DOTS_TEST_GH_PUBLIC=1 HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK DOTS_GH=$MOCK_GH GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid "$DOTS" init
+}
+
+run_derived_default_init() {
+  home=$1
+  remote=$2
+  response=$3
+  log=$TMP/gh-create.log
+  : >"$log"
+  (sleep 3; printf '%s' "$response") | HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK DOTS_GH=$MOCK_GH DOTS_GIT=$MOCK_GIT DOTS_TEST_GH_REMOTE=$remote DOTS_TEST_GH_LOG=$log GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid /usr/bin/script -q /dev/null /bin/sh -c "$DOTS init"
 }
 
 make_mock_gitleaks
@@ -133,6 +154,11 @@ if run_default_init "$home" "$remote" >/dev/null 2>&1 && test -f "$home/.config/
 remote=$TMP/default-trunk.git; new_remote "$remote"; work=$TMP/default-trunk-work; /usr/bin/git clone -q "$remote" "$work"; /usr/bin/git -C "$work" branch -m main trunk; /usr/bin/git -C "$work" push -q origin trunk; /usr/bin/git --git-dir="$remote" symbolic-ref HEAD refs/heads/trunk
 home=$TMP/home-default-trunk; mkdir -p "$home"
 if expect_ok run_existing_default_init "$home" "$remote" && test "$(/usr/bin/git --git-dir="$home/data/repo.git" config --get dots.branch)" = trunk; then pass "existing default branch"; else fail "existing default branch"; fi
+# Normal no-argument derivation creates <authenticated-user>/dotfiles and asks first.
+remote=$TMP/derived-created.git; home=$TMP/home-derived-created; mkdir -p "$home"
+if run_derived_default_init "$home" "$remote" $'y\n' >/dev/null 2>&1 && test -f "$home/.config/dots/manifest" && grep -F -- '--private' "$TMP/gh-create.log" >/dev/null; then pass "derived private default creation"; else fail "derived private default creation"; fi
+remote=$TMP/derived-cancelled.git; home=$TMP/home-derived-cancelled; mkdir -p "$home"
+if run_derived_default_init "$home" "$remote" $'n\n' >/dev/null 2>&1 && test ! -e "$remote"; then pass "derived default cancellation"; else fail "derived default cancellation"; fi
 # Normal no-argument derivation rejects a public <authenticated-user>/dotfiles repo.
 home=$TMP/home-public-default; mkdir -p "$home"
 if expect_fail run_public_default_init "$home"; then pass "derived public default refused"; else fail "derived public default refused"; fi
@@ -224,6 +250,10 @@ if run_sync "$removal_home" $'y\nremove approved file\n' >/dev/null 2>&1 && test
 remote=$TMP/live-symlink.git; new_remote "$remote"; symlink_home=$TMP/home-live-symlink; mkdir -p "$symlink_home"; expect_ok run_dots "$symlink_home" init "$remote" main
 rm "$symlink_home/.config/example/settings"; ln -s /tmp "$symlink_home/.config/example/settings"
 if expect_fail run_dots "$symlink_home" status; then pass "live symlink refused"; else fail "live symlink refused"; fi
+
+# Packaging emits all release assets and a portable checksum filename.
+package_repo=$TMP/package-repo; /usr/bin/git clone -q "$ROOT" "$package_repo"; /usr/bin/git -C "$package_repo" config user.name test; /usr/bin/git -C "$package_repo" config user.email test@example.invalid; cp "$ROOT/scripts/package.sh" "$package_repo/scripts/package.sh"; /usr/bin/git -C "$package_repo" add scripts/package.sh; /usr/bin/git -C "$package_repo" commit -qm 'package test'; /usr/bin/git -C "$package_repo" tag v0.0.0-test
+if "$package_repo/scripts/package.sh" v0.0.0-test >/dev/null 2>&1 && test -x "$package_repo/dist/dots" && test -x "$package_repo/dist/install.sh" && (cd "$package_repo/dist" && shasum -a 256 --check dots.sha256) >/dev/null 2>&1; then pass "release packaging"; else fail "release packaging"; fi
 
 # The installer verifies release checksums before copying a binary.
 assets=$TMP/release-assets; destination=$TMP/installed-bin; mkdir -p "$assets"; printf '#!/bin/sh\necho dots\n' >"$assets/dots"; shasum -a 256 "$assets/dots" >"$assets/dots.sha256"

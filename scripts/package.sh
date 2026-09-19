@@ -16,6 +16,6 @@ rm -rf "$DIST"
 mkdir -p "$DIST"
 cp "$ROOT/bin/dots" "$DIST/dots"
 chmod 755 "$DIST/dots"
-shasum -a 256 "$DIST/dots" >"$DIST/dots.sha256"
+(cd "$DIST" && shasum -a 256 dots >dots.sha256)
 cp "$ROOT/install.sh" "$DIST/install.sh"
 printf 'Release assets for %s are in %s\n' "$VERSION" "$DIST"
