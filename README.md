@@ -1,6 +1,6 @@
 # dots
 
-`dots` is a small, allowlist-only macOS shell CLI for keeping selected live files in `$HOME` in a Git repository. It has three commands: `init`, `status`, and foreground-only `sync`.
+`dots` is a small, allowlist-only macOS shell CLI for keeping selected live files in `$HOME` in a Git repository. Its commands are `init`, `status`, `sync`, and `update`.
 
 It is intentionally not a replacement for chezmoi or yadm. Snapshots, restore, cloud services, background work, templates, encryption, plugins, and auth transfer are out of scope.
 
@@ -34,7 +34,13 @@ For the default private configuration repository, run this from a terminal:
 dots init
 ```
 
-`dots` derives the authenticated GitHub account from `gh`, then uses `<account>/dotfiles`. If that repository is missing, it asks before creating it privately. It seeds only an empty versioned manifest, then you can add approved paths to `.config/dots/manifest` and run `dots sync` to adopt their current contents. `gh` is needed only for no-argument initialization and automatic creation.
+`dots` derives the authenticated GitHub account from `gh`, then uses `<account>/dotfiles`. If that repository is missing, it asks before creating it privately. It seeds an empty versioned manifest, no configuration is adopted automatically. `gh` is needed only for no-argument initialization, automatic creation, and `update` PRs.
+
+Before initialization, inspect a names-only candidate preview without changing files, Git state, or the network:
+
+```sh
+dots init --discover
+```
 
 You can also initialize an existing repository:
 
@@ -48,7 +54,15 @@ An existing configuration repository must already contain a valid manifest. `ini
 
 `status` validates both the repository and live manifest, fetches only remote metadata for an accurate ahead/behind report, then reports only allowlisted files. It never runs an unscoped home-directory status.
 
-`sync` scans local approved candidates before showing a content-free exact path summary. It requires a terminal confirmation and commit message, stages only manifest-derived paths, fetches without applying, validates and scans the incoming revision, preflights the merged result in a temporary clone, then integrates and pushes. It never force-pushes or resolves a conflict. A conflict is left in normal Git conflict state for manual resolution.
+`sync` fetches, validates, and scans the repository before updating live files. With no local approved changes, it applies the repository configuration locally and never pushes. If local files differ, it offers to use the repository version, keep local files unchanged, create an update PR, or merge the remote into local files only.
+
+A local-only merge happens in `~/.local/share/dots/conflict-workspace`, never in live configuration. If it conflicts, resolve and commit there with normal Git, then run:
+
+```sh
+dots sync --continue
+```
+
+`update` detects approved local changes, presents new names-only candidates for exact selection, scans the proposed content, then creates and pushes a `dots/update-*` branch and opens a GitHub PR. It never changes live files or the manifest while preparing the PR. It requires an authenticated `gh` and a GitHub origin remote.
 
 ## Safety boundaries and caveats
 
