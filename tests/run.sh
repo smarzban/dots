@@ -68,8 +68,9 @@ make_mock_gh() {
 case "$1:$2" in
   auth:status) exit 0 ;;
   api:user) printf '%s\n' example ;;
-  repo:view) if [ "${DOTS_TEST_GH_PUBLIC:-0}" = 1 ]; then printf '%s\n' false; else exit 1; fi ;;
+  repo:view) if [ "${DOTS_TEST_GH_PUBLIC:-0}" = 1 ]; then printf '%s\n' false; elif [ "${DOTS_TEST_GH_REPO_EXISTS:-0}" = 1 ]; then printf '%s\n' true; else exit 1; fi ;;
   repo:create) printf '%s\n' "$*" >>"$DOTS_TEST_GH_LOG"; /usr/bin/git init -q --bare "$DOTS_TEST_GH_REMOTE" ;;
+  pr:create) printf '%s\n' "$*" >>"$DOTS_TEST_GH_LOG" ;;
   *) exit 2 ;;
 esac
 EOF
@@ -79,8 +80,11 @@ EOF
 if [ "$1" = clone ] && [ "${4:-}" = https://github.com/example/dotfiles.git ]; then
   exec /usr/bin/git clone "$2" "$3" "$DOTS_TEST_GH_REMOTE" "$5"
 fi
-if [ "$1" = -C ] && [ "${3:-}" = remote ] && [ "${4:-}" = add ] && [ "${6:-}" = https://github.com/example/dotfiles.git ]; then
-  exec /usr/bin/git -C "$2" remote add "$5" "$DOTS_TEST_GH_REMOTE"
+case " $* " in
+  *' remote get-url origin'*) printf '%s\n' https://github.com/example/dotfiles.git; exit 0 ;;
+esac
+if [ "$1" = -C ] && [ "${3:-}" = push ]; then
+  exec /usr/bin/git -C "$2" push "$4" "$DOTS_TEST_GH_REMOTE" "$6"
 fi
 exec /usr/bin/git "$@"
 EOF
@@ -132,6 +136,15 @@ run_derived_default_init() {
   (sleep 3; printf '%s' "$response") | HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK DOTS_GH=$MOCK_GH DOTS_GIT=$MOCK_GIT DOTS_TEST_GH_REMOTE=$remote DOTS_TEST_GH_LOG=$log GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid /usr/bin/script -q /dev/null /bin/sh -c "$DOTS init"
 }
 
+run_update() {
+  home=$1
+  remote=$2
+  input=$3
+  log=$TMP/gh-update.log
+  : >"$log"
+  (sleep 3; printf '%s' "$input") | DOTS_TEST_GH_REPO_EXISTS=1 HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK DOTS_GH=$MOCK_GH DOTS_GIT=$MOCK_GIT DOTS_TEST_GH_REMOTE=$remote DOTS_TEST_GH_LOG=$log GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid /usr/bin/script -q /dev/null /bin/sh -c "$DOTS update"
+}
+
 make_mock_gitleaks
 make_mock_gh
 chmod 755 "$DOTS"
@@ -175,10 +188,10 @@ if expect_fail run_dots "$home" init "$remote" main && test "$(cat "$home/.confi
 home=$TMP/home-idempotent; mkdir -p "$home"
 if expect_ok run_dots "$home" init "$remote" main && expect_ok run_dots "$home" init "$remote" main; then pass "idempotent init"; else fail "idempotent init"; fi
 
-# Discovery reads names only, requires numbered selection plus confirmation, and
-# adds only the selected safe candidates to the manifest.
+# Discovery is a names-only preview and never changes an initialized manifest.
 printf git >"$home/.gitconfig"; printf shell >"$home/.zshrc"
-if run_discover "$home" $'1,2\ny\n' >/dev/null 2>&1 && grep -Fx .gitconfig "$home/.config/dots/manifest" >/dev/null && grep -Fx .zshrc "$home/.config/dots/manifest" >/dev/null; then pass "interactive candidate discovery"; else fail "interactive candidate discovery"; fi
+discovery=$(run_dots "$home" init --discover 2>&1)
+if printf '%s\n' "$discovery" | grep -F .gitconfig >/dev/null && ! grep -Fx .gitconfig "$home/.config/dots/manifest" >/dev/null; then pass "read-only candidate discovery"; else fail "read-only candidate discovery"; fi
 
 # status scopes itself to the allowlist and never reports an unrelated home file.
 printf private >"$home/private-token"
@@ -189,13 +202,14 @@ printf ':\n' >"$home/.config/dots/manifest"
 if expect_fail run_dots "$home" status; then pass "pathspec manifest attack"; else fail "pathspec manifest attack"; fi
 printf '%s\n' '.config/example/settings' >"$home/.config/dots/manifest"
 
-# Exact-path staging: an unrelated file cannot enter a local commit.
+# Sync never stages unrelated files or creates history from local edits.
 printf local >"$home/.config/example/settings"; printf unrelated >"$home/not-approved"
-if run_sync "$home" $'y\nlocal change\n' >/dev/null 2>&1 && ! /usr/bin/git --git-dir="$home/data/repo.git" ls-tree -r --name-only HEAD | grep -F not-approved >/dev/null; then pass "exact-path staging"; else fail "exact-path staging"; fi
+before=$(/usr/bin/git --git-dir="$home/data/repo.git" rev-parse HEAD)
+if run_sync "$home" $'2\n' >/dev/null 2>&1 && test "$before" = "$(/usr/bin/git --git-dir="$home/data/repo.git" rev-parse HEAD)" && test "$(cat "$home/.config/example/settings")" = local && ! /usr/bin/git --git-dir="$home/data/repo.git" ls-tree -r --name-only HEAD | grep -F not-approved >/dev/null; then pass "sync keeps local changes"; else fail "sync keeps local changes"; fi
 
-# Cancellation creates no history.
-before=$(/usr/bin/git --git-dir="$home/data/repo.git" rev-parse HEAD); printf cancelled >"$home/.config/example/settings"
-if run_sync "$home" $'n\n' >/dev/null 2>&1 && test "$before" = "$(/usr/bin/git --git-dir="$home/data/repo.git" rev-parse HEAD)"; then pass "cancellation"; else fail "cancellation"; fi
+# Choosing the repository version discards approved local changes without history.
+printf cancelled >"$home/.config/example/settings"
+if run_sync "$home" $'1\n' >/dev/null 2>&1 && test "$before" = "$(/usr/bin/git --git-dir="$home/data/repo.git" rev-parse HEAD)"; then pass "sync repository override"; else fail "sync repository override"; fi
 
 # Mocked scanner failure blocks known secret-shaped local and incoming candidates without exposing a finding.
 printf DOTS_TEST_SECRET >"$home/.config/example/settings"
@@ -220,19 +234,25 @@ remote_edit "$remote" "printf '%s\\n' '.config/example/settings' '.gitleaks.toml
 home4=$TMP/home-scanner-config; mkdir -p "$home4"
 if expect_fail run_dots "$home4" init "$remote" main && test ! -e "$home4/.config/example/settings"; then pass "scanner config refused"; else fail "scanner config refused"; fi
 
-# Conflict preflight is followed by the real Git conflict state, with no auto-resolution.
-remote=$TMP/conflict.git; new_remote "$remote"; a=$TMP/home-a; b=$TMP/home-b; mkdir -p "$a" "$b"; expect_ok run_dots "$a" init "$remote" main; expect_ok run_dots "$b" init "$remote" main
-# Prepare B's local history without pushing, then let A push a conflicting history.
+# A local-only merge conflict stays in a private workspace, never in live files.
+remote=$TMP/conflict.git; new_remote "$remote"; b=$TMP/home-b; mkdir -p "$b"; expect_ok run_dots "$b" init "$remote" main
 printf two >"$b/.config/example/settings"
-/usr/bin/git --git-dir="$b/data/repo.git" --work-tree="$b" add -- .config/example/settings
-GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.invalid /usr/bin/git --git-dir="$b/data/repo.git" --work-tree="$b" commit -qm 'b local' || exit 1
-printf one >"$a/.config/example/settings"; run_sync "$a" $'y\na change\n' >/dev/null 2>&1 || exit 1
-if ! run_sync "$b" '' >/dev/null 2>&1 && /usr/bin/git --git-dir="$b/data/repo.git" diff --cached --name-only --diff-filter=U | grep -Fx .config/example/settings >/dev/null; then pass "conflict preservation"; else fail "conflict preservation"; fi
+remote_edit "$remote" "printf one > \"\$1/.config/example/settings\"" || exit 1
+if run_sync "$b" $'4\n' >/dev/null 2>&1 && test "$(cat "$b/.config/example/settings")" = two && test -d "$b/data/conflict-workspace/.git"; then pass "conflict workspace preservation"; else fail "conflict workspace preservation"; fi
+workspace=$b/data/conflict-workspace
+/usr/bin/git -C "$workspace" checkout --theirs -- .config/example/settings && /usr/bin/git -C "$workspace" add -- .config/example/settings && /usr/bin/git -C "$workspace" commit -qm resolve || exit 1
+if expect_ok run_dots "$b" sync --continue && test "$(cat "$b/.config/example/settings")" = one && test ! -e "$workspace"; then pass "conflict workspace continuation"; else fail "conflict workspace continuation"; fi
 
-# Two clean homes can exchange an allowlisted change through the local remote.
+# Two clean homes can apply an allowlisted remote change without pushing.
 remote=$TMP/two-machine.git; new_remote "$remote"; one=$TMP/home-one; two=$TMP/home-two; mkdir -p "$one" "$two"; expect_ok run_dots "$one" init "$remote" main; expect_ok run_dots "$two" init "$remote" main
-printf synced >"$one/.config/example/settings"; run_sync "$one" $'y\nsync one\n' >/dev/null 2>&1 || exit 1
+remote_edit "$remote" "printf synced > \"\$1/.config/example/settings\"" || exit 1
 if run_sync "$two" '' >/dev/null 2>&1 && test "$(cat "$two/.config/example/settings")" = synced; then pass "successful two-machine sync"; else fail "successful two-machine sync"; fi
+
+# Update creates a GitHub PR branch from selected local candidates without changing HOME.
+remote=$TMP/update.git; update_home=$TMP/home-update; mkdir -p "$update_home"
+run_derived_default_init "$update_home" "$remote" $'y\n' >/dev/null 2>&1 || exit 1
+printf shell >"$update_home/.zshrc"
+if run_update "$update_home" "$remote" $'1\ny\nAdd shell configuration\n' >/dev/null 2>&1 && ! grep -Fx .zshrc "$update_home/.config/dots/manifest" >/dev/null && /usr/bin/git --git-dir="$remote" show-ref | grep -F 'refs/heads/dots/update-' >/dev/null && grep -F 'pr create' "$TMP/gh-update.log" >/dev/null; then pass "update creates candidate PR"; else fail "update creates candidate PR"; fi
 
 # Repository internals are never valid manifest targets, even when DOTS_DATA is under HOME.
 remote=$TMP/reserved-path.git; new_remote "$remote"
@@ -251,11 +271,6 @@ remote=$TMP/incoming-collision.git; new_remote "$remote"; collision_home=$TMP/ho
 mkdir -p "$collision_home/.config/example"; printf local >"$collision_home/.config/example/new"
 remote_edit "$remote" "printf '%s\\n' '.config/example/settings' '.config/example/new' > \"\$1/.config/dots/manifest\"; printf remote > \"\$1/.config/example/new\"" || exit 1
 if ! run_sync "$collision_home" '' >/dev/null 2>&1 && test "$(cat "$collision_home/.config/example/new")" = local; then pass "incoming live collision"; else fail "incoming live collision"; fi
-
-# Removing a manifest entry untracks it but never deletes the existing live file.
-remote=$TMP/removal.git; new_remote "$remote"; removal_home=$TMP/home-removal; mkdir -p "$removal_home"; expect_ok run_dots "$removal_home" init "$remote" main
-: >"$removal_home/.config/dots/manifest"
-if run_sync "$removal_home" $'y\nremove approved file\n' >/dev/null 2>&1 && test -f "$removal_home/.config/example/settings" && ! /usr/bin/git --git-dir="$removal_home/data/repo.git" ls-tree -r --name-only HEAD | grep -Fx .config/example/settings >/dev/null; then pass "manifest removal preserves live file"; else fail "manifest removal preserves live file"; fi
 
 # A live symlink is refused during status, without following its target.
 remote=$TMP/live-symlink.git; new_remote "$remote"; symlink_home=$TMP/home-live-symlink; mkdir -p "$symlink_home"; expect_ok run_dots "$symlink_home" init "$remote" main

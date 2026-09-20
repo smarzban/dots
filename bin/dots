@@ -28,7 +28,8 @@ usage() { cat <<'EOF'
 Usage:
   dots init [--discover] [remote] [branch]
   dots status
-  dots sync
+  dots sync [--continue]
+  dots update
 EOF
 }
 
@@ -387,17 +388,23 @@ collect_candidates() {
   sort -u "$out" -o "$out"
 }
 
-select_candidates() {
+print_candidates() {
   candidates=$1
-  approved=$2
-  temp=$3
-  selected=$temp/selected
-  : >"$selected"
   count=$(wc -l <"$candidates" | tr -d ' ')
   test "$count" -gt 0 || { say "No unapproved, low-risk configuration candidates found."; return 0; }
   say "Candidate configuration files (names only):"
   awk '{ printf "%3d  %s\\n", NR, $0 }' "$candidates"
-  printf 'Select files to add (for example 1,3-5, Enter for none): ' >&2
+}
+
+select_candidates() {
+  candidates=$1
+  temp=$2
+  selected=$temp/selected
+  : >"$selected"
+  count=$(wc -l <"$candidates" | tr -d ' ')
+  print_candidates "$candidates"
+  test "$count" -gt 0 || return 0
+  printf 'Select files for the update PR (for example 1,3-5, Enter for none): ' >&2
   IFS= read -r selection || fail "candidate selection cancelled"
   test -n "$selection" || { say "no files selected"; return 0; }
   case $selection in ,*|*,|*,,*|*[!0-9,-]*) fail "selection must contain only numbers, commas, and ranges" ;; esac
@@ -420,35 +427,86 @@ select_candidates() {
     done
   done
   test -s "$selected" || { say "no files selected"; return 0; }
-  say "Will add to $MANIFEST:"
+  say "Will include in the update PR:"
   cat "$selected"
-  printf 'Write these approved paths to the manifest? [y/N] ' >&2
-  IFS= read -r answer || fail "manifest update cancelled"
-  case $answer in y|Y|yes|YES) ;; *) say "manifest unchanged"; return 0 ;; esac
-  new_manifest=$temp/new-manifest
-  cat "$DOTS_HOME/$MANIFEST" >"$new_manifest" || fail "could not read live manifest"
+  printf 'Include these paths? [y/N] ' >&2
+  IFS= read -r answer || fail "candidate selection cancelled"
+  case $answer in y|Y|yes|YES) ;; *) : >"$selected"; say "no candidates selected" ;; esac
+}
+
+preview_candidates() {
+  temp=$1
+  : >"$temp/preview-approved"
+  collect_candidates "$temp/preview-approved" "$temp/candidates" || fail "could not collect candidates"
+  print_candidates "$temp/candidates"
+  say "Preview only, no files, manifest, repository, or network state changed."
+}
+
+build_manifest_with_selection() {
+  current=$1
+  selected=$2
+  out=$3
+  approved=$4
+  cat "$current" >"$out" || return 1
   while IFS= read -r path; do
-    path_in_list "$path" "$approved" || printf '%s\n' "$path" >>"$new_manifest"
+    path_in_list "$path" "$approved" || printf '%s\n' "$path" >>"$out"
   done <"$selected"
-  validate_manifest_file "$new_manifest" "$temp/validated-selection" || fail "selected paths cannot form a safe manifest"
-  mv "$new_manifest" "$DOTS_HOME/$MANIFEST" || fail "could not update manifest"
-  say "manifest updated, run dots sync to scan and commit these paths"
+  validate_manifest_file "$out" "$out.validated"
 }
 
-discover_candidates() {
-  temp=$1
-  test -t 0 && test -t 1 || fail "candidate discovery requires an interactive terminal"
-  live_manifest_list "$temp/discovery-approved" || fail "live manifest is unsafe"
-  collect_candidates "$temp/discovery-approved" "$temp/candidates" || fail "could not collect candidates"
-  select_candidates "$temp/candidates" "$temp/discovery-approved" "$temp"
+configure_sandbox_identity() {
+  sandbox=$1
+  ensure_identity || return 1
+  name=$(git_repo config --get user.name 2>/dev/null || true)
+  email=$(git_repo config --get user.email 2>/dev/null || true)
+  test -z "$name" || "$GIT" -C "$sandbox" config user.name "$name" || return 1
+  test -z "$email" || "$GIT" -C "$sandbox" config user.email "$email" || return 1
 }
 
-offer_discovery() {
-  temp=$1
-  test -t 0 && test -t 1 || { say "manifest is empty; run dots init --discover to review configuration candidates"; return 0; }
-  printf 'Scan this Mac for likely configuration files? [y/N] ' >&2
-  IFS= read -r answer || { say "manifest remains empty; run dots init --discover later"; return 0; }
-  case $answer in y|Y|yes|YES) discover_candidates "$temp" ;; *) say "manifest remains empty; run dots init --discover later" ;; esac
+configure_merge_identity() {
+  "$GIT" -C "$1" config user.name "dots temporary merge" || return 1
+  "$GIT" -C "$1" config user.email "dots@local.invalid"
+}
+
+prepare_local_sandbox() {
+  sandbox=$1
+  live_paths=$3
+  all_paths=$4
+  proposed_manifest=$5
+  while IFS= read -r path; do
+    if test "$path" = "$MANIFEST"; then
+      mkdir -p "$sandbox/$(dirname "$path")" || return 1
+      cp -p "$proposed_manifest" "$sandbox/$path" || return 1
+    elif path_in_list "$path" "$live_paths"; then
+      test -f "$DOTS_HOME/$path" && test ! -L "$DOTS_HOME/$path" || return 1
+      mkdir -p "$sandbox/$(dirname "$path")" || return 1
+      cp -p "$DOTS_HOME/$path" "$sandbox/$path" || return 1
+    else
+      "$GIT" -C "$sandbox" rm -f --ignore-unmatch -- "$path" >/dev/null || return 1
+    fi
+  done <"$all_paths"
+  set --
+  while IFS= read -r path; do set -- "$@" "$path"; done <"$all_paths"
+  "$GIT" -C "$sandbox" add -A -- "$@"
+}
+
+copy_sandbox_paths_to_home() {
+  sandbox=$1
+  paths=$2
+  while IFS= read -r path; do
+    safe_live_path "$path" || return 1
+    test -f "$sandbox/$path" && test ! -L "$sandbox/$path" || return 1
+    mkdir -p "$DOTS_HOME/$(dirname "$path")" || return 1
+    cp -p "$sandbox/$path" "$DOTS_HOME/$path" || return 1
+  done <"$paths"
+}
+
+advance_to_remote_revision() {
+  branch=$1
+  remote=$2
+  git_repo update-ref "refs/heads/$branch" "$remote" || return 1
+  git_repo symbolic-ref HEAD "refs/heads/$branch" || return 1
+  git_repo read-tree "$remote"
 }
 
 check_new_tree_collisions() {
@@ -470,8 +528,13 @@ check_new_tree_collisions() {
 }
 
 init_command() {
-  discover=false
-  if test "${1:-}" = --discover; then discover=true; shift; fi
+  if test "${1:-}" = --discover; then
+    shift
+    test $# -eq 0 || { usage >&2; exit 2; }
+    temp=$(mktemp_dir); trap 'rm -rf "$temp"' EXIT HUP INT TERM
+    preview_candidates "$temp"
+    exit 0
+  fi
   test $# -le 2 || { usage >&2; exit 2; }
   auto_default=false
   if test $# -eq 0 && test -e "$REPO"; then
@@ -506,7 +569,7 @@ init_command() {
     test -z "$requested_branch" -o "$requested_branch" = "$branch" || fail "already initialized with a different branch"
     temp=$(mktemp_dir); trap 'rm -rf "$temp"' EXIT HUP INT TERM
     validate_current_state "$temp" || fail "existing repository or live manifest is unsafe"
-    if test "$discover" = true; then discover_candidates "$temp"; else say "already initialized on $branch; no live files changed"; fi
+    say "already initialized on $branch; no live files changed"
     exit 0
   fi
   mkdir -p "$DOTS_DATA" || fail "cannot create data directory"
@@ -549,11 +612,6 @@ init_command() {
   git_repo checkout --quiet "$revision" -- "$@" || fail "checkout failed after preflight; inspect live files before retrying"
   git_repo config dots.initialized true || fail "could not finalize initialization"
   say "initialized $branch at $revision"
-  if test "$discover" = true; then
-    discover_candidates "$temp"
-  elif test ! -s "$temp/manifest-paths"; then
-    offer_discovery "$temp"
-  fi
 }
 
 status_command() {
@@ -582,72 +640,166 @@ status_command() {
   fi
 }
 
+fetch_validated_remote() {
+  temp=$1
+  branch=$2
+  git_repo fetch --no-tags origin "refs/heads/$branch:refs/remotes/origin/$branch" >/dev/null 2>&1 || return 1
+  remote=$(git_repo rev-parse "refs/remotes/origin/$branch" 2>/dev/null) || return 1
+  validate_tree "$REPO" "$remote" "$temp/remote-manifest" "$temp" || return 1
+  scan_git_revision "$REPO" "$remote" || return 1
+  printf '%s\n' "$remote"
+}
+
+apply_workspace_result() {
+  workspace=$1
+  tree=$2
+  remote=$3
+  base=$4
+  branch=$5
+  temp=$6
+  validate_tree "$workspace/.git" "$tree" "$temp/result-manifest" "$temp" || return 1
+  list_with_manifest "$temp/result-manifest" "$temp/result-paths"
+  scan_directory "$workspace" || return 1
+  check_new_tree_collisions "$workspace/.git" "$base" "$tree" "$temp" || return 1
+  copy_sandbox_paths_to_home "$workspace" "$temp/result-paths" || return 1
+  advance_to_remote_revision "$branch" "$remote"
+}
+
+sync_continue_command() {
+  test $# -eq 1 && test "$1" = --continue || { usage >&2; exit 2; }
+  require_dependencies
+  ensure_initialized
+  workspace=$DOTS_DATA/conflict-workspace
+  test -d "$workspace/.git" || fail "no pending conflict workspace"
+  "$GIT" -C "$workspace" diff --name-only --diff-filter=U | grep . >/dev/null 2>&1 && fail "resolve all conflicts in $workspace before continuing"
+  test -z "$("$GIT" -C "$workspace" status --porcelain)" || fail "commit the conflict resolution in $workspace before continuing"
+  remote=$("$GIT" -C "$workspace" config --get dots.remoteRevision 2>/dev/null || true)
+  base=$("$GIT" -C "$workspace" config --get dots.baseRevision 2>/dev/null || true)
+  test -n "$remote" && test -n "$base" || fail "conflict workspace metadata is unsafe"
+  temp=$(mktemp_dir); trap 'rm -rf "$temp"' EXIT HUP INT TERM
+  branch=$(current_branch)
+  tree=$("$GIT" -C "$workspace" rev-parse 'HEAD^{tree}' 2>/dev/null) || fail "could not read resolved workspace"
+  apply_workspace_result "$workspace" "$tree" "$remote" "$base" "$branch" "$temp" || fail "resolved workspace is unsafe"
+  rm -rf "$workspace"
+  say "resolved merge applied locally, no remote changes were pushed"
+}
+
 sync_command() {
+  if test "${1:-}" = --continue; then sync_continue_command "$@"; return; fi
   test $# -eq 0 || { usage >&2; exit 2; }
   require_dependencies
   ensure_initialized
   test -t 0 && test -t 1 || fail "sync requires an interactive terminal"
   temp=$(mktemp_dir); trap 'rm -rf "$temp"' EXIT HUP INT TERM
   validate_current_state "$temp" || fail "repository tree or live manifest is unsafe"
-  # Never integrate remote data over a manually staged or conflicted index.
   git_repo diff --cached --quiet || fail "repository index has staged changes; resolve or unstage them before sync"
   git_repo diff --name-only --diff-filter=U | grep . >/dev/null 2>&1 && fail "repository index has conflicts; resolve them before sync"
-  # Scan all current allowlisted candidates before displaying even a content-free diff.
   scan_live_candidates "$temp/live-paths" "$temp" || fail "credential scan failed for local candidates"
   branch=$(current_branch)
   base=$(head_revision) || fail "cannot resolve current revision"
-  if show_changes "$temp/all-paths" "$temp/changes"; then
-    show_change_summary "$temp/all-paths" "$temp/changes"
-    printf 'Commit these approved changes? [y/N] ' >&2
-    IFS= read -r answer || fail "confirmation cancelled"
-    case $answer in y|Y|yes|YES) ;; *) say "sync cancelled"; exit 0 ;; esac
-    printf 'Commit message: ' >&2
-    IFS= read -r message || fail "commit message cancelled"
-    test -n "$message" || fail "commit message is required"
-    stage_approved_paths "$temp/head-paths" "$temp/live-paths" || fail "cannot stage approved paths safely (resolve any existing index state first)"
-    git_repo diff --cached --quiet && fail "no approved changes were staged"
-    ensure_identity || fail "Git author identity is required before committing"
-    git_repo commit -m "$message" >/dev/null || fail "could not create local commit"
-    base=$(head_revision) || fail "cannot resolve local commit"
-  else
-    result=$?
-    test "$result" -eq 1 || fail "could not inspect approved configuration changes"
+  remote=$(fetch_validated_remote "$temp" "$branch") || fail "incoming repository data is unsafe or unavailable"
+  git_repo merge-base --is-ancestor "$base" "$remote" || test "$base" = "$remote" || fail "remote history is not a safe fast-forward"
+  has_local=false
+  if show_changes "$temp/all-paths" "$temp/changes"; then has_local=true; show_change_summary "$temp/all-paths" "$temp/changes"; else result=$?; test "$result" -eq 1 || fail "could not inspect approved configuration changes"; fi
+  remote_workspace=$temp/remote-workspace
+  "$GIT" clone --quiet --no-checkout -- "$REPO" "$remote_workspace" || fail "could not prepare remote workspace"
+  "$GIT" -C "$remote_workspace" checkout --quiet "$remote" || fail "could not prepare remote revision"
+  if test "$has_local" = false; then
+    apply_workspace_result "$remote_workspace" "${remote}^{tree}" "$remote" "$base" "$branch" "$temp" || fail "could not apply remote configuration"
+    say "sync complete, repository configuration applied locally"
+    return
   fi
-  git_repo fetch --no-tags origin "refs/heads/$branch:refs/remotes/origin/$branch" >/dev/null 2>&1 || fail "could not fetch remote changes"
-  remote=$(git_repo rev-parse "refs/remotes/origin/$branch" 2>/dev/null) || fail "remote branch is unavailable"
-  # Validate and scan the exact incoming revision before it can reach HOME.
-  validate_tree "$REPO" "$remote" "$temp/remote-manifest" "$temp" || fail "incoming manifest or repository tree is unsafe"
-  scan_git_revision "$REPO" "$remote" || fail "credential scan failed for incoming revision"
-  sandbox=$temp/sandbox
-  "$GIT" clone --quiet --no-checkout -- "$REPO" "$sandbox" || fail "could not create integration preflight"
-  "$GIT" --no-pager -C "$sandbox" checkout --quiet "$base" || fail "could not prepare integration preflight"
-  if ! GIT_MERGE_AUTOEDIT=no "$GIT" --no-pager -C "$sandbox" merge --no-commit --no-ff "$remote" >/dev/null 2>&1; then
-    # Re-run on the real worktree solely to leave Git's normal conflict state for the user.
-    GIT_MERGE_AUTOEDIT=no git_repo merge --no-commit --no-ff "$remote" >/dev/null 2>&1 || true
-    fail "incoming changes conflict; Git conflict information has been preserved"
-  fi
-  merged_tree=$("$GIT" --no-pager -C "$sandbox" write-tree 2>/dev/null) || fail "could not write preflight merge tree"
-  validate_tree "$sandbox/.git" "$merged_tree" "$temp/merged-manifest" "$temp" || fail "merged candidate manifest or tree is unsafe"
-  scan_directory "$sandbox" || fail "credential scan failed for merged candidate"
-  check_new_tree_collisions "$sandbox/.git" "$base" "$merged_tree" "$temp" || fail "incoming changes would overwrite an untracked live file"
-  if test "$base" = "$remote" || git_repo merge-base --is-ancestor "$remote" "$base"; then
-    : # Already current, or local history already contains the remote revision.
-  elif git_repo merge-base --is-ancestor "$base" "$remote"; then
-    # Fast-forward needs no identity and cannot create a conflict.
-    git_repo merge --ff-only "$remote" || fail "could not fast-forward incoming changes"
-  else
-    ensure_identity || fail "Git author identity is required before merging"
-    GIT_MERGE_AUTOEDIT=no git_repo merge --no-commit --no-ff "$remote" || fail "incoming changes conflict; resolve with Git and retry"
-    git_repo commit --no-edit >/dev/null || fail "merge is prepared but could not be committed; resolve with Git"
-  fi
-  git_repo push origin "HEAD:refs/heads/$branch" >/dev/null || fail "integration succeeded locally but push failed"
-  say "sync complete"
+  say "Local approved changes are not pushed by sync:"
+  say "  1. Use repository version, replace local files"
+  say "  2. Keep local files, make no changes"
+  say "  3. Create a PR from local changes"
+  test "$base" = "$remote" || say "  4. Merge remote into local only"
+  printf 'Choose [1-4]: ' >&2
+  IFS= read -r choice || fail "sync choice cancelled"
+  case $choice in
+    1) apply_workspace_result "$remote_workspace" "${remote}^{tree}" "$remote" "$base" "$branch" "$temp" || fail "could not apply repository configuration"; say "repository configuration applied locally" ;;
+    2) say "local files kept, no changes made" ;;
+    3) update_command ;;
+    4)
+      test "$base" != "$remote" || fail "there are no remote changes to merge"
+      workspace=$DOTS_DATA/conflict-workspace
+      test ! -e "$workspace" || fail "a conflict workspace already exists: $workspace"
+      "$GIT" clone --quiet --no-checkout -- "$REPO" "$workspace" || fail "could not create conflict workspace"
+      "$GIT" -C "$workspace" checkout --quiet "$base" || fail "could not prepare conflict workspace"
+      configure_merge_identity "$workspace" || fail "could not configure temporary merge workspace"
+      prepare_local_sandbox "$workspace" "$temp/head-paths" "$temp/live-paths" "$temp/all-paths" "$DOTS_HOME/$MANIFEST" || fail "could not prepare local merge candidate"
+      "$GIT" -C "$workspace" commit --quiet -m "dots local changes" || fail "could not prepare local merge candidate"
+      "$GIT" -C "$workspace" config dots.remoteRevision "$remote"
+      "$GIT" -C "$workspace" config dots.baseRevision "$base"
+      if ! GIT_MERGE_AUTOEDIT=no "$GIT" -C "$workspace" merge --no-commit --no-ff "$remote" >/dev/null 2>&1; then
+        say "merge conflict workspace: $workspace"
+        "$GIT" -C "$workspace" diff --name-only --diff-filter=U
+        say "resolve and commit there, then run: dots sync --continue"
+        return
+      fi
+      tree=$("$GIT" -C "$workspace" write-tree 2>/dev/null) || fail "could not prepare merged configuration"
+      apply_workspace_result "$workspace" "$tree" "$remote" "$base" "$branch" "$temp" || fail "merged configuration is unsafe"
+      rm -rf "$workspace"
+      say "merged remote configuration into local files only" ;;
+    *) fail "invalid sync choice" ;;
+  esac
+}
+
+update_command() {
+  test $# -eq 0 || { usage >&2; exit 2; }
+  require_dependencies
+  require_tool "$GH"
+  ensure_initialized
+  test -t 0 && test -t 1 || fail "update requires an interactive terminal"
+  "$GH" auth status >/dev/null 2>&1 || fail "GitHub CLI is not authenticated"
+  temp=$(mktemp_dir); trap 'rm -rf "$temp"' EXIT HUP INT TERM
+  validate_current_state "$temp" || fail "repository tree or live manifest is unsafe"
+  branch=$(current_branch)
+  base=$(head_revision) || fail "cannot resolve current revision"
+  remote=$(fetch_validated_remote "$temp" "$branch") || fail "incoming repository data is unsafe or unavailable"
+  collect_candidates "$temp/live-manifest" "$temp/candidates" || fail "could not collect candidates"
+  select_candidates "$temp/candidates" "$temp"
+  build_manifest_with_selection "$DOTS_HOME/$MANIFEST" "$temp/selected" "$temp/proposed-manifest" "$temp/live-manifest" || fail "could not build proposed manifest"
+  validate_manifest_file "$temp/proposed-manifest" "$temp/proposed-list" || fail "proposed manifest is unsafe"
+  list_with_manifest "$temp/proposed-list" "$temp/proposed-paths"
+  : >"$temp/update-paths"
+  append_unique_list "$temp/head-paths" "$temp/update-paths"
+  append_unique_list "$temp/proposed-paths" "$temp/update-paths"
+  scan_live_candidates "$temp/proposed-paths" "$temp" || fail "credential scan failed for local update candidates"
+  update_workspace=$temp/update-workspace
+  "$GIT" clone --quiet --no-checkout -- "$REPO" "$update_workspace" || fail "could not prepare update workspace"
+  "$GIT" -C "$update_workspace" checkout --quiet "$base" || fail "could not prepare update base"
+  configure_sandbox_identity "$update_workspace" || fail "Git author identity is required for an update PR"
+  prepare_local_sandbox "$update_workspace" "$temp/head-paths" "$temp/proposed-paths" "$temp/update-paths" "$temp/proposed-manifest" || fail "could not prepare local update"
+  "$GIT" -C "$update_workspace" diff --cached --quiet && { say "no local changes or candidates to update"; return; }
+  printf 'PR title: ' >&2
+  IFS= read -r title || fail "PR title cancelled"
+  test -n "$title" || fail "PR title is required"
+  update_branch=dots/update-$(date +%Y%m%d%H%M%S)
+  "$GIT" -C "$update_workspace" checkout -qb "$update_branch" || fail "could not create update branch"
+  "$GIT" -C "$update_workspace" commit --quiet -m "$title" || fail "could not create update commit"
+  tree=$("$GIT" -C "$update_workspace" rev-parse 'HEAD^{tree}') || fail "could not read update tree"
+  validate_tree "$update_workspace/.git" "$tree" "$temp/update-manifest" "$temp" || fail "update tree is unsafe"
+  scan_directory "$update_workspace" || fail "credential scan failed for update"
+  origin=$(git_repo remote get-url origin 2>/dev/null || true)
+  case $origin in
+    https://github.com/*/*.git) repo_name=${origin#https://github.com/}; repo_name=${repo_name%.git} ;;
+    git@github.com:*/*.git) repo_name=${origin#git@github.com:}; repo_name=${repo_name%.git} ;;
+    *) fail "update PRs require a GitHub origin remote" ;;
+  esac
+  safe_github_component "${repo_name%%/*}" && safe_github_component "${repo_name##*/}" || fail "origin is not an accessible GitHub repository"
+  "$GH" repo view "$repo_name" --json nameWithOwner >/dev/null 2>&1 || fail "origin is not an accessible GitHub repository"
+  enable_gh_git_credentials
+  "$GIT" -C "$update_workspace" push --quiet origin "$update_branch" || fail "could not push update branch"
+  "$GH" pr create --repo "$repo_name" --base "$branch" --head "$update_branch" --title "$title" --body "Created by dots update." || fail "branch was pushed but PR creation failed"
+  say "update PR created, local files and manifest remain unchanged"
 }
 
 case ${1:-} in
   init) shift; init_command "$@" ;;
   status) shift; status_command "$@" ;;
   sync) shift; sync_command "$@" ;;
+  update) shift; update_command "$@" ;;
   -h|--help|help|'') usage ;;
   *) usage >&2; exit 2 ;;
 esac
