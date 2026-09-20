@@ -363,28 +363,50 @@ candidate_is_excluded() {
   path=$1
   # Names only, conservative exclusions for secrets and machine-local state.
   case $path in
-    .config/dots/*|.config/gh/*|*/.git/*|*/auth*|*/credentials*|*token*|*secret*|*password*|*.env|*/cache/*|*/logs/*|*/log/*|*/runtime/*|*/tmp/*|*/backups/*|*history*|*session*|*state*|*.db|*.sqlite*|*.lock|*.log|*.pid|*.bak|*backup*) return 0 ;;
+    .config/dots/*|.config/gh/*|.config/mcp/*|.config/browser-harness/*|.config/cagent/*|.config/configstore/*|.config/origin-cli/*|.config/pass/*|.config/vercel-plugin/*|.config/zed/prompts/*|.config/herdr/release-notes.json|.config/herdr/tsk-plugins/*|.config/chezmoi/*|.config/uv/*|*/.git/*|*/.system/*|*/auth*|*/credentials*|*token*|*secret*|*password*|*.env|*/cache/*|*/logs/*|*/log/*|*/runtime/*|*/tmp/*|*/backups/*|*history*|*session*|*state*|*.db|*.sqlite*|*.lock|*.log|*.pid|*.bak|*backup*) return 0 ;;
   esac
   return 1
+}
+
+add_candidate() {
+  path=$1
+  approved=$2
+  out=$3
+  test -f "$DOTS_HOME/$path" && test ! -L "$DOTS_HOME/$path" || return 0
+  valid_manifest_path "$path" || return 0
+  is_reserved_path "$path" && return 0
+  candidate_is_excluded "$path" && return 0
+  path_in_list "$path" "$approved" && return 0
+  printf '%s\n' "$path" >>"$out"
 }
 
 collect_candidates() {
   approved=$1
   out=$2
   : >"$out" || return 1
-  for path in .gitconfig .bash_profile .profile .tcshrc .zshenv .zshrc; do
-    test -f "$DOTS_HOME/$path" && test ! -L "$DOTS_HOME/$path" || continue
-    path_in_list "$path" "$approved" || printf '%s\n' "$path" >>"$out"
+  for path in .gitconfig .bash_profile .profile .tcshrc .zshenv .zshrc .claude/settings.json .claude/statusline-command.sh .codex/AGENTS.md .codex/config.toml .codex/hooks.json .codex/keybindings.json .codex/rules/default.rules .cursor/argv.json .cursor/cli-config.json .cursor/hooks.json .cursor/statusline.sh .grok/config.toml .grok/pager.toml .grok/statusline.sh .grokbot/settings.json .pi/agent/AGENTS.md .pi/agent/editor.json .pi/agent/settings.json .pi/agent/spawn.json .pi/agent/statusline.json .pi/agent/toolview.json .pi/web-search.json .pi/workflows/model-tiers.json .pi/workflows/settings.json; do
+    add_candidate "$path" "$approved" "$out"
   done
-  test -d "$DOTS_HOME/.config" && test ! -L "$DOTS_HOME/.config" || return 0
-  find "$DOTS_HOME/.config" -type f -print 2>/dev/null | while IFS= read -r absolute; do
-    path=${absolute#"$DOTS_HOME"/}
-    valid_manifest_path "$path" || continue
-    is_reserved_path "$path" && continue
-    candidate_is_excluded "$path" && continue
-    path_in_list "$path" "$approved" && continue
-    printf '%s\n' "$path"
-  done >>"$out"
+  for directory in .claude/hooks .cursor/agents .cursor/rules .grok/hooks .pi/agent/agents .pi/agent/extensions .pi/agent/themes; do
+    test -d "$DOTS_HOME/$directory" && test ! -L "$DOTS_HOME/$directory" || continue
+    find "$DOTS_HOME/$directory" -type f -print 2>/dev/null | while IFS= read -r absolute; do
+      path=${absolute#"$DOTS_HOME"/}
+      add_candidate "$path" "$approved" "$out"
+    done
+  done
+  for directory in .claude/skills .codex/skills .cursor/skills .grok/skills; do
+    test -d "$DOTS_HOME/$directory" && test ! -L "$DOTS_HOME/$directory" || continue
+    find "$DOTS_HOME/$directory" -type f -name SKILL.md -print 2>/dev/null | while IFS= read -r absolute; do
+      path=${absolute#"$DOTS_HOME"/}
+      add_candidate "$path" "$approved" "$out"
+    done
+  done
+  if test -d "$DOTS_HOME/.config" && test ! -L "$DOTS_HOME/.config"; then
+    find "$DOTS_HOME/.config" -type f -print 2>/dev/null | while IFS= read -r absolute; do
+      path=${absolute#"$DOTS_HOME"/}
+      add_candidate "$path" "$approved" "$out"
+    done
+  fi
   sort -u "$out" -o "$out"
 }
 
@@ -393,7 +415,7 @@ print_candidates() {
   count=$(wc -l <"$candidates" | tr -d ' ')
   test "$count" -gt 0 || { say "No unapproved, low-risk configuration candidates found."; return 0; }
   say "Candidate configuration files (names only):"
-  awk '{ printf "%3d  %s\\n", NR, $0 }' "$candidates"
+  awk '{ printf "%3d  %s\n", NR, $0 }' "$candidates"
 }
 
 select_candidates() {
