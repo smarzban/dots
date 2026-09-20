@@ -34,7 +34,7 @@ For the default private configuration repository, run this from a terminal:
 dots init
 ```
 
-`dots` derives the authenticated GitHub account from `gh`, then uses `<account>/dotfiles`. If that repository is missing, it asks before creating it privately. It seeds only an empty versioned manifest, then you can add approved paths to `.config/dots/manifest` and run `dots sync` to adopt their current contents. `gh` is needed only for no-argument initialization and automatic creation.
+`dots` derives the authenticated GitHub account from `gh`, then uses `<account>/dotfiles`. If that repository is missing, it asks before creating it privately. It seeds only an empty versioned manifest, then offers an opt-in, names-only scan for likely configuration files. You select exact numbered paths and confirm the manifest preview, `dots` never adopts files automatically. To rerun it later, use `dots init --discover`. `gh` is needed only for no-argument initialization and automatic creation.
 
 You can also initialize an existing repository:
 

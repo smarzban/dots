@@ -100,6 +100,12 @@ run_sync() {
   (sleep 3; printf '%s' "$input") | HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid /usr/bin/script -q /dev/null /bin/sh -c "$DOTS sync"
 }
 
+run_discover() {
+  home=$1
+  input=$2
+  (sleep 3; printf '%s' "$input") | HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid /usr/bin/script -q /dev/null /bin/sh -c "$DOTS init --discover"
+}
+
 run_default_init() {
   home=$1
   remote=$2
@@ -168,6 +174,11 @@ remote=$TMP/collision.git; new_remote "$remote"; home=$TMP/home-collision; mkdir
 if expect_fail run_dots "$home" init "$remote" main && test "$(cat "$home/.config/example/settings")" = old; then pass "collision refused"; else fail "collision refused"; fi
 home=$TMP/home-idempotent; mkdir -p "$home"
 if expect_ok run_dots "$home" init "$remote" main && expect_ok run_dots "$home" init "$remote" main; then pass "idempotent init"; else fail "idempotent init"; fi
+
+# Discovery reads names only, requires numbered selection plus confirmation, and
+# adds only the selected safe candidates to the manifest.
+printf git >"$home/.gitconfig"; printf shell >"$home/.zshrc"
+if run_discover "$home" $'1,2\ny\n' >/dev/null 2>&1 && grep -Fx .gitconfig "$home/.config/dots/manifest" >/dev/null && grep -Fx .zshrc "$home/.config/dots/manifest" >/dev/null; then pass "interactive candidate discovery"; else fail "interactive candidate discovery"; fi
 
 # status scopes itself to the allowlist and never reports an unrelated home file.
 printf private >"$home/private-token"

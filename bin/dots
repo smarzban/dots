@@ -26,7 +26,7 @@ say() { printf '%s\n' "$*"; }
 fail() { printf 'dots: %s\n' "$*" >&2; exit 1; }
 usage() { cat <<'EOF'
 Usage:
-  dots init [remote] [branch]
+  dots init [--discover] [remote] [branch]
   dots status
   dots sync
 EOF
@@ -55,6 +55,20 @@ mktemp_dir() {
   mktemp -d "${TMPDIR:-/tmp}/dots.XXXXXX" || fail "cannot create temporary directory"
 }
 
+valid_manifest_path() {
+  line=$1
+  test -n "$line" || return 1
+  # v1 paths are printable ASCII. This avoids ambiguous Unicode whitespace and
+  # platform-dependent normalization, as well as unsafe Git pathspec characters.
+  printf '%s' "$line" | LC_ALL=C grep '[^ -~]' >/dev/null && return 1
+  case $line in
+    '#'*|:*|*'\\'*|.gitleaks.toml|/*|./*|*/|*'//'*|*'..'*|*'?'*|*'*'*|*'['*|*']'*|*'{'*|*'}'*) return 1 ;;
+  esac
+  case "/$line/" in */./*|*/../*) return 1 ;; esac
+  case $line in *' '*|*$'\t'*) return 1 ;; esac
+  return 0
+}
+
 # A manifest is parsed into a private newline-delimited file. Paths cannot contain
 # controls, so this representation is unambiguous.
 validate_manifest_file() {
@@ -64,16 +78,7 @@ validate_manifest_file() {
   : >"$out_file" || return 1
   while IFS= read -r line || test -n "$line"; do
     case $line in ''|'#'*) continue ;; esac
-    # v1 paths are printable ASCII. This avoids ambiguous Unicode whitespace and
-    # platform-dependent normalization, as well as unsafe Git pathspec characters.
-    printf '%s' "$line" | LC_ALL=C grep '[^ -~]' >/dev/null && return 1
-    case $line in
-      :*|*'\\'*|.gitleaks.toml|/*|./*|*/|*'//'*|*'..'*|*'?'*|*'*'*|*'['*|*']'*|*'{'*|*'}'*) return 1 ;;
-    esac
-    # Reject a dot or dot-dot component, rather than accepting prefix lookalikes.
-    case "/$line/" in */./*|*/../*) return 1 ;; esac
-    # Spaces make review and shell output ambiguous. They are deliberately not v1 paths.
-    case $line in *' '*|*$'\t'*) return 1 ;; esac
+    valid_manifest_path "$line" || return 1
     grep -F -x -- "$line" "$out_file" >/dev/null 2>&1 && return 1
     printf '%s\n' "$line" >>"$out_file" || return 1
   done <"$manifest_file"
@@ -353,6 +358,99 @@ create_default_github_repository() {
   return 0
 }
 
+candidate_is_excluded() {
+  path=$1
+  # Names only, conservative exclusions for secrets and machine-local state.
+  case $path in
+    .config/dots/*|.config/gh/*|*/.git/*|*/auth*|*/credentials*|*token*|*secret*|*password*|*.env|*/cache/*|*/logs/*|*/log/*|*/runtime/*|*/tmp/*|*/backups/*|*history*|*session*|*state*|*.db|*.sqlite*|*.lock|*.log|*.pid|*.bak|*backup*) return 0 ;;
+  esac
+  return 1
+}
+
+collect_candidates() {
+  approved=$1
+  out=$2
+  : >"$out" || return 1
+  for path in .gitconfig .bash_profile .profile .tcshrc .zshenv .zshrc; do
+    test -f "$DOTS_HOME/$path" && test ! -L "$DOTS_HOME/$path" || continue
+    path_in_list "$path" "$approved" || printf '%s\n' "$path" >>"$out"
+  done
+  test -d "$DOTS_HOME/.config" && test ! -L "$DOTS_HOME/.config" || return 0
+  find "$DOTS_HOME/.config" -type f -print 2>/dev/null | while IFS= read -r absolute; do
+    path=${absolute#"$DOTS_HOME"/}
+    valid_manifest_path "$path" || continue
+    is_reserved_path "$path" && continue
+    candidate_is_excluded "$path" && continue
+    path_in_list "$path" "$approved" && continue
+    printf '%s\n' "$path"
+  done >>"$out"
+  sort -u "$out" -o "$out"
+}
+
+select_candidates() {
+  candidates=$1
+  approved=$2
+  temp=$3
+  selected=$temp/selected
+  : >"$selected"
+  count=$(wc -l <"$candidates" | tr -d ' ')
+  test "$count" -gt 0 || { say "No unapproved, low-risk configuration candidates found."; return 0; }
+  say "Candidate configuration files (names only):"
+  awk '{ printf "%3d  %s\\n", NR, $0 }' "$candidates"
+  printf 'Select files to add (for example 1,3-5, Enter for none): ' >&2
+  IFS= read -r selection || fail "candidate selection cancelled"
+  test -n "$selection" || { say "no files selected"; return 0; }
+  case $selection in ,*|*,|*,,*|*[!0-9,-]*) fail "selection must contain only numbers, commas, and ranges" ;; esac
+  oldifs=$IFS
+  IFS=,
+  set -- $selection
+  IFS=$oldifs
+  for item in "$@"; do
+    case $item in
+      *-*) start=${item%-*}; finish=${item#*-}; test -n "$start" && test -n "$finish" && test "$start" -le "$finish" || fail "invalid selection range" ;;
+      *) start=$item; finish=$item ;;
+    esac
+    test "$start" -ge 1 2>/dev/null && test "$finish" -le "$count" 2>/dev/null || fail "selection is out of range"
+    number=$start
+    while test "$number" -le "$finish"; do
+      path=$(sed -n "${number}p" "$candidates") || fail "could not read selected candidate"
+      path_in_list "$path" "$selected" && fail "selection contains a duplicate"
+      printf '%s\n' "$path" >>"$selected"
+      number=$((number + 1))
+    done
+  done
+  test -s "$selected" || { say "no files selected"; return 0; }
+  say "Will add to $MANIFEST:"
+  cat "$selected"
+  printf 'Write these approved paths to the manifest? [y/N] ' >&2
+  IFS= read -r answer || fail "manifest update cancelled"
+  case $answer in y|Y|yes|YES) ;; *) say "manifest unchanged"; return 0 ;; esac
+  new_manifest=$temp/new-manifest
+  cat "$DOTS_HOME/$MANIFEST" >"$new_manifest" || fail "could not read live manifest"
+  while IFS= read -r path; do
+    path_in_list "$path" "$approved" || printf '%s\n' "$path" >>"$new_manifest"
+  done <"$selected"
+  validate_manifest_file "$new_manifest" "$temp/validated-selection" || fail "selected paths cannot form a safe manifest"
+  mv "$new_manifest" "$DOTS_HOME/$MANIFEST" || fail "could not update manifest"
+  say "manifest updated, run dots sync to scan and commit these paths"
+}
+
+discover_candidates() {
+  temp=$1
+  test -t 0 && test -t 1 || fail "candidate discovery requires an interactive terminal"
+  live_manifest_list "$temp/discovery-approved" || fail "live manifest is unsafe"
+  collect_candidates "$temp/discovery-approved" "$temp/candidates" || fail "could not collect candidates"
+  select_candidates "$temp/candidates" "$temp/discovery-approved" "$temp"
+}
+
+offer_discovery() {
+  temp=$1
+  test -t 0 && test -t 1 || { say "manifest is empty; run dots init --discover to review configuration candidates"; return 0; }
+  printf 'Scan this Mac for likely configuration files? [y/N] ' >&2
+  IFS= read -r answer || { say "manifest remains empty; run dots init --discover later"; return 0; }
+  case $answer in y|Y|yes|YES) discover_candidates "$temp" ;; *) say "manifest remains empty; run dots init --discover later" ;; esac
+}
+
 check_new_tree_collisions() {
   gitdir=$1
   base=$2
@@ -372,6 +470,8 @@ check_new_tree_collisions() {
 }
 
 init_command() {
+  discover=false
+  if test "${1:-}" = --discover; then discover=true; shift; fi
   test $# -le 2 || { usage >&2; exit 2; }
   auto_default=false
   if test $# -eq 0 && test -e "$REPO"; then
@@ -406,7 +506,7 @@ init_command() {
     test -z "$requested_branch" -o "$requested_branch" = "$branch" || fail "already initialized with a different branch"
     temp=$(mktemp_dir); trap 'rm -rf "$temp"' EXIT HUP INT TERM
     validate_current_state "$temp" || fail "existing repository or live manifest is unsafe"
-    say "already initialized on $branch; no live files changed"
+    if test "$discover" = true; then discover_candidates "$temp"; else say "already initialized on $branch; no live files changed"; fi
     exit 0
   fi
   mkdir -p "$DOTS_DATA" || fail "cannot create data directory"
@@ -449,6 +549,11 @@ init_command() {
   git_repo checkout --quiet "$revision" -- "$@" || fail "checkout failed after preflight; inspect live files before retrying"
   git_repo config dots.initialized true || fail "could not finalize initialization"
   say "initialized $branch at $revision"
+  if test "$discover" = true; then
+    discover_candidates "$temp"
+  elif test ! -s "$temp/manifest-paths"; then
+    offer_discovery "$temp"
+  fi
 }
 
 status_command() {
