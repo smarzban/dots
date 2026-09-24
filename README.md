@@ -160,7 +160,7 @@ include .claude/skills/*/SKILL.md
 exclude .config/some-app/*
 ```
 
-Patterns are relative to your home folder and `*` also matches `/`. Write out the first folder (`.claude/…`, not `.*/…`); a pattern without a folder matches files directly in your home folder. Exclusions win over includes, and the built-in exclusions always apply.
+Patterns are relative to your home folder and `*` also matches `/`. Write out the first folder (`.claude/…`, not `.*/…`); a pattern without a folder matches files directly in your home folder. Exclusions win over includes. An include can reach into a Git checkout (for example a folder you used to sync with its own repository), but the built-in credential and state exclusions always apply.
 
 ## How it works
 

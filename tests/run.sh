@@ -270,10 +270,12 @@ printf '%s\n' '# rules for this test' 'include .pi/agent/agents/*' 'include .cod
 discovery=$(run_dots "$disc" init --discover 2>&1)
 if listed .pi/agent/agents/helper.md && listed .codex/skills/demo/SKILL.md && listed .config/dots/discover && ! printf '%s' "$discovery" | grep -F -e '.pi/agent/agents/a' -e forged-notes >/dev/null; then pass "discover rules include extra files"; else fail "discover rules include extra files"; fi
 if ! printf '%s' "$discovery" | grep -F -e notes.md -e .config/mcp/ -e .pi/web-search.json >/dev/null; then pass "discover rules exclude files"; else fail "discover rules exclude files"; fi
-# Includes still obey the built-in exclusions, symlink checks, and Git checkout rule.
+# Includes still obey the built-in exclusions and symlink checks, but may reach into a
+# Git checkout the owner names explicitly.
 printf '%s\n' 'include .ssh/*' 'include .unknowntool/*' 'include .grok/*' 'include .grok/config.toml' 'include .project/*' 'include .config/vendored/*' >"$disc/.config/dots/discover"
 discovery=$(run_dots "$disc" init --discover 2>&1)
-if listed .unknowntool/sub/deeper/too-deep.json && ! printf '%s' "$discovery" | grep -F -e .ssh/ -e huge.json -e /cache/ -e .grok/ -e .project/ -e .config/vendored/ >/dev/null; then pass "discover includes keep built-in exclusions"; else fail "discover includes keep built-in exclusions"; fi
+if listed .unknowntool/sub/deeper/too-deep.json && ! printf '%s' "$discovery" | grep -F -e .ssh/ -e huge.json -e /cache/ -e .grok/ >/dev/null; then pass "discover includes keep built-in exclusions"; else fail "discover includes keep built-in exclusions"; fi
+if listed .project/config.json && listed .config/vendored/settings.json; then pass "discover includes can name files in a Git checkout"; else fail "discover includes can name files in a Git checkout"; fi
 # A malformed rules file fails closed with the line number.
 printf '%s\n' 'include .pi/agent/agents/*' 'includ .zshrc' >"$disc/.config/dots/discover"
 if ! (run_dots "$disc" init --discover) >"$TMP/rules.out" 2>&1 && grep -F 'discover line 2' "$TMP/rules.out" >/dev/null; then pass "invalid discover rule fails with its line"; else fail "invalid discover rule fails with its line"; fi

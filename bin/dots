@@ -589,7 +589,9 @@ load_discover_rules() {
   return 0
 }
 
-# add_candidate path [config-names]; appends to $DC_OUT unless approved or filtered.
+# add_candidate path [config-names|included]; appends to $DC_OUT unless approved or
+# filtered. "included" marks a path named by an include rule, which may be inside a
+# Git checkout; every other filter still applies.
 add_candidate() {
   ac_path=$1
   # Every source is a hidden path in HOME; anything else is a forged or stray name.
@@ -601,7 +603,7 @@ add_candidate() {
   # A symlinked parent (for example ~/.claude -> elsewhere) would publish files from outside HOME.
   safe_live_path "$ac_path" || return 0
   test -f "$DOTS_HOME/$ac_path" && test ! -L "$DOTS_HOME/$ac_path" || return 0
-  inside_git_checkout "$ac_path" && return 0
+  test "${2:-}" = included || ! inside_git_checkout "$ac_path" || return 0
   is_reserved_path "$ac_path" && return 0
   path_in_list "$ac_path" "$DC_APPROVED" && return 0
   small_text_file "$DOTS_HOME/$ac_path" || return 0
@@ -654,12 +656,12 @@ collect_candidates() {
   # Rule includes: walk from the pattern's fixed leading folder, then match.
   while IFS= read -r dc_pattern; do
     dc_fixed=${dc_pattern%%[*?[]*}
-    if test "$dc_fixed" = "$dc_pattern"; then add_candidate "$dc_pattern"; continue; fi
+    if test "$dc_fixed" = "$dc_pattern"; then add_candidate "$dc_pattern" included; continue; fi
     case $dc_fixed in */*) dc_base=${dc_fixed%/*}; dc_depth= ;; *) dc_base=; dc_depth=1 ;; esac
     walk_files "$dc_base" "$dc_depth" | while IFS= read -r -d '' dc_file; do
       dc_path=${dc_file#"$DOTS_HOME"/}
       # shellcheck disable=SC2254 # rule patterns are globs on purpose
-      case $dc_path in $dc_pattern) add_candidate "$dc_path" ;; esac
+      case $dc_path in $dc_pattern) add_candidate "$dc_path" included ;; esac
     done
   done <"$DC_INCLUDES"
   rm -f "$DC_INCLUDES" "$DC_EXCLUDES"
