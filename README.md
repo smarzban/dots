@@ -76,7 +76,7 @@ dots sync --continue
 
 Incoming paths, manifests, revision names, and filenames are treated as untrusted. Any invalid manifest/tree, symlink, unapproved tracked file, credential scan failure, collision (except an identical file, or a differing file with `init --backup-existing`), or unsafe parent fails closed without printing file contents or scanner findings.
 
-All checkable preflight happens before `$HOME` is changed. A disk, permission, or process failure while Git is actually checking out or merging can still interrupt multi-file filesystem changes, Git's normal recovery state is retained in that case. `gitleaks` reduces accidental secret commits, it is not a proof that a value is non-sensitive.
+All checkable preflight happens before `$HOME` is changed. A disk, permission, or process failure while Git is actually checking out or merging can still interrupt multi-file filesystem changes. For `sync`, Git's normal recovery state is retained. For `init`, the incomplete repository is removed so you can rerun `init`: files already replaced now match and are adopted, and the originals of differing files remain in the reported backup directory. `gitleaks` reduces accidental secret commits, it is not a proof that a value is non-sensitive.
 
 ## Publishing a release
 
