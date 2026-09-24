@@ -430,6 +430,13 @@ test -n "$edit_ref" && /usr/bin/git --git-dir="$edit_remote" update-ref refs/hea
 printf 'v2\n' >"$edit_home/.zshrc"
 if run_sync "$edit_home" $'n\n' >/dev/null 2>&1 && test "$(cat "$edit_home/.zshrc")" = v2 && grep -Fx 'skip .zshrc' "$edit_home/data/selection" >/dev/null; then pass "edited own file is confirmed, not a stuck sync"; else fail "edited own file is confirmed, not a stuck sync"; fi
 
+# A pending file that reaches the manifest by a manual edit is confirmed and backed up, not a stuck sync.
+remote=$TMP/pending-manual.git; new_remote "$remote"; manual_home=$TMP/home-pending-manual; mkdir -p "$manual_home"; expect_ok run_dots "$manual_home" init "$remote" main
+remote_edit "$remote" "printf '%s\\n' '.config/example/settings' '.zshrc' > \"\$1/.config/dots/manifest\"; printf 'theirs\\n' > \"\$1/.zshrc\"" || exit 1
+printf 'pending .zshrc\n' >>"$manual_home/data/selection"
+printf '%s\n' '.config/example/settings' '.zshrc' >"$manual_home/.config/dots/manifest"; printf 'mine\n' >"$manual_home/.zshrc"
+if run_sync "$manual_home" $'y\n1\n' >/dev/null 2>&1 && test "$(cat "$manual_home/.zshrc")" = theirs && test "$(cat "$(find "$manual_home/data/backups" -path '*/.zshrc' -type f | head -1)")" = mine; then pass "manually listed pending file is confirmed and backed up"; else fail "manually listed pending file is confirmed and backed up"; fi
+
 # Update: unticking a shared file removes it from the repository only; files this Mac skips keep their repository version.
 remote=$TMP/update-remove.git; new_remote "$remote"
 remote_edit "$remote" "printf '%s\\n' '.config/example/settings' '.zshrc' '.gitconfig' > \"\$1/.config/dots/manifest\"; printf 'shell\\n' > \"\$1/.zshrc\"; printf 'git\\n' > \"\$1/.gitconfig\"" || exit 1

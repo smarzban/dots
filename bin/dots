@@ -293,9 +293,12 @@ load_selection() {
 }
 
 # Pending paths that reached the given manifest are used on this Mac from now on.
+# They count as newly used, so a copy edited since the PR is confirmed or backed up
+# rather than treated as a collision.
 pending_arrived() {
   list_intersect "$1/pending" "$2" "$1/arrived"
   cat "$1/arrived" >>"$1/use"
+  cat "$1/arrived" >>"$1/newly-used"
   list_minus "$1/pending" "$1/arrived" "$1/pending.next" && mv -f "$1/pending.next" "$1/pending"
 }
 
@@ -991,8 +994,6 @@ apply_workspace_result() {
   scan_directory "$workspace" || return 1
   if test ! -f "$temp/use"; then
     load_selection "$temp" "$temp/result-manifest" || return 1
-    # Own merged files are newly used here, so an edited copy is backed up, not a collision.
-    cat "$temp/arrived" >>"$temp/newly-used"
     # sync --continue: restore choices made about new files before the conflict.
     if test -f "$workspace/.git/dots-newly-used"; then
       cat "$workspace/.git/dots-newly-used" >>"$temp/newly-used" || return 1
@@ -1045,18 +1046,18 @@ sync_command() {
   remote=$(fetch_validated_remote "$temp" "$branch") || fail "incoming repository data is unsafe or unavailable"
   git_repo merge-base --is-ancestor "$base" "$remote" || test "$base" = "$remote" || fail "remote history is not a safe fast-forward"
   # This Mac's own merged update PRs: its pending files are used here, not offered.
-  # They still count as newly used, so a copy edited since the PR is confirmed first.
   pending_arrived "$temp" "$temp/remote-manifest"
-  cat "$temp/arrived" >>"$temp/newly-used"
   # Files another Mac added that this Mac has not been asked about yet. The choice is
   # saved only when the repository configuration is applied.
   list_minus "$temp/remote-manifest" "$temp/use" "$temp/unseen-used"
   list_minus "$temp/unseen-used" "$temp/skip" "$temp/unseen"
   if test -s "$temp/unseen"; then
     build_rows "$temp/unseen" "$temp/unseen-rows"
-    cp "$temp/unseen" "$temp/newly-used"
-    checklist "$temp/unseen-rows" "$temp/newly-used" "New files in the repository: choose which to use on this Mac" || fail "sync cancelled, nothing was changed"
-    list_minus "$temp/unseen" "$temp/newly-used" "$temp/newly-skipped"
+    cp "$temp/unseen" "$temp/unseen-chosen"
+    checklist "$temp/unseen-rows" "$temp/unseen-chosen" "New files in the repository: choose which to use on this Mac" || fail "sync cancelled, nothing was changed"
+    list_minus "$temp/unseen" "$temp/unseen-chosen" "$temp/newly-skipped"
+    # Appended, so this Mac's own merged files already marked newly used are kept.
+    cat "$temp/unseen-chosen" >>"$temp/newly-used"
   fi
   test -f "$temp/newly-skipped" || : >"$temp/newly-skipped"
   has_local=false
