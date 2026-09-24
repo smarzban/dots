@@ -261,8 +261,9 @@ list_count() { wc -l <"$1" | tr -d ' '; }
 # ── Machine selection ───────────────────────────────────────
 # Format: a comment header, then "use <path>", "skip <path>", or "pending <path>"
 # lines. Pending paths were shared from this Mac by an update PR that is not merged
-# yet; they become used once they appear in the manifest. Paths are validated
-# manifest paths, so they contain no whitespace.
+# yet; they become used once they appear in the manifest. "ignore <path>" marks a
+# discovered file this Mac chose not to share, so dots update lists it last instead
+# of as new. Paths are validated manifest paths, so they contain no whitespace.
 selection_list() {
   kind=$1
   out=$2
@@ -283,10 +284,12 @@ load_selection() {
     selection_list use "$temp/use"
     selection_list skip "$temp/skip"
     selection_list pending "$temp/pending"
+    selection_list ignore "$temp/ignore"
   else
     cp "$manifest_union" "$temp/use" || return 1
     : >"$temp/skip"
     : >"$temp/pending"
+    : >"$temp/ignore"
   fi
   : >"$temp/newly-used"
   pending_arrived "$temp" "$manifest_union"
@@ -302,13 +305,19 @@ pending_arrived() {
   list_minus "$1/pending" "$1/arrived" "$1/pending.next" && mv -f "$1/pending.next" "$1/pending"
 }
 
-# Save use/skip entries for paths present in the given manifest list.
+# Save use/skip entries for paths present in the given manifest list, plus pending
+# and ignore entries for paths outside it. Without an ignore list the saved ignore
+# entries are kept, so only update, which offers those files, has to pass one.
 write_selection() {
   use=$1
   skip=$2
   manifest=$3
   pending=${4:-/dev/null}
   tmp=$(mktemp "$DOTS_DATA/.selection.XXXXXX") || return 1
+  ignore=${5:-$tmp.ignore}
+  if test -z "${5:-}"; then
+    : >"$ignore" && selection_list ignore "$ignore" || { rm -f "$tmp" "$tmp.ignore"; return 1; }
+  fi
   {
     printf '%s\n' '# dots selection v1: repository files this Mac uses. Change with: dots select'
     while IFS= read -r path; do
@@ -320,7 +329,11 @@ write_selection() {
     while IFS= read -r path; do
       if ! path_in_list "$path" "$manifest" && valid_manifest_path "$path"; then printf 'pending %s\n' "$path"; fi
     done <"$pending"
-  } >"$tmp" || { rm -f "$tmp"; return 1; }
+    while IFS= read -r path; do
+      if ! path_in_list "$path" "$manifest" && ! path_in_list "$path" "$pending" && valid_manifest_path "$path"; then printf 'ignore %s\n' "$path"; fi
+    done <"$ignore"
+  } >"$tmp" || { rm -f "$tmp" "$tmp.ignore"; return 1; }
+  rm -f "$tmp.ignore"
   mv -f "$tmp" "$SELECTION"
 }
 
@@ -451,59 +464,176 @@ create_default_github_repository() {
   return 0
 }
 
+# ── Discovery ───────────────────────────────────────────────
+# Candidates come from a generic scan, never a list of tools: dotfiles directly in
+# HOME, everything under ~/.config, and config-like files up to two levels inside
+# any other ~/.<name> folder. An optional shared rules file adds or drops paths.
+# Helpers here can run outside a subshell, so their variables carry prefixes to
+# avoid clobbering callers (update_command uses $base, for example).
+DISCOVER_RULES=.config/dots/discover
+DISCOVER_MAX_BYTES=65536
+
+# Names that hold credentials, caches, or machine-local state, wherever they appear.
+# Matching is case-insensitive. gitleaks still scans every chosen file before a push.
 candidate_is_excluded() {
-  path=$1
-  # Names only, conservative exclusions for secrets and machine-local state.
-  case $path in
-    .config/dots/*|.config/gh/*|.config/mcp/*|.config/browser-harness/*|.config/cagent/*|.config/configstore/*|.config/origin-cli/*|.config/pass/*|.config/vercel-plugin/*|.config/zed/prompts/*|.config/herdr/release-notes.json|.config/herdr/tsk-plugins/*|.config/chezmoi/*|.config/uv/*|*/.git/*|*/.system/*|*/auth*|*/credentials*|*token*|*secret*|*password*|*.env|*/cache/*|*/logs/*|*/log/*|*/runtime/*|*/tmp/*|*/backups/*|*history*|*session*|*state*|*.db|*.sqlite*|*.lock|*.log|*.pid|*.bak|*backup*) return 0 ;;
+  case $1 in
+    "$DISCOVER_RULES") return 1 ;;
+    .config/dots/*) return 0 ;;
+  esac
+  ce_lower=$(printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]')
+  case "/$ce_lower" in
+    # Folders of credentials or keys.
+    /.ssh/*|/.gnupg/*|/.kube/*|/.config/gh/*|/.config/configstore/*|/.docker/config.json) return 0 ;;
+    # Caches, logs, transcripts, and other machine-local state.
+    */.git/*|*/.system/*|*/logs/*|*/log/*|*-logs/*|*_logs/*|*/tmp/*|*/temp/*|*/runtime/*|*/sessions/*|*/state/*|*/history/*|*/projects/*|*/node_modules/*|*/backups/*|*/.trash/*) return 0 ;;
+    # Private content that tools keep next to their settings.
+    */memories/*|*/memory/*|*/attachments/*|*/transcripts/*) return 0 ;;
+    *auth*|*credential*|*token*|*secret*|*password*|*passwd*|*history*|*session*|*state*|*backup*|*cache*|*telemetry*|*analytics*) return 0 ;;
+  esac
+  case ${ce_lower##*/} in
+    .netrc|.npmrc|.pypirc|.pgpass|.my.cnf|.git-credentials|.env|.env.*|*.env|*.env.*|*.pem|*.key|*.p12|*.pfx|*.crt|*.keychain*|id_*|*.db|*.db-*|*.sqlite*|*.lock|*.log|*.pid|*.bak|*.old|*.swp|*~) return 0 ;;
+    .ds_store|.cfusertextencoding|.localized|.zcompdump*|.viminfo|.lesshst|.wget-hsts|.xauthority) return 0 ;;
+    # Application state files that live beside configuration and hold account details.
+    .claude.json) return 0 ;;
   esac
   return 1
 }
 
+# Inside ~/.<name> folders only names that look like hand-edited configuration count.
+config_like_name() {
+  case ${1##*/} in
+    *.json|*.jsonc|*.json5|*.toml|*.yaml|*.yml|*.conf|*.cfg|*.ini|*.md|*.sh|*.bash|*.zsh|*.fish|*.lua|*.vim|*.rules|*rc|config) return 0 ;;
+  esac
+  return 1
+}
+
+# Small text files only: large or binary files are data, not configuration.
+small_text_file() {
+  st_size=$(wc -c <"$1" 2>/dev/null | tr -d ' ')
+  case $st_size in ''|*[!0-9]*) return 1 ;; esac
+  test "$st_size" -gt 0 && test "$st_size" -le "$DISCOVER_MAX_BYTES" || return 1
+  st_text=$(LC_ALL=C tr -d '\000' <"$1" | wc -c | tr -d ' ')
+  test "$st_text" = "$st_size"
+}
+
+path_matches_list() {
+  while IFS= read -r pm_pattern; do
+    # shellcheck disable=SC2254 # rule patterns are globs on purpose
+    case $1 in $pm_pattern) return 0 ;; esac
+  done <"$2"
+  return 1
+}
+
+# Rule patterns are HOME-relative printable ASCII globs without spaces or "..".
+valid_rule_pattern() {
+  test -n "$1" || return 1
+  printf '%s' "$1" | LC_ALL=C grep '[^!-~]' >/dev/null && return 1
+  case $1 in .*) ;; *) return 1 ;; esac
+  case $1 in *'..'*|*'\\'*|*'//'*|*/) return 1 ;; esac
+  return 0
+}
+
+# Parse the optional rules file into include and exclude pattern lists.
+# "include <pattern>" adds files the scan misses, "exclude <pattern>" drops files
+# it finds; exclusions win, and the built-in exclusions always apply.
+load_discover_rules() {
+  : >"$1" && : >"$2" || return 1
+  dr_file=$DOTS_HOME/$DISCOVER_RULES
+  test -e "$dr_file" || test -L "$dr_file" || return 0
+  { safe_live_path "$DISCOVER_RULES" && test -f "$dr_file" && test ! -L "$dr_file"; } || { say "$DISCOVER_RULES must be a regular file"; return 1; }
+  dr_number=0
+  while IFS= read -r dr_line || test -n "$dr_line"; do
+    dr_number=$((dr_number + 1))
+    case $dr_line in ''|'#'*) continue ;; esac
+    dr_kind=${dr_line%% *}
+    dr_pattern=${dr_line#* }
+    if test "$dr_kind" != "$dr_line" && valid_rule_pattern "$dr_pattern"; then
+      case $dr_kind in
+        include) printf '%s\n' "$dr_pattern" >>"$1"; continue ;;
+        exclude) printf '%s\n' "$dr_pattern" >>"$2"; continue ;;
+      esac
+    fi
+    say "$DISCOVER_RULES line $dr_number: expected \"include <pattern>\" or \"exclude <pattern>\""
+    return 1
+  done <"$dr_file"
+  return 0
+}
+
+# add_candidate path [config-names]; appends to $DC_OUT unless approved or filtered.
 add_candidate() {
-  path=$1
-  approved=$2
-  out=$3
-  valid_manifest_path "$path" || return 0
+  ac_path=$1
+  valid_manifest_path "$ac_path" || return 0
+  candidate_is_excluded "$ac_path" && return 0
+  test "${2:-}" != config-names || config_like_name "$ac_path" || return 0
+  path_matches_list "$ac_path" "$DC_EXCLUDES" && return 0
   # A symlinked parent (for example ~/.claude -> elsewhere) would publish files from outside HOME.
-  safe_live_path "$path" || return 0
-  test -f "$DOTS_HOME/$path" && test ! -L "$DOTS_HOME/$path" || return 0
-  is_reserved_path "$path" && return 0
-  candidate_is_excluded "$path" && return 0
-  path_in_list "$path" "$approved" && return 0
-  printf '%s\n' "$path" >>"$out"
+  safe_live_path "$ac_path" || return 0
+  test -f "$DOTS_HOME/$ac_path" && test ! -L "$DOTS_HOME/$ac_path" || return 0
+  is_reserved_path "$ac_path" && return 0
+  path_in_list "$ac_path" "$DC_APPROVED" && return 0
+  small_text_file "$DOTS_HOME/$ac_path" || return 0
+  printf '%s\n' "$ac_path" >>"$DC_OUT"
+}
+
+# Print files under a HOME-relative folder ("" for HOME itself), NUL-delimited so a
+# newline inside a filename cannot forge another path; valid_manifest_path then
+# rejects the control character. An optional second argument limits the depth.
+walk_files() {
+  if test -n "$1"; then
+    safe_live_path "$1" && test -d "$DOTS_HOME/$1" && test ! -L "$DOTS_HOME/$1" || return 0
+    wf_root=$DOTS_HOME/$1
+  else
+    wf_root=$DOTS_HOME
+  fi
+  if test -n "${2:-}"; then
+    find "$wf_root" -mindepth 1 -maxdepth "$2" -type f -print0 2>/dev/null
+  else
+    find "$wf_root" -mindepth 1 -type f -print0 2>/dev/null
+  fi
 }
 
 collect_candidates() {
-  approved=$1
-  out=$2
-  : >"$out" || return 1
-  # NUL-delimited walks keep a newline inside a filename from forging another path;
-  # valid_manifest_path then rejects the control character.
-  for path in .gitconfig .bash_profile .profile .tcshrc .zshenv .zshrc .claude/settings.json .claude/statusline-command.sh .codex/AGENTS.md .codex/config.toml .codex/hooks.json .codex/keybindings.json .codex/rules/default.rules .cursor/argv.json .cursor/cli-config.json .cursor/hooks.json .cursor/statusline.sh .grok/config.toml .grok/pager.toml .grok/statusline.sh .grokbot/settings.json .pi/agent/AGENTS.md .pi/agent/editor.json .pi/agent/settings.json .pi/agent/spawn.json .pi/agent/statusline.json .pi/agent/toolview.json .pi/workflows/model-tiers.json .pi/workflows/settings.json; do
-    add_candidate "$path" "$approved" "$out"
+  DC_APPROVED=$1
+  DC_OUT=$2
+  DC_INCLUDES=$2.includes
+  DC_EXCLUDES=$2.excludes
+  : >"$DC_OUT" || return 1
+  load_discover_rules "$DC_INCLUDES" "$DC_EXCLUDES" || return 1
+  # Dotfiles directly in HOME.
+  walk_files '' 1 | while IFS= read -r -d '' dc_file; do
+    dc_path=${dc_file#"$DOTS_HOME"/}
+    case $dc_path in .*) add_candidate "$dc_path" ;; esac
   done
-  for directory in .claude/hooks .cursor/agents .cursor/rules .grok/hooks .pi/agent/agents .pi/agent/extensions .pi/agent/themes; do
-    test -d "$DOTS_HOME/$directory" && test ! -L "$DOTS_HOME/$directory" || continue
-    find "$DOTS_HOME/$directory" -type f -print0 2>/dev/null | while IFS= read -r -d '' absolute; do
-      path=${absolute#"$DOTS_HOME"/}
-      add_candidate "$path" "$approved" "$out"
+  # Everything under ~/.config.
+  walk_files .config | while IFS= read -r -d '' dc_file; do
+    add_candidate "${dc_file#"$DOTS_HOME"/}"
+  done
+  # Config-like files up to two levels inside every other ~/.<name> folder.
+  find "$DOTS_HOME" -mindepth 1 -maxdepth 1 -type d -name '.*' -print0 2>/dev/null | while IFS= read -r -d '' dc_dir; do
+    dc_dir=${dc_dir#"$DOTS_HOME"/}
+    case $dc_dir in .config|.local|.cache|.Trash|.npm|.cups|.git) continue ;; esac
+    valid_manifest_path "$dc_dir" || continue
+    is_reserved_path "$dc_dir" && continue
+    walk_files "$dc_dir" 2 | while IFS= read -r -d '' dc_file; do
+      dc_path=${dc_file#"$DOTS_HOME"/}
+      # A Git checkout inside a tool folder (a vendored project) is not configuration.
+      case $dc_path in */*/*) test ! -e "$DOTS_HOME/${dc_path%/*}/.git" || continue ;; esac
+      add_candidate "$dc_path" config-names
     done
   done
-  for directory in .claude/skills .codex/skills .cursor/skills .grok/skills; do
-    test -d "$DOTS_HOME/$directory" && test ! -L "$DOTS_HOME/$directory" || continue
-    find "$DOTS_HOME/$directory" -type f -name SKILL.md -print0 2>/dev/null | while IFS= read -r -d '' absolute; do
-      path=${absolute#"$DOTS_HOME"/}
-      add_candidate "$path" "$approved" "$out"
+  # Rule includes: walk from the pattern's fixed leading folder, then match.
+  while IFS= read -r dc_pattern; do
+    dc_fixed=${dc_pattern%%[*?[]*}
+    if test "$dc_fixed" = "$dc_pattern"; then add_candidate "$dc_pattern"; continue; fi
+    case $dc_fixed in */*) dc_base=${dc_fixed%/*}; dc_depth= ;; *) dc_base=; dc_depth=1 ;; esac
+    walk_files "$dc_base" "$dc_depth" | while IFS= read -r -d '' dc_file; do
+      dc_path=${dc_file#"$DOTS_HOME"/}
+      # shellcheck disable=SC2254 # rule patterns are globs on purpose
+      case $dc_path in $dc_pattern) add_candidate "$dc_path" ;; esac
     done
-  done
-  if test -d "$DOTS_HOME/.config" && test ! -L "$DOTS_HOME/.config"; then
-    find "$DOTS_HOME/.config" -type f -print0 2>/dev/null | while IFS= read -r -d '' absolute; do
-      path=${absolute#"$DOTS_HOME"/}
-      add_candidate "$path" "$approved" "$out"
-    done
-  fi
-  sort -u "$out" -o "$out"
+  done <"$DC_INCLUDES"
+  rm -f "$DC_INCLUDES" "$DC_EXCLUDES"
+  sort -u "$DC_OUT" -o "$DC_OUT"
 }
 
 print_candidates() {
@@ -1160,14 +1290,18 @@ update_command() {
   refuse_open_update_pr "$repo_name"
   collect_candidates "$temp/live-manifest" "$temp/candidates" || fail "could not collect candidates"
   # Ticked rows are shared from this Mac; new candidates start unticked unless an
-  # earlier update already chose them (pending).
+  # earlier update already chose them (pending). Candidates left unticked before are
+  # listed last, under "previously ignored".
   list_intersect "$temp/live-manifest" "$temp/use" "$temp/shared"
-  list_union "$temp/shared" "$temp/candidates" "$temp/choices"
+  list_intersect "$temp/candidates" "$temp/ignore" "$temp/ignored-candidates"
+  list_minus "$temp/candidates" "$temp/ignore" "$temp/fresh-candidates"
+  list_union "$temp/shared" "$temp/fresh-candidates" "$temp/choices"
   list_intersect "$temp/candidates" "$temp/pending" "$temp/pending-ticked"
   list_union "$temp/shared" "$temp/pending-ticked" "$temp/chosen"
-  if test -s "$temp/choices"; then
-    build_rows "$temp/choices" "$temp/rows"
-    checklist "$temp/rows" "$temp/chosen" "Files shared from this Mac. Unticking a shared file removes it from the repository for every Mac." || fail "update cancelled, nothing was changed"
+  build_rows "$temp/choices" "$temp/rows"
+  LC_ALL=C sort "$temp/ignored-candidates" | awk '{ print "previously ignored\t" $0 }' >>"$temp/rows"
+  if test -s "$temp/rows"; then
+    checklist "$temp/rows" "$temp/chosen" "Files shared from this Mac. Unticked shared files leave the repository for every Mac; unticked new files are listed last next time." || fail "update cancelled, nothing was changed"
   fi
   list_intersect "$temp/chosen" "$temp/candidates" "$temp/added"
   list_minus "$temp/shared" "$temp/chosen" "$temp/removed"
@@ -1188,7 +1322,11 @@ update_command() {
     # Pending entries not offered in this checklist (for example a file deleted since) are kept.
     list_minus "$temp/pending" "$temp/candidates" "$temp/pending-unoffered"
     list_union "$temp/added" "$temp/pending-unoffered" "$temp/pending-after"
-    write_selection "$temp/use" "$temp/skip" "$temp/manifest-union" "$temp/pending-after" || fail "could not save the file selection"
+    # Unticked candidates are remembered as ignored; entries not offered this time are kept.
+    list_minus "$temp/candidates" "$temp/chosen" "$temp/ignore-now"
+    list_minus "$temp/ignore" "$temp/candidates" "$temp/ignore-unoffered"
+    list_union "$temp/ignore-now" "$temp/ignore-unoffered" "$temp/ignore-after"
+    write_selection "$temp/use" "$temp/skip" "$temp/manifest-union" "$temp/pending-after" "$temp/ignore-after" || fail "could not save the file selection"
   fi
   build_proposed_manifest "$DOTS_HOME/$MANIFEST" "$temp/removed" "$temp/added" "$temp/proposed-manifest" || fail "could not build proposed manifest"
   validate_manifest_file "$temp/proposed-manifest" "$temp/proposed-list" || fail "proposed manifest is unsafe"

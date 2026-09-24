@@ -59,7 +59,7 @@ curl -fsSL https://github.com/smarzban/dots/releases/latest/download/install.sh 
    git --git-dir="$HOME/.local/share/dots/repo.git" config user.email "you@example.com"
    ```
 
-4. Pick the files to share. `dots update` opens a checklist of candidate files grouped by folder. Tick the ones you want, confirm, and give the PR a title:
+4. Pick the files to share. `dots update` opens a checklist of candidate files grouped by folder (see [Which files are suggested](#which-files-are-suggested)). Tick the ones you want, confirm, and give the PR a title. Files you leave unticked are remembered and listed last next time, so later runs start with what is new:
 
    ```sh
    dots update
@@ -130,9 +130,31 @@ dots update
 | `select` | Changes which repository files this Mac uses. Newly chosen files are brought in; a differing local copy is backed up first, after you confirm. Unchosen files stay on disk but stop syncing. |
 | `status` | Shows the branch, how far this Mac is ahead or behind, how many repository files this Mac uses, and which of them changed locally. |
 | `sync` | Fetches, checks, and applies the repository configuration to the files this Mac uses. It only pushes if you choose to create a PR from local changes. |
-| `update` | Opens a pull request with local changes, newly ticked files, and unticked files to remove from the repository. Never changes local files. |
+| `update` | Opens a pull request with local changes, newly ticked files, and unticked files to remove from the repository. Unticked new files are remembered and listed last, under "previously ignored". Never changes local files. |
 
 In checklists, use Up/Down to move, Left/Right to change folder page, Space to toggle, `a` or `n` to tick all or none on the page, Enter to confirm, and `q` to cancel. Without a full terminal, or with `DOTS_PLAIN_PROMPTS=1`, `dots` shows a numbered list instead: type numbers such as `1,3-5` to toggle them.
+
+## Which files are suggested
+
+`dots` doesn't keep a list of tools. It suggests:
+
+- dotfiles directly in your home folder, such as `.zshrc`, `.zprofile`, and `.gitconfig`
+- every file under `~/.config`
+- inside any other `~/.<name>` folder, files up to two levels deep whose names look like configuration (`.json`, `.toml`, `.yaml`, `.conf`, `.ini`, `.md`, `.sh`, `.lua`, names ending in `rc`, and similar)
+
+Only small text files (up to 64 KB) are suggested. Keys and credentials (`~/.ssh`, `~/.gnupg`, `.netrc`, `.npmrc`, names containing `token`, `secret`, `auth`, and similar), caches, logs, history, sessions, and Git checkouts inside tool folders are always left out. Whatever you tick is still scanned with gitleaks before it is pushed.
+
+To tune the suggestions, create `~/.config/dots/discover` with one rule per line, then share it like any other file so every Mac gets the same suggestions:
+
+```text
+# Folders deeper than the scan looks
+include .pi/agent/agents/*
+include .claude/skills/*/SKILL.md
+# Things you never want suggested
+exclude .config/some-app/*
+```
+
+Patterns are relative to your home folder, and `*` also matches `/`. Exclusions win over includes, and the built-in exclusions always apply.
 
 ## How it works
 
@@ -147,7 +169,7 @@ In checklists, use Up/Down to move, Left/Right to change folder page, Space to t
   ```
 
 - Paths must be plain files inside your home directory: no absolute paths, `..`, globs, whitespace, or symlinks.
-- Which of those files this Mac uses is saved in `~/.local/share/dots/selection`. It stays on this Mac and is never synced.
+- Which of those files this Mac uses, and which suggestions it ignored, is saved in `~/.local/share/dots/selection`. It stays on this Mac and is never synced.
 - Before anything is written or pushed, `dots` validates the repository contents against the manifest and scans them with gitleaks. Any problem stops the command without printing file contents.
 
 ## Development
