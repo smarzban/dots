@@ -23,6 +23,7 @@ make_mock_gitleaks() {
 #!/bin/sh
 # Tests use this only to make scanner failures deterministic. It prints no finding.
 # Like the real scanner with --exit-code 3, findings exit 3 and the report names files only.
+[ "${DOTS_TEST_GITLEAKS_ERROR:-0}" = 1 ] && exit 2
 if [ "${DOTS_TEST_GITLEAKS_FAIL:-0}" = 1 ]; then
   want=
   for arg in "$@"; do
@@ -512,6 +513,9 @@ run_derived_default_init "$secret_home" "$secret_remote" $'y\n' >/dev/null 2>&1 
 printf 'key = "DOTS_TEST_SECRET"\n' >"$secret_home/.newtool/config.toml"
 secret_out=$(DOTS_TEST_GITLEAKS_FAIL=1 run_update "$secret_home" "$secret_remote" $'1\ny\nShare new tool\n' 2>&1)
 if printf '%s' "$secret_out" | grep -F '.newtool/config.toml, line 1 (generic-api-key)' >/dev/null && printf '%s' "$secret_out" | grep -F 'nothing was pushed' >/dev/null && ! printf '%s' "$secret_out" | grep -F 'key = ' >/dev/null && ! printf '%s' "$secret_out" | grep -F DOTS_TEST_SECRET >/dev/null && test -z "$(/usr/bin/git --git-dir="$secret_remote" for-each-ref 'refs/heads/dots/update-*')" && ! grep -F 'pr create' "$TMP/gh-update.log" >/dev/null; then pass "update scans newly discovered files before pushing"; else fail "update scans newly discovered files before pushing"; fi
+# A scanner failure is not reported as a secret.
+error_out=$(DOTS_TEST_GITLEAKS_ERROR=1 run_update "$secret_home" "$secret_remote" $'\ny\nShare new tool\n' 2>&1)
+if printf '%s' "$error_out" | grep -F 'could not complete the scan' >/dev/null && ! printf '%s' "$error_out" | grep -F -e 'Remove the secret' -e 'looks like a secret' >/dev/null; then pass "scanner failure is not reported as a secret"; else fail "scanner failure is not reported as a secret"; fi
 # Declining the confirmation saves no ignore entries.
 decline_home=$TMP/home-update-decline; mkdir -p "$decline_home"
 run_derived_default_init "$decline_home" "$TMP/update-decline.git" $'y\n' >/dev/null 2>&1 || exit 1

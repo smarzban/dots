@@ -199,14 +199,32 @@ run_gitleaks() {
   case $gl_status in
     0) ;;
     3)
-      say "gitleaks found what looks like a secret (values are not shown):"
-      # Printable characters only, so a hostile file name cannot drive the terminal.
-      LC_ALL=C tr -cd '\11\12\40-\176' <"$gl_dir/report" 2>/dev/null |
-        awk -F '\t' 'NF >= 3 { n++; if (n <= 20) printf "  %s, line %s (%s)\n", $1, $2, $3 } END { if (n > 20) printf "  and %d more\n", n - 20; if (!n) print "  (no details available)" }' >&2 ;;
-    *) say "gitleaks could not complete the scan (exit status $gl_status)" ;;
+      say "gitleaks found what looks like a secret (values are not shown):" >&2
+      # Only names that are valid manifest paths (printable ASCII, no whitespace or
+      # control characters) are shown; anything else is summarised.
+      gl_n=0
+      cat "$gl_dir/report" >"$gl_dir/report.lines" 2>/dev/null || : >"$gl_dir/report.lines"
+      while IFS=$TAB read -r gl_file gl_line gl_rule; do
+        gl_n=$((gl_n + 1))
+        test "$gl_n" -le 20 || continue
+        valid_manifest_path "$gl_file" || gl_file='a file in the repository history'
+        case $gl_line in ''|*[!0-9]*) gl_line='?' ;; esac
+        case $gl_rule in ''|*[!A-Za-z0-9_-]*) gl_rule=unknown ;; esac
+        printf '  %s, line %s (%s)\n' "$gl_file" "$gl_line" "$gl_rule" >&2
+      done <"$gl_dir/report.lines"
+      if test "$gl_n" -gt 20; then printf '  and %d more\n' $((gl_n - 20)) >&2; fi
+      if test "$gl_n" -eq 0; then printf '  (no details available)\n' >&2; fi ;;
+    *) say "gitleaks could not complete the scan (exit status $gl_status)" >&2 ;;
   esac
   rm -rf "$gl_dir"
   return "$gl_status"
+}
+
+# Fail with the given advice when the scan found a secret (status 3), or with a
+# plain message when the scanner itself failed.
+scan_fail() {
+  if test "$1" -eq 3; then fail "$2"; fi
+  fail "the credential scan could not run, so nothing was changed"
 }
 
 scan_git_revision() {
@@ -1078,7 +1096,7 @@ init_command() {
   git_dir "$candidate_repo" fetch --no-tags origin "refs/heads/$branch:refs/heads/$branch" >/dev/null 2>&1 || fail "could not fetch requested branch"
   revision=$(git_dir "$candidate_repo" rev-parse "refs/heads/$branch" 2>/dev/null) || fail "requested branch has no revision"
   validate_tree "$candidate_repo" "$revision" "$temp/manifest-paths" "$temp" || fail "candidate manifest or repository tree is unsafe"
-  scan_git_revision "$candidate_repo" "$revision" || fail "nothing was changed on this Mac. Remove the secret from the repository, then run dots init again"
+  scan_git_revision "$candidate_repo" "$revision" || scan_fail $? "nothing was changed on this Mac. The scan covers the repository's whole history, so remove the secret from every commit (or start from a clean repository), then run dots init again"
   # Choose which repository files this Mac uses. Without a terminal, all are used.
   cp "$temp/manifest-paths" "$temp/use" || fail "could not prepare file selection"
   if test -s "$temp/manifest-paths" && test -t 0 && test -t 1; then
@@ -1233,7 +1251,7 @@ sync_command() {
   validate_current_state "$temp" || fail "repository tree or live manifest is unsafe"
   git_repo diff --cached --quiet || fail "repository index has staged changes; resolve or unstage them before sync"
   git_repo diff --name-only --diff-filter=U | grep . >/dev/null 2>&1 && fail "repository index has conflicts; resolve them before sync"
-  scan_live_candidates "$temp/selected-paths" "$temp" || fail "nothing was changed. Remove the secret from the local file, then run dots sync again"
+  scan_live_candidates "$temp/selected-paths" "$temp" || scan_fail $? "nothing was changed. Remove the secret from the local file, then run dots sync again"
   branch=$(current_branch)
   base=$(head_revision) || fail "cannot resolve current revision"
   remote=$(fetch_validated_remote "$temp" "$branch") || fail "incoming repository data is unsafe or unavailable"
@@ -1409,7 +1427,7 @@ update_command() {
   : >"$temp/update-paths"
   append_unique_list "$temp/head-paths" "$temp/update-paths"
   append_unique_list "$temp/proposed-paths" "$temp/update-paths"
-  scan_live_candidates "$temp/scan-paths" "$temp" || fail "nothing was pushed. Remove the secret from the file, or untick the file, then run dots update again"
+  scan_live_candidates "$temp/scan-paths" "$temp" || scan_fail $? "nothing was pushed. Remove the secret from the file, or untick the file, then run dots update again"
   update_workspace=$temp/update-workspace
   "$GIT" clone --quiet --no-checkout -- "$REPO" "$update_workspace" || fail "could not prepare update workspace"
   "$GIT" -C "$update_workspace" checkout --quiet "$base" || fail "could not prepare update base"
@@ -1424,7 +1442,7 @@ update_command() {
   "$GIT" -C "$update_workspace" commit --quiet -m "$title" || fail "could not create update commit"
   tree=$("$GIT" -C "$update_workspace" rev-parse 'HEAD^{tree}') || fail "could not read update tree"
   validate_tree "$update_workspace/.git" "$tree" "$temp/update-manifest" "$temp" || fail "update tree is unsafe"
-  scan_directory "$update_workspace" || fail "credential scan failed for update"
+  scan_directory "$update_workspace" || scan_fail $? "nothing was pushed. Remove the secret from the file, or untick the file, then run dots update again"
   enable_gh_git_credentials
   # Checked again here, in case another Mac opened one while this checklist was open.
   refuse_open_update_pr "$repo_name"
