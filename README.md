@@ -4,7 +4,7 @@ Keep a hand-picked list of dotfiles in sync across your Macs through a private G
 
 `dots` is a single-file Bash CLI for macOS. You choose exactly which files in your home directory are tracked, changes reach the repository as pull requests, and every other Mac pulls them with one command.
 
-- **Explicit allowlist.** Only files listed in `~/.config/dots/manifest` are ever tracked. No directories, globs, or symlinks.
+- **Explicit allowlist.** Only the files listed in `~/.config/dots/manifest`, plus the manifest itself, are ever tracked. No directories, globs, or symlinks.
 - **Your real home is the working tree.** Files stay where your tools expect them. No symlink farm, no copies.
 - **Changes go through pull requests.** `dots update` opens a PR, so you review every change before it lands.
 - **Secret scanning built in.** Incoming and outgoing content is scanned with [gitleaks](https://github.com/gitleaks/gitleaks) before anything is written or pushed.
@@ -120,7 +120,7 @@ dots update
 | `init --discover` | Lists candidate configuration files by name, without changing anything. |
 | `init --backup-existing` | Backs up differing local files, then uses the repository version. |
 | `status` | Shows the branch, how far this Mac is ahead or behind, and which tracked files changed locally. |
-| `sync` | Fetches, checks, and applies the repository configuration. Never pushes. |
+| `sync` | Fetches, checks, and applies the repository configuration. It only pushes if you choose to create a PR from local changes. |
 | `update` | Opens a pull request with local changes and any newly selected files. Never changes local files. |
 
 ## How it works
