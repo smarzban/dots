@@ -1043,7 +1043,9 @@ sync_command() {
   remote=$(fetch_validated_remote "$temp" "$branch") || fail "incoming repository data is unsafe or unavailable"
   git_repo merge-base --is-ancestor "$base" "$remote" || test "$base" = "$remote" || fail "remote history is not a safe fast-forward"
   # This Mac's own merged update PRs: its pending files are used here, not offered.
+  # They still count as newly used, so a copy edited since the PR is confirmed first.
   pending_arrived "$temp" "$temp/remote-manifest"
+  cat "$temp/arrived" >>"$temp/newly-used"
   # Files another Mac added that this Mac has not been asked about yet. The choice is
   # saved only when the repository configuration is applied.
   list_minus "$temp/remote-manifest" "$temp/use" "$temp/unseen-used"
@@ -1076,6 +1078,7 @@ sync_command() {
       y|Y|yes|YES) ;;
       *)
         list_minus "$temp/newly-used" "$temp/differing" "$temp/newly-used.next" && mv -f "$temp/newly-used.next" "$temp/newly-used"
+        list_minus "$temp/use" "$temp/differing" "$temp/use.next" && mv -f "$temp/use.next" "$temp/use"
         cat "$temp/differing" >>"$temp/newly-skipped"
         say "left unused on this Mac; bring them in later with: dots select" ;;
     esac
@@ -1125,6 +1128,11 @@ sync_command() {
   esac
 }
 
+refuse_open_update_pr() {
+  open_prs=$("$GH" pr list --repo "$1" --state open --json headRefName,url --jq '.[] | select(.headRefName | startswith("dots/update-")) | .url' 2>/dev/null) || fail "could not check for open update PRs"
+  test -z "$open_prs" || fail "an earlier update PR is still open: $(printf '%s\n' "$open_prs" | head -1). Merge or close it, run dots sync, then try again"
+}
+
 update_command() {
   test $# -eq 0 || { usage >&2; exit 2; }
   require_dependencies
@@ -1146,8 +1154,7 @@ update_command() {
   safe_github_component "${repo_name%%/*}" && safe_github_component "${repo_name##*/}" || fail "origin is not an accessible GitHub repository"
   "$GH" repo view "$repo_name" --json nameWithOwner >/dev/null 2>&1 || fail "origin is not an accessible GitHub repository"
   # One update PR at a time: a second one would conflict on the manifest.
-  open_prs=$("$GH" pr list --repo "$repo_name" --state open --json headRefName,url --jq '.[] | select(.headRefName | startswith("dots/update-")) | .url' 2>/dev/null) || fail "could not check for open update PRs"
-  test -z "$open_prs" || fail "an earlier update PR is still open: $(printf '%s\n' "$open_prs" | head -1). Merge or close it, run dots sync, then try again"
+  refuse_open_update_pr "$repo_name"
   collect_candidates "$temp/live-manifest" "$temp/candidates" || fail "could not collect candidates"
   # Ticked rows are shared from this Mac; new candidates start unticked unless an
   # earlier update already chose them (pending).
@@ -1175,7 +1182,10 @@ update_command() {
   fi
   # Remember the ticks right away, so a failed push or PR does not lose them.
   if test "$confirmed" = true; then
-    write_selection "$temp/use" "$temp/skip" "$temp/manifest-union" "$temp/added" || fail "could not save the file selection"
+    # Pending entries not offered in this checklist (for example a file deleted since) are kept.
+    list_minus "$temp/pending" "$temp/candidates" "$temp/pending-unoffered"
+    list_union "$temp/added" "$temp/pending-unoffered" "$temp/pending-after"
+    write_selection "$temp/use" "$temp/skip" "$temp/manifest-union" "$temp/pending-after" || fail "could not save the file selection"
   fi
   build_proposed_manifest "$DOTS_HOME/$MANIFEST" "$temp/removed" "$temp/added" "$temp/proposed-manifest" || fail "could not build proposed manifest"
   validate_manifest_file "$temp/proposed-manifest" "$temp/proposed-list" || fail "proposed manifest is unsafe"
@@ -1206,6 +1216,8 @@ update_command() {
   validate_tree "$update_workspace/.git" "$tree" "$temp/update-manifest" "$temp" || fail "update tree is unsafe"
   scan_directory "$update_workspace" || fail "credential scan failed for update"
   enable_gh_git_credentials
+  # Checked again here, in case another Mac opened one while this checklist was open.
+  refuse_open_update_pr "$repo_name"
   # Push to the GitHub remote itself: "origin" in this temporary clone is the local data repository.
   "$GIT" -C "$update_workspace" push --quiet "$origin" "$update_branch" || fail "could not push update branch"
   "$GH" pr create --repo "$repo_name" --base "$branch" --head "$update_branch" --title "$title" --body "Created by dots update." || fail "branch was pushed but PR creation failed"

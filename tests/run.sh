@@ -73,8 +73,11 @@ case "$1:$2" in
   api:user) printf '%s\n' example ;;
   repo:view) if [ "${DOTS_TEST_GH_PUBLIC:-0}" = 1 ]; then printf '%s\n' false; elif [ "${DOTS_TEST_GH_REPO_EXISTS:-0}" = 1 ]; then printf '%s\n' true; else exit 1; fi ;;
   repo:create) printf '%s\n' "$*" >>"$DOTS_TEST_GH_LOG"; /usr/bin/git init -q --bare "$DOTS_TEST_GH_REMOTE" ;;
-  pr:create) printf '%s\n' "$*" >>"$DOTS_TEST_GH_LOG" ;;
-  pr:list) test -z "${DOTS_TEST_GH_OPEN_PR:-}" || printf '%s\n' "$DOTS_TEST_GH_OPEN_PR" ;;
+  pr:create) printf '%s\n' "$*" >>"$DOTS_TEST_GH_LOG"; test "${DOTS_TEST_GH_PR_FAIL:-0}" = 0 ;;
+  pr:list)
+    printf '%s\n' "$*" >>"$DOTS_TEST_GH_LOG"
+    case " $* " in *' --repo example/dotfiles '*'--state open '*'startswith("dots/update-")'*) ;; *) exit 3 ;; esac
+    test -z "${DOTS_TEST_GH_OPEN_PR:-}" || printf '%s\n' "$DOTS_TEST_GH_OPEN_PR" ;;
   *) exit 2 ;;
 esac
 EOF
@@ -306,7 +309,9 @@ run_derived_default_init "$update_home" "$remote" $'y\n' >/dev/null 2>&1 || exit
 printf shell >"$update_home/.zshrc"
 if run_update "$update_home" "$remote" $'1\ny\nAdd shell configuration\n' >/dev/null 2>&1 && ! grep -Fx .zshrc "$update_home/.config/dots/manifest" >/dev/null && /usr/bin/git --git-dir="$remote" show-ref | grep -F 'refs/heads/dots/update-' >/dev/null && grep -F 'pr create' "$TMP/gh-update.log" >/dev/null && grep -Fx 'pending .zshrc' "$update_home/data/selection" >/dev/null; then pass "update creates candidate PR"; else fail "update creates candidate PR"; fi
 # While that PR is open, another update is refused instead of racing it.
-if DOTS_TEST_GH_OPEN_PR=https://github.com/example/dotfiles/pull/1 run_update "$update_home" "$remote" '' 2>&1 | grep -F 'still open' >/dev/null; then pass "update refuses while an update PR is open"; else fail "update refuses while an update PR is open"; fi
+refs_before=$(/usr/bin/git --git-dir="$remote" for-each-ref | wc -l)
+open_out=$(DOTS_TEST_GH_OPEN_PR=https://github.com/example/dotfiles/pull/1 run_update "$update_home" "$remote" $'1\ny\nsecond\n' 2>&1)
+if printf '%s' "$open_out" | grep -F 'still open' >/dev/null && ! printf '%s' "$open_out" | grep -F 'PR title' >/dev/null && test "$(/usr/bin/git --git-dir="$remote" for-each-ref | wc -l)" = "$refs_before"; then pass "update refuses while an update PR is open"; else fail "update refuses while an update PR is open"; fi
 # Pending ticks are pre-ticked next time, for example after a failed PR attempt.
 if run_update "$update_home" "$remote" $'\n' 2>&1 | grep -F '[x] .zshrc' >/dev/null; then pass "update remembers pending ticks"; else fail "update remembers pending ticks"; fi
 # Once the PR is merged, sync treats the file as used here without asking.
@@ -402,6 +407,29 @@ EXPECT
 else
   pass "arrow-key checklist (expect unavailable, skipped)"
 fi
+# Confirmed ticks are saved before publishing, so a failed PR creation keeps them.
+remote=$TMP/update-fail.git; fail_home=$TMP/home-update-fail; mkdir -p "$fail_home"
+run_derived_default_init "$fail_home" "$remote" $'y\n' >/dev/null 2>&1 || exit 1
+printf shell >"$fail_home/.zshrc"
+if ! DOTS_TEST_GH_PR_FAIL=1 run_update "$fail_home" "$remote" $'1\ny\nFirst upload\n' >/dev/null 2>&1 && grep -Fx 'pending .zshrc' "$fail_home/data/selection" >/dev/null && run_update "$fail_home" "$remote" $'\n' 2>&1 | grep -F '[x] .zshrc' >/dev/null; then pass "failed PR creation keeps the ticks"; else fail "failed PR creation keeps the ticks"; fi
+# Pending entries survive select and unrelated syncs, and count as used once in the manifest.
+remote=$TMP/pending-keep.git; new_remote "$remote"; keep_home=$TMP/home-pending-keep; mkdir -p "$keep_home"; expect_ok run_dots "$keep_home" init "$remote" main
+printf 'pending .zshrc\n' >>"$keep_home/data/selection"
+run_dots_pty "$keep_home" $'\n' select >/dev/null 2>&1
+remote_edit "$remote" "printf changed > \"\$1/.config/example/settings\"" || exit 1
+if grep -Fx 'pending .zshrc' "$keep_home/data/selection" >/dev/null && run_sync "$keep_home" '' >/dev/null 2>&1 && grep -Fx 'pending .zshrc' "$keep_home/data/selection" >/dev/null; then pass "pending entries survive select and sync"; else fail "pending entries survive select and sync"; fi
+printf '%s\n' '.config/example/settings' '.zshrc' >"$keep_home/.config/dots/manifest"; printf shell >"$keep_home/.zshrc"
+if run_dots "$keep_home" status 2>&1 | grep -Fx 'files used on this Mac: 2 of 2' >/dev/null; then pass "pending files in the manifest count as used"; else fail "pending files in the manifest count as used"; fi
+# A merged own file edited since its PR is confirmed before replacing, instead of blocking sync.
+edit_remote=$TMP/update-edited.git; edit_home=$TMP/home-update-edited; mkdir -p "$edit_home"
+run_derived_default_init "$edit_home" "$edit_remote" $'y\n' >/dev/null 2>&1 || exit 1
+printf 'v1\n' >"$edit_home/.zshrc"
+run_update "$edit_home" "$edit_remote" $'1\ny\nShare shell\n' >/dev/null 2>&1
+edit_ref=$(/usr/bin/git --git-dir="$edit_remote" for-each-ref --format='%(refname)' 'refs/heads/dots/update-*' | head -1)
+test -n "$edit_ref" && /usr/bin/git --git-dir="$edit_remote" update-ref refs/heads/main "$edit_ref"
+printf 'v2\n' >"$edit_home/.zshrc"
+if run_sync "$edit_home" $'n\n' >/dev/null 2>&1 && test "$(cat "$edit_home/.zshrc")" = v2 && grep -Fx 'skip .zshrc' "$edit_home/data/selection" >/dev/null; then pass "edited own file is confirmed, not a stuck sync"; else fail "edited own file is confirmed, not a stuck sync"; fi
+
 # Update: unticking a shared file removes it from the repository only; files this Mac skips keep their repository version.
 remote=$TMP/update-remove.git; new_remote "$remote"
 remote_edit "$remote" "printf '%s\\n' '.config/example/settings' '.zshrc' '.gitconfig' > \"\$1/.config/dots/manifest\"; printf 'shell\\n' > \"\$1/.zshrc\"; printf 'git\\n' > \"\$1/.gitconfig\"" || exit 1
