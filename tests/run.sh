@@ -581,6 +581,11 @@ printf 'shell\n' >"$om_home/.zshrc"; printf '.zshrc\n' >>"$om_home/.config/dots/
 remote_edit "$remote" "printf '%s\\n' '.config/example/settings' '.zshrc' > \"\$1/.config/dots/manifest\"; printf 'shell\\n' > \"\$1/.zshrc\"" || exit 1
 om_out=$(run_sync "$om_home" '' 2>&1)
 if printf '%s' "$om_out" | grep -F 'already in the repository' >/dev/null && ! printf '%s' "$om_out" | grep -F 'Choose [1-4]' >/dev/null && run_dots "$om_home" status 2>&1 | grep -F 'ahead 0, behind 0' >/dev/null && run_dots "$om_home" status 2>&1 | grep -Fx 'tracked configuration changes: none' >/dev/null && test ! -e "$om_home/data/backups"; then pass "sync skips the menu for changes already merged"; else fail "sync skips the menu for changes already merged"; fi
+# A mode-only change (chmod +x) is a real local change, not already merged.
+chmod +x "$om_home/.zshrc"
+remote_edit "$remote" "printf again > \"\$1/.config/example/settings\"" || exit 1
+if run_sync "$om_home" '' 2>&1 | grep -F 'Choose [1-4]' >/dev/null && test -x "$om_home/.zshrc"; then pass "sync asks about a mode-only local change"; else fail "sync asks about a mode-only local change"; fi
+chmod -x "$om_home/.zshrc"
 printf 'edited again\n' >"$om_home/.zshrc"
 remote_edit "$remote" "printf changed > \"\$1/.config/example/settings\"" || exit 1
 if run_sync "$om_home" '' 2>&1 | grep -F 'Choose [1-4]' >/dev/null && test "$(cat "$om_home/.zshrc")" = 'edited again'; then pass "sync still asks about changes not in the repository"; else fail "sync still asks about changes not in the repository"; fi

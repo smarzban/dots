@@ -418,19 +418,24 @@ validate_current_state() {
   append_unique_list "$temp/live-paths" "$temp/all-paths"
 }
 
-# True when every path that differs locally from HEAD matches the remote workspace
-# exactly (content, or absent in both).
+# "x" when a file is executable, "-" otherwise; Git tracks only this part of the mode.
+exec_bit() { if test -x "$1"; then printf x; else printf -- -; fi; }
+
+# True when every path that differs locally from HEAD (content or executable bit)
+# matches the remote workspace exactly, or is absent in both.
 changes_already_in_remote() {
   while IFS= read -r path; do
+    live=$DOTS_HOME/$path
     if git_repo cat-file -e "HEAD:$path" 2>/dev/null; then
-      git_repo cat-file blob "HEAD:$path" | cmp -s - "$DOTS_HOME/$path" 2>/dev/null && continue
+      case $(git_repo ls-tree HEAD -- "$path" | cut -d ' ' -f 1) in 100755) head_bit=x ;; *) head_bit=- ;; esac
+      if test -f "$live" && test ! -L "$live" && test "$(exec_bit "$live")" = "$head_bit" && git_repo cat-file blob "HEAD:$path" | cmp -s - "$live"; then continue; fi
     else
-      test -e "$DOTS_HOME/$path" || test -L "$DOTS_HOME/$path" || continue
+      test -e "$live" || test -L "$live" || continue
     fi
     if test -e "$2/$path"; then
-      test -f "$DOTS_HOME/$path" && test ! -L "$DOTS_HOME/$path" && cmp -s "$2/$path" "$DOTS_HOME/$path" || return 1
+      test -f "$live" && test ! -L "$live" && test "$(exec_bit "$live")" = "$(exec_bit "$2/$path")" && cmp -s "$2/$path" "$live" || return 1
     else
-      test ! -e "$DOTS_HOME/$path" && test ! -L "$DOTS_HOME/$path" || return 1
+      test ! -e "$live" && test ! -L "$live" || return 1
     fi
   done <"$1"
   return 0
@@ -1307,8 +1312,10 @@ sync_command() {
   "$GIT" -C "$remote_workspace" checkout --quiet "$remote" || fail "could not prepare remote revision"
   # Local changes the repository already has (for example this Mac's own merged
   # update PR) leave nothing to decide, so sync just brings the Mac up to date.
+  already_merged=false
   if test "$has_local" = true && changes_already_in_remote "$temp/selected-paths" "$remote_workspace"; then
     has_local=false
+    already_merged=true
     say "local changes are already in the repository"
   fi
   test "$has_local" = false || show_change_summary "$temp/selected-paths" "$temp/changes"
@@ -1338,6 +1345,8 @@ sync_command() {
   cat "$temp/newly-used" >>"$temp/use"
   cat "$temp/newly-skipped" >>"$temp/skip"
   if test "$has_local" = false; then
+    # Checked again just before writing, in case a file was edited meanwhile.
+    if test "$already_merged" = true && ! changes_already_in_remote "$temp/selected-paths" "$remote_workspace"; then fail "a local file changed during sync; nothing was changed, run dots sync again"; fi
     apply_workspace_result "$remote_workspace" "${remote}^{tree}" "$remote" "$base" "$branch" "$temp" || fail "could not apply remote configuration"
     say "sync complete, repository configuration applied locally"
     return
