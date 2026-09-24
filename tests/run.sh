@@ -297,7 +297,7 @@ if run_sync "$two" '' >/dev/null 2>&1 && test "$(cat "$two/.config/example/setti
 remote=$TMP/update.git; update_home=$TMP/home-update; mkdir -p "$update_home"
 run_derived_default_init "$update_home" "$remote" $'y\n' >/dev/null 2>&1 || exit 1
 printf shell >"$update_home/.zshrc"
-if run_update "$update_home" "$remote" $'1\ny\nAdd shell configuration\n' >/dev/null 2>&1 && ! grep -Fx .zshrc "$update_home/.config/dots/manifest" >/dev/null && /usr/bin/git --git-dir="$remote" show-ref | grep -F 'refs/heads/dots/update-' >/dev/null && grep -F 'pr create' "$TMP/gh-update.log" >/dev/null; then pass "update creates candidate PR"; else fail "update creates candidate PR"; fi
+if run_update "$update_home" "$remote" $'1\ny\nAdd shell configuration\n' >/dev/null 2>&1 && ! grep -Fx .zshrc "$update_home/.config/dots/manifest" >/dev/null && /usr/bin/git --git-dir="$remote" show-ref | grep -F 'refs/heads/dots/update-' >/dev/null && grep -F 'pr create' "$TMP/gh-update.log" >/dev/null && grep -Fx 'use .zshrc' "$update_home/data/selection" >/dev/null; then pass "update creates candidate PR"; else fail "update creates candidate PR"; fi
 
 # ── Per-Mac file selection ─────────────────────────────────
 # Checklist rows list home-folder files first, sorted, then other directories.
@@ -362,6 +362,27 @@ EXPECT
   tui_cancel=$TMP/home-tui-cancel; mkdir -p "$tui_cancel"
   if HOME=$tui_cancel DOTS_DATA_DIR=$tui_cancel/data DOTS_GITLEAKS=$MOCK DOTS_PLAIN_PROMPTS=0 TERM=xterm-256color expect "$tui_script" Q "$DOTS" init "$remote" main >/dev/null 2>&1 &&
     test ! -e "$tui_cancel/data/repo.git" && test ! -e "$tui_cancel/.config/example/settings"; then pass "arrow-key checklist cancel changes nothing"; else fail "arrow-key checklist cancel changes nothing"; fi
+  restore_script=$TMP/restore.expect
+  cat >"$restore_script" <<'EXPECT'
+# After the checklist ends (q or Ctrl-C), the terminal must be back in canonical, echoing mode.
+set timeout 20
+set key [lindex $argv 0]
+set stty_init "rows 30 columns 100"
+spawn -noecho /bin/sh -c "\"[lindex $argv 1]\" init \"[lindex $argv 2]\" main; stty -a"
+expect { "selected" {} timeout { exit 1 } }
+if {$key eq "Q"} { send "q" } else { send "\003" }
+expect {
+  -re {lflags:[^\r\n]*} { set flags $expect_out(0,string) }
+  timeout { exit 1 }
+}
+if {[string match "*-icanon*" $flags] || [string match "*-echo *" $flags]} { exit 1 }
+expect eof
+exit 0
+EXPECT
+  for key in Q C; do
+    restore_home=$TMP/home-restore-$key; mkdir -p "$restore_home"
+    if HOME=$restore_home DOTS_DATA_DIR=$restore_home/data DOTS_GITLEAKS=$MOCK DOTS_PLAIN_PROMPTS=0 TERM=xterm-256color expect "$restore_script" "$key" "$DOTS" "$remote" >/dev/null 2>&1; then pass "checklist restores the terminal ($key)"; else fail "checklist restores the terminal ($key)"; fi
+  done
 else
   pass "arrow-key checklist (expect unavailable, skipped)"
 fi
@@ -370,6 +391,10 @@ remote=$TMP/update-remove.git; new_remote "$remote"
 remote_edit "$remote" "printf '%s\\n' '.config/example/settings' '.zshrc' '.gitconfig' > \"\$1/.config/dots/manifest\"; printf 'shell\\n' > \"\$1/.zshrc\"; printf 'git\\n' > \"\$1/.gitconfig\"" || exit 1
 remove_home=$TMP/home-update-remove; mkdir -p "$remove_home"
 run_dots_pty "$remove_home" $'1\n' init "$remote" main >/dev/null 2>&1
+printf 'local git\n' >"$remove_home/.gitconfig"
+# Declining the confirmation changes nothing.
+run_update "$remove_home" "$remote" $'1\nn\n' >/dev/null 2>&1
+if test -z "$(/usr/bin/git --git-dir="$remote" for-each-ref 'refs/heads/dots/update-*')"; then pass "declined update removal changes nothing"; else fail "declined update removal changes nothing"; fi
 if run_update "$remove_home" "$remote" $'1\ny\nStop sharing shell\n' >/dev/null 2>&1; then
   update_ref=$(/usr/bin/git --git-dir="$remote" for-each-ref --format='%(refname)' 'refs/heads/dots/update-*' | head -1)
   proposed=$(/usr/bin/git --git-dir="$remote" show "$update_ref:.config/dots/manifest" 2>/dev/null)
@@ -377,6 +402,41 @@ if run_update "$remove_home" "$remote" $'1\ny\nStop sharing shell\n' >/dev/null 
 else
   fail "update removes unticked files and keeps skipped ones"
 fi
+
+# Accepting a new repository file whose local copy differs asks first; yes backs it up, no leaves it unused.
+remote=$TMP/sync-differing.git; new_remote "$remote"
+yes_home=$TMP/home-sync-differing-yes; no_home=$TMP/home-sync-differing-no; mkdir -p "$yes_home" "$no_home"
+expect_ok run_dots "$yes_home" init "$remote" main; expect_ok run_dots "$no_home" init "$remote" main
+printf 'mine\n' >"$yes_home/.zshrc"; printf 'mine\n' >"$no_home/.zshrc"
+remote_edit "$remote" "printf '%s\\n' '.config/example/settings' '.zshrc' > \"\$1/.config/dots/manifest\"; printf 'theirs\\n' > \"\$1/.zshrc\"" || exit 1
+if run_sync "$yes_home" $'\ny\n' >/dev/null 2>&1 && test "$(cat "$yes_home/.zshrc")" = theirs && test "$(cat "$(find "$yes_home/data/backups" -path '*sync-*/.zshrc' -type f | head -1)")" = mine; then pass "sync backs up a differing local copy after confirmation"; else fail "sync backs up a differing local copy after confirmation"; fi
+if run_sync "$no_home" $'\nn\n' >/dev/null 2>&1 && test "$(cat "$no_home/.zshrc")" = mine && grep -Fx 'skip .zshrc' "$no_home/data/selection" >/dev/null; then pass "sync leaves a differing local copy when declined"; else fail "sync leaves a differing local copy when declined"; fi
+# Keeping local changes does not save choices about new files; they are offered again.
+remote_edit "$remote" "printf '%s\\n' '.config/example/settings' '.zshrc' '.config/example/later' > \"\$1/.config/dots/manifest\"; printf later > \"\$1/.config/example/later\"" || exit 1
+printf 'dirty\n' >"$yes_home/.config/example/settings"
+run_sync "$yes_home" $'\n2\n' >/dev/null 2>&1
+if ! grep -F '.config/example/later' "$yes_home/data/selection" >/dev/null && run_sync "$yes_home" $'\n2\n' 2>&1 | grep -F 'New files in the repository' >/dev/null; then pass "kept local changes leave new files unanswered"; else fail "kept local changes leave new files unanswered"; fi
+# A local-only merge keeps the repository version of files this Mac does not use.
+remote=$TMP/merge-unused.git; new_remote "$remote"
+remote_edit "$remote" "printf '%s\\n' '.config/example/settings' '.zshrc' > \"\$1/.config/dots/manifest\"; printf 'shell\\n' > \"\$1/.zshrc\"" || exit 1
+merge_home=$TMP/home-merge-unused; mkdir -p "$merge_home"
+run_dots_pty "$merge_home" $'1\n' init "$remote" main >/dev/null 2>&1
+printf 'local\n' >"$merge_home/.config/example/settings"
+remote_edit "$remote" "printf 'shell 2\\n' > \"\$1/.zshrc\"" || exit 1
+if run_sync "$merge_home" $'4\n' >/dev/null 2>&1 && test ! -e "$merge_home/.zshrc" && test "$(cat "$merge_home/.config/example/settings")" = local && test "$(/usr/bin/git --git-dir="$merge_home/data/repo.git" show HEAD:.zshrc)" = 'shell 2'; then pass "local merge keeps files this Mac does not use"; else fail "local merge keeps files this Mac does not use"; fi
+# select can stop using a file: later repository changes leave the local copy alone.
+remote=$TMP/select-stop.git; new_remote "$remote"; stop_home=$TMP/home-select-stop; mkdir -p "$stop_home"; expect_ok run_dots "$stop_home" init "$remote" main
+if run_dots_pty "$stop_home" $'1\n' select >/dev/null 2>&1 && grep -Fx 'skip .config/example/settings' "$stop_home/data/selection" >/dev/null; then pass "select stops using a file"; else fail "select stops using a file"; fi
+remote_edit "$remote" "printf changed > \"\$1/.config/example/settings\"" || exit 1
+if run_sync "$stop_home" '' >/dev/null 2>&1 && test "$(cat "$stop_home/.config/example/settings")" = base; then pass "sync leaves files this Mac stopped using"; else fail "sync leaves files this Mac stopped using"; fi
+# Declining select's backup confirmation changes nothing.
+printf 'mine\n' >"$stop_home/.config/example/settings"
+run_dots_pty "$stop_home" $'1\nn\n' select >/dev/null 2>&1
+if test "$(cat "$stop_home/.config/example/settings")" = mine && grep -Fx 'skip .config/example/settings' "$stop_home/data/selection" >/dev/null; then pass "declined select changes nothing"; else fail "declined select changes nothing"; fi
+# DOTS_PLAIN_PROMPTS=1 forces the numbered list even in a capable terminal.
+plain_home=$TMP/home-plain; mkdir -p "$plain_home"
+plain=$( (sleep 3; printf '\n') | HOME=$plain_home DOTS_DATA_DIR=$plain_home/data DOTS_GITLEAKS=$MOCK DOTS_PLAIN_PROMPTS=1 TERM=xterm-256color /usr/bin/script -q /dev/null "$DOTS" init "$TMP/merge-unused.git" main 2>&1)
+if printf '%s' "$plain" | grep -F 'Toggle numbers' >/dev/null; then pass "DOTS_PLAIN_PROMPTS forces numbered prompts"; else fail "DOTS_PLAIN_PROMPTS forces numbered prompts"; fi
 
 # Repository internals are never valid manifest targets, even when DOTS_DATA is under HOME.
 remote=$TMP/reserved-path.git; new_remote "$remote"
@@ -390,9 +450,11 @@ remote_edit "$remote" "printf remote > \"\$1/.config/example/settings\"" || exit
 status=$(run_dots "$status_home" status 2>&1)
 if printf '%s\n' "$status" | grep -Fx 'initialized: yes' >/dev/null && printf '%s\n' "$status" | grep -Fx 'divergence: ahead 0, behind 1' >/dev/null; then pass "status divergence"; else fail "status divergence"; fi
 
-# An incoming allowlisted file cannot overwrite a live untracked file.
+# An incoming file this Mac already chose (for example shared by its own update, then
+# edited again) cannot overwrite a differing live file.
 remote=$TMP/incoming-collision.git; new_remote "$remote"; collision_home=$TMP/home-incoming-collision; mkdir -p "$collision_home"; expect_ok run_dots "$collision_home" init "$remote" main
 mkdir -p "$collision_home/.config/example"; printf local >"$collision_home/.config/example/new"
+printf 'use .config/example/new\n' >>"$collision_home/data/selection"
 remote_edit "$remote" "printf '%s\\n' '.config/example/settings' '.config/example/new' > \"\$1/.config/dots/manifest\"; printf remote > \"\$1/.config/example/new\"" || exit 1
 if ! run_sync "$collision_home" '' >/dev/null 2>&1 && test "$(cat "$collision_home/.config/example/new")" = local; then pass "incoming live collision"; else fail "incoming live collision"; fi
 

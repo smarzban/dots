@@ -97,7 +97,7 @@ dots init --backup-existing
 | Choose which shared files this Mac uses | `dots select` |
 | Get the latest configuration on this Mac | `dots sync` |
 
-When another Mac starts sharing a new file, the next `dots sync` asks whether to use it here. Your answer is remembered.
+When another Mac starts sharing a new file, the next `dots sync` asks whether to use it here, and asks again before replacing a different local copy (which is backed up first). Your answer is remembered once that sync applies the repository configuration.
 
 When `dots sync` finds local changes, it asks what to do:
 

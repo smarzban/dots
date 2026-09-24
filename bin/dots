@@ -21,6 +21,7 @@ DEFAULT_REMOTE=${DOTS_DEFAULT_REMOTE:-}
 DEFAULT_GITHUB_REPO=${DOTS_DEFAULT_GITHUB_REPO:-}
 DEFAULT_GITHUB_REPO_NAME=${DOTS_DEFAULT_GITHUB_REPO_NAME:-dotfiles}
 MANIFEST=.config/dots/manifest
+TAB=$(printf '\t')
 # Machine-local choice of which repository files this Mac uses. Never synced.
 SELECTION=$DOTS_DATA/selection
 
@@ -291,14 +292,14 @@ write_selection() {
   use=$1
   skip=$2
   manifest=$3
-  tmp=$SELECTION.tmp.$$
+  tmp=$(mktemp "$DOTS_DATA/.selection.XXXXXX") || return 1
   {
     printf '%s\n' '# dots selection v1: repository files this Mac uses. Change with: dots select'
     while IFS= read -r path; do
-      path_in_list "$path" "$use" && printf 'use %s\n' "$path"
+      if path_in_list "$path" "$use"; then printf 'use %s\n' "$path"; fi
     done <"$manifest"
     while IFS= read -r path; do
-      path_in_list "$path" "$use" || { path_in_list "$path" "$skip" && printf 'skip %s\n' "$path"; }
+      if ! path_in_list "$path" "$use" && path_in_list "$path" "$skip"; then printf 'skip %s\n' "$path"; fi
     done <"$manifest"
   } >"$tmp" || { rm -f "$tmp"; return 1; }
   mv -f "$tmp" "$SELECTION"
@@ -495,12 +496,12 @@ print_candidates() {
 }
 
 # ── Checklist ───────────────────────────────────────────────
-# Rows are "group|path" lines. The chosen file holds the initial ticks and is
+# Rows are "group<TAB>path" lines; manifest paths never contain whitespace. The chosen file holds the initial ticks and is
 # rewritten with the final ticks. Returns 1 when the user cancels.
 build_rows() {
   # Home-folder files first, then one group per top-level directory.
-  awk '{ i = index($0, "/"); if (i) print "1|" substr($0, 1, i - 1) "|" $0; else print "0|home|" $0 }' "$1" |
-    LC_ALL=C sort -t '|' -k1,1 -k2,2 -k3,3 | cut -d '|' -f 2- >"$2"
+  awk '{ i = index($0, "/"); if (i) print "1\t" substr($0, 1, i - 1) "\t" $0; else print "0\thome\t" $0 }' "$1" |
+    LC_ALL=C sort -t "$TAB" -k1,1 -k2,2 -k3,3 | cut -f 2- >"$2"
 }
 
 list_toggle() {
@@ -551,7 +552,7 @@ checklist_plain() {
   cl_chosen=$2
   say "$3"
   number=0
-  while IFS='|' read -r _group path; do
+  while IFS=$TAB read -r _group path; do
     number=$((number + 1))
     if path_in_list "$path" "$cl_chosen"; then mark='[x]'; else mark='[ ]'; fi
     printf '%3d  %s %s\n' "$number" "$mark" "$path"
@@ -561,7 +562,7 @@ checklist_plain() {
   test -n "$numbers" || return 0
   expand_numbers "$numbers" "$number" "$cl_chosen.numbers" || fail "selection must be numbers, commas, and ranges within the list"
   while IFS= read -r number; do
-    path=$(sed -n "${number}p" "$cl_rows" | cut -d '|' -f 2-)
+    path=$(sed -n "${number}p" "$cl_rows" | cut -f 2-)
     list_toggle "$path" "$cl_chosen"
   done <"$cl_chosen.numbers"
   rm -f "$cl_chosen.numbers"
@@ -577,10 +578,10 @@ checklist_stop() {
   CL_ACTIVE=0
 }
 
-checklist_page_rows() { awk -F '|' -v group="$CL_GROUP" '$1 == group { n++ } END { print n + 0 }' "$CL_ROWS"; }
+checklist_page_rows() { awk -F '\t' -v group="$CL_GROUP" '$1 == group { n++ } END { print n + 0 }' "$CL_ROWS"; }
 
 checklist_current_path() {
-  awk -F '|' -v group="$CL_GROUP" -v wanted="$CL_CURSOR" '$1 == group { n++; if (n == wanted) { print $2; exit } }' "$CL_ROWS"
+  awk -F '\t' -v group="$CL_GROUP" -v wanted="$CL_CURSOR" '$1 == group { n++; if (n == wanted) { print $2; exit } }' "$CL_ROWS"
 }
 
 checklist_draw() {
@@ -605,7 +606,7 @@ checklist_draw() {
   printf '%.*s\n\n' "$width" 'Up/Down move  Left/Right page  Space toggle  a all  n none  Enter confirm  q cancel' >&3
   row=0
   shown=0
-  while IFS='|' read -r group path; do
+  while IFS=$TAB read -r group path; do
     test "$group" = "$CL_GROUP" || continue
     row=$((row + 1))
     test "$row" -ge "$CL_TOP" || continue
@@ -630,7 +631,7 @@ checklist_tui() {
   CL_CHOSEN=$2
   CL_TITLE=$3
   CL_GROUPS=$CL_CHOSEN.groups
-  awk -F '|' '!seen[$1]++ { print $1 }' "$CL_ROWS" >"$CL_GROUPS" || return 1
+  awk -F '\t' '!seen[$1]++ { print $1 }' "$CL_ROWS" >"$CL_GROUPS" || return 1
   CL_PAGES=$(list_count "$CL_GROUPS")
   test "$CL_PAGES" -gt 0 || return 0
   CL_PAGE=1
@@ -664,8 +665,8 @@ checklist_tui() {
       h) test "$CL_PAGE" -le 1 || { CL_PAGE=$((CL_PAGE - 1)); checklist_set_page; } ;;
       l) test "$CL_PAGE" -ge "$CL_PAGES" || { CL_PAGE=$((CL_PAGE + 1)); checklist_set_page; } ;;
       ' ') path=$(checklist_current_path); test -z "$path" || list_toggle "$path" "$CL_CHOSEN" ;;
-      a) awk -F '|' -v group="$CL_GROUP" '$1 == group { print $2 }' "$CL_ROWS" | while IFS= read -r path; do path_in_list "$path" "$CL_CHOSEN" || printf '%s\n' "$path" >>"$CL_CHOSEN"; done ;;
-      n) awk -F '|' -v group="$CL_GROUP" '$1 == group { print $2 }' "$CL_ROWS" >"$CL_CHOSEN.page"; list_minus "$CL_CHOSEN" "$CL_CHOSEN.page" "$CL_CHOSEN.next"; mv -f "$CL_CHOSEN.next" "$CL_CHOSEN" ;;
+      a) awk -F '\t' -v group="$CL_GROUP" '$1 == group { print $2 }' "$CL_ROWS" | while IFS= read -r path; do path_in_list "$path" "$CL_CHOSEN" || printf '%s\n' "$path" >>"$CL_CHOSEN"; done ;;
+      n) awk -F '\t' -v group="$CL_GROUP" '$1 == group { print $2 }' "$CL_ROWS" >"$CL_CHOSEN.page"; list_minus "$CL_CHOSEN" "$CL_CHOSEN.page" "$CL_CHOSEN.next"; mv -f "$CL_CHOSEN.next" "$CL_CHOSEN" ;;
       ''|$'\r'|$'\n') break ;;
       q) cl_status=1; break ;;
     esac
@@ -972,7 +973,15 @@ apply_workspace_result() {
   temp=$6
   validate_tree "$workspace/.git" "$tree" "$temp/result-manifest" "$temp" || return 1
   scan_directory "$workspace" || return 1
-  test -f "$temp/use" || load_selection "$temp" "$temp/result-manifest" || return 1
+  if test ! -f "$temp/use"; then
+    load_selection "$temp" "$temp/result-manifest" || return 1
+    # sync --continue: restore choices made about new files before the conflict.
+    if test -f "$workspace/.git/dots-newly-used"; then
+      cp "$workspace/.git/dots-newly-used" "$temp/newly-used" || return 1
+      cat "$workspace/.git/dots-newly-used" >>"$temp/use"
+      cat "$workspace/.git/dots-newly-skipped" >>"$temp/skip" 2>/dev/null
+    fi
+  fi
   # Only files this Mac uses are written to HOME.
   list_intersect "$temp/result-manifest" "$temp/use" "$temp/apply-manifest"
   list_with_manifest "$temp/apply-manifest" "$temp/apply-paths"
@@ -1026,14 +1035,35 @@ sync_command() {
     cp "$temp/unseen" "$temp/newly-used"
     checklist "$temp/unseen-rows" "$temp/newly-used" "New files in the repository: choose which to use on this Mac" || fail "sync cancelled, nothing was changed"
     list_minus "$temp/unseen" "$temp/newly-used" "$temp/newly-skipped"
-    cat "$temp/newly-used" >>"$temp/use"
-    cat "$temp/newly-skipped" >>"$temp/skip"
   fi
+  test -f "$temp/newly-skipped" || : >"$temp/newly-skipped"
   has_local=false
   if show_changes "$temp/selected-paths" "$temp/changes"; then has_local=true; show_change_summary "$temp/selected-paths" "$temp/changes"; else result=$?; test "$result" -eq 1 || fail "could not inspect approved configuration changes"; fi
   remote_workspace=$temp/remote-workspace
   "$GIT" clone --quiet --no-checkout -- "$REPO" "$remote_workspace" || fail "could not prepare remote workspace"
   "$GIT" -C "$remote_workspace" checkout --quiet "$remote" || fail "could not prepare remote revision"
+  # A newly accepted file that differs from a local copy replaces it only after
+  # confirmation and a backup. Declining leaves it unused here for now.
+  : >"$temp/differing"
+  while IFS= read -r path; do
+    test -f "$DOTS_HOME/$path" && test ! -L "$DOTS_HOME/$path" || continue
+    cmp -s "$remote_workspace/$path" "$DOTS_HOME/$path" || printf '%s\n' "$path" >>"$temp/differing"
+  done <"$temp/newly-used"
+  if test -s "$temp/differing"; then
+    say "These local files differ from the repository version:"
+    sed 's/^/  /' "$temp/differing"
+    printf 'Back them up and use the repository version? [y/N] ' >&2
+    IFS= read -r answer || fail "sync cancelled, nothing was changed"
+    case $answer in
+      y|Y|yes|YES) ;;
+      *)
+        list_minus "$temp/newly-used" "$temp/differing" "$temp/newly-used.next" && mv -f "$temp/newly-used.next" "$temp/newly-used"
+        cat "$temp/differing" >>"$temp/newly-skipped"
+        say "left unused on this Mac; bring them in later with: dots select" ;;
+    esac
+  fi
+  cat "$temp/newly-used" >>"$temp/use"
+  cat "$temp/newly-skipped" >>"$temp/skip"
   if test "$has_local" = false; then
     apply_workspace_result "$remote_workspace" "${remote}^{tree}" "$remote" "$base" "$branch" "$temp" || fail "could not apply remote configuration"
     say "sync complete, repository configuration applied locally"
@@ -1057,6 +1087,8 @@ sync_command() {
       "$GIT" clone --quiet --no-checkout -- "$REPO" "$workspace" || fail "could not create conflict workspace"
       "$GIT" -C "$workspace" checkout --quiet "$base" || fail "could not prepare conflict workspace"
       configure_merge_identity "$workspace" || fail "could not configure temporary merge workspace"
+      # Choices about new repository files apply when the merge is continued.
+      cp "$temp/newly-used" "$workspace/.git/dots-newly-used" && cp "$temp/newly-skipped" "$workspace/.git/dots-newly-skipped" || fail "could not prepare conflict workspace"
       prepare_local_sandbox "$workspace" "$temp/head-paths" "$temp/live-paths" "$temp/all-paths" "$DOTS_HOME/$MANIFEST" "$temp/unselected" || fail "could not prepare local merge candidate"
       "$GIT" -C "$workspace" commit --quiet -m "dots local changes" || fail "could not prepare local merge candidate"
       "$GIT" -C "$workspace" config dots.remoteRevision "$remote"
@@ -1181,6 +1213,10 @@ select_command() {
     IFS= read -r answer || fail "selection cancelled"
     case $answer in y|Y|yes|YES) ;; *) say "selection unchanged"; return 0 ;; esac
     backup_live_files "$temp/backup-paths" select || fail "could not back up local files; selection unchanged"
+    # A file edited after its backup would lose that edit, so re-check just before replacing.
+    while IFS= read -r path; do
+      cmp -s "$BACKUP_DIR/$path" "$DOTS_HOME/$path" || fail "a local file changed during select; nothing was replaced (backup: $BACKUP_DIR)"
+    done <"$temp/backup-paths"
   fi
   if test -s "$temp/newly-used"; then
     set --
