@@ -777,32 +777,36 @@ checklist_draw() {
   case $lines in ''|*[!0-9]*) lines=24 ;; esac
   case $columns in ''|*[!0-9]*) columns=80 ;; esac
   width=$((columns - 1))
-  printf '\033[H\033[2J' >&3
   CL_TOO_SMALL=0
   if test "$lines" -lt 8 || test "$columns" -lt 30; then
     CL_TOO_SMALL=1
-    printf '%s' 'Terminal too small. Enlarge it, or press q to cancel.' >&3
+    printf '\033[H\033[2J%s' 'Terminal too small. Enlarge it, or press q to cancel.' >&3
     return
   fi
   height=$((lines - 6))
   test "$CL_CURSOR" -ge "$CL_TOP" || CL_TOP=$CL_CURSOR
   test "$CL_CURSOR" -lt $((CL_TOP + height)) || CL_TOP=$((CL_CURSOR - height + 1))
-  printf '%.*s\n' "$width" "$CL_TITLE" >&3
-  printf '%.*s\n' "$width" "Page $CL_PAGE of $CL_PAGES: $CL_GROUP" >&3
-  printf '%.*s\n\n' "$width" 'Up/Down move  Left/Right page  Space toggle  a all  n none  Enter confirm  q cancel' >&3
-  row=0
-  shown=0
-  while IFS=$TAB read -r group path; do
-    test "$group" = "$CL_GROUP" || continue
-    row=$((row + 1))
-    test "$row" -ge "$CL_TOP" || continue
-    test "$shown" -lt "$height" || break
-    if path_in_list "$path" "$CL_CHOSEN"; then mark='[x]'; else mark='[ ]'; fi
-    if test "$row" -eq "$CL_CURSOR"; then prefix='> '; else prefix='  '; fi
-    printf '%.*s\n' "$width" "$prefix$mark $path" >&3
-    shown=$((shown + 1))
-  done <"$CL_ROWS"
-  printf '\n%.*s' "$width" "$(list_count "$CL_CHOSEN") of $(list_count "$CL_ROWS") selected" >&3
+  # One awk pass builds the whole frame, which is written over the previous one in a
+  # single write. Clearing first, or a process per row, makes the list flicker.
+  frame=$(awk -F '\t' -v group="$CL_GROUP" -v top="$CL_TOP" -v height="$height" -v cursor="$CL_CURSOR" -v width="$width" \
+    -v title="$CL_TITLE" -v page="Page $CL_PAGE of $CL_PAGES: $CL_GROUP" \
+    -v keys='Up/Down move  Left/Right page  Space toggle  a all  n none  Enter confirm  q cancel' '
+    function out(text) { printf "%s\033[K\n", substr(text, 1, width) }
+    FILENAME == ARGV[1] { chosen[$0] = 1; picked++; next }
+    { total++ }
+    $1 == group {
+      row++
+      if (row < top || shown >= height) next
+      line = (row == cursor ? "> " : "  ") (($2 in chosen) ? "[x] " : "[ ] ") $2
+      body = body substr(line, 1, width) "\033[K\n"
+      shown++
+    }
+    END {
+      out(title); out(page); out(keys); out("")
+      printf "%s", body
+      printf "\033[K\n%s\033[K", substr((picked + 0) " of " (total + 0) " selected", 1, width)
+    }' "$CL_CHOSEN" "$CL_ROWS")
+  printf '\033[H%s\033[J' "$frame" >&3
 }
 
 checklist_set_page() {
@@ -829,7 +833,7 @@ checklist_tui() {
   trap 'checklist_stop; rm -rf "$temp"' EXIT
   trap 'checklist_stop; rm -rf "$temp"; exit 130' HUP INT TERM
   stty -echo -icanon min 1 time 0 <&3
-  printf '\033[?1049h\033[?25l' >&3
+  printf '\033[?1049h\033[?25l\033[2J' >&3
   cl_status=0
   cl_escape=0
   while :; do
