@@ -146,7 +146,7 @@ Only small text files (up to 64 KB) are suggested. Always left out:
 
 - keys and credentials: `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `.netrc`, `.npmrc`, and names containing `token`, `secret`, `auth`, `private`, `password`, or `mcp` (MCP server configs usually hold API keys)
 - caches, logs, history, sessions, and similar machine-local state
-- files inside a Git checkout, which belong to that project
+- files inside a Git checkout, which belong to that project (unless an `include` rule names them, see below)
 
 Whatever you tick is still scanned with gitleaks, using its default rules, before it is pushed.
 
