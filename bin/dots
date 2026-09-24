@@ -995,7 +995,7 @@ apply_workspace_result() {
     cat "$temp/arrived" >>"$temp/newly-used"
     # sync --continue: restore choices made about new files before the conflict.
     if test -f "$workspace/.git/dots-newly-used"; then
-      cp "$workspace/.git/dots-newly-used" "$temp/newly-used" || return 1
+      cat "$workspace/.git/dots-newly-used" >>"$temp/newly-used" || return 1
       cat "$workspace/.git/dots-newly-used" >>"$temp/use"
       cat "$workspace/.git/dots-newly-skipped" >>"$temp/skip" 2>/dev/null
     fi
