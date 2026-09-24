@@ -193,6 +193,25 @@ printf git >"$home/.gitconfig"; printf shell >"$home/.zshrc"
 discovery=$(run_dots "$home" init --discover 2>&1)
 if printf '%s\n' "$discovery" | grep -F .gitconfig >/dev/null && ! grep -Fx .gitconfig "$home/.config/dots/manifest" >/dev/null; then pass "read-only candidate discovery"; else fail "read-only candidate discovery"; fi
 
+# Discovery covers agent sources, keeps exclusions, and renders one candidate per line.
+disc=$TMP/home-discovery; outside=$TMP/outside-discovery; mkdir -p "$disc" "$outside"
+printf git >"$disc/.gitconfig"; printf shell >"$disc/.zshrc"
+mkdir -p "$disc/.claude" "$disc/.pi/agent/agents" "$disc/.codex/skills/demo" "$disc/.config/mcp" "$disc/.config/pass"
+printf '{}' >"$disc/.claude/settings.json"; printf agent >"$disc/.pi/agent/agents/helper.md"
+printf skill >"$disc/.codex/skills/demo/SKILL.md"; printf notes >"$disc/.codex/skills/demo/notes.md"
+printf '{}' >"$disc/.config/mcp/settings.json"; printf ref >"$disc/.config/pass/dev.env.tmpl"; printf '{}' >"$disc/.pi/web-search.json"
+# A symlinked parent must not expose files from outside HOME.
+printf outside >"$outside/config.toml"; ln -s "$outside" "$disc/.grok"
+# A newline inside a filename must not forge a second HOME path.
+printf private >"$disc/.forged"; printf x >"$disc/.pi/agent/agents/a
+.forged"
+discovery=$(run_dots "$disc" init --discover 2>&1)
+listed() { printf '%s\n' "$discovery" | grep -E "^ *[0-9]+  $1\$" >/dev/null; }
+if listed .gitconfig && listed .zshrc && ! printf '%s' "$discovery" | grep -F '\n' >/dev/null; then pass "discovery renders one candidate per line"; else fail "discovery renders one candidate per line"; fi
+if listed .claude/settings.json && listed .pi/agent/agents/helper.md && listed .codex/skills/demo/SKILL.md; then pass "discovery includes agent sources"; else fail "discovery includes agent sources"; fi
+if ! printf '%s' "$discovery" | grep -F -e notes.md -e .config/mcp/ -e .config/pass/ -e .pi/web-search.json >/dev/null; then pass "discovery keeps exclusions"; else fail "discovery keeps exclusions"; fi
+if ! printf '%s' "$discovery" | grep -F -e .grok/config.toml -e .forged >/dev/null; then pass "discovery refuses symlinked parents and forged names"; else fail "discovery refuses symlinked parents and forged names"; fi
+
 # status scopes itself to the allowlist and never reports an unrelated home file.
 printf private >"$home/private-token"
 status=$(run_dots "$home" status 2>&1 || true)

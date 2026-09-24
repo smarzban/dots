@@ -66,7 +66,8 @@ valid_manifest_path() {
     '#'*|:*|*'\\'*|.gitleaks.toml|/*|./*|*/|*'//'*|*'..'*|*'?'*|*'*'*|*'['*|*']'*|*'{'*|*'}'*) return 1 ;;
   esac
   case "/$line/" in */./*|*/../*) return 1 ;; esac
-  case $line in *' '*|*$'\t'*) return 1 ;; esac
+  # grep above is line-based, so a newline must be refused explicitly.
+  case $line in *' '*|*$'\t'*|*$'\n'*|*$'\r'*) return 1 ;; esac
   return 0
 }
 
@@ -372,8 +373,10 @@ add_candidate() {
   path=$1
   approved=$2
   out=$3
-  test -f "$DOTS_HOME/$path" && test ! -L "$DOTS_HOME/$path" || return 0
   valid_manifest_path "$path" || return 0
+  # A symlinked parent (for example ~/.claude -> elsewhere) would publish files from outside HOME.
+  safe_live_path "$path" || return 0
+  test -f "$DOTS_HOME/$path" && test ! -L "$DOTS_HOME/$path" || return 0
   is_reserved_path "$path" && return 0
   candidate_is_excluded "$path" && return 0
   path_in_list "$path" "$approved" && return 0
@@ -384,25 +387,27 @@ collect_candidates() {
   approved=$1
   out=$2
   : >"$out" || return 1
-  for path in .gitconfig .bash_profile .profile .tcshrc .zshenv .zshrc .claude/settings.json .claude/statusline-command.sh .codex/AGENTS.md .codex/config.toml .codex/hooks.json .codex/keybindings.json .codex/rules/default.rules .cursor/argv.json .cursor/cli-config.json .cursor/hooks.json .cursor/statusline.sh .grok/config.toml .grok/pager.toml .grok/statusline.sh .grokbot/settings.json .pi/agent/AGENTS.md .pi/agent/editor.json .pi/agent/settings.json .pi/agent/spawn.json .pi/agent/statusline.json .pi/agent/toolview.json .pi/web-search.json .pi/workflows/model-tiers.json .pi/workflows/settings.json; do
+  # NUL-delimited walks keep a newline inside a filename from forging another path;
+  # valid_manifest_path then rejects the control character.
+  for path in .gitconfig .bash_profile .profile .tcshrc .zshenv .zshrc .claude/settings.json .claude/statusline-command.sh .codex/AGENTS.md .codex/config.toml .codex/hooks.json .codex/keybindings.json .codex/rules/default.rules .cursor/argv.json .cursor/cli-config.json .cursor/hooks.json .cursor/statusline.sh .grok/config.toml .grok/pager.toml .grok/statusline.sh .grokbot/settings.json .pi/agent/AGENTS.md .pi/agent/editor.json .pi/agent/settings.json .pi/agent/spawn.json .pi/agent/statusline.json .pi/agent/toolview.json .pi/workflows/model-tiers.json .pi/workflows/settings.json; do
     add_candidate "$path" "$approved" "$out"
   done
   for directory in .claude/hooks .cursor/agents .cursor/rules .grok/hooks .pi/agent/agents .pi/agent/extensions .pi/agent/themes; do
     test -d "$DOTS_HOME/$directory" && test ! -L "$DOTS_HOME/$directory" || continue
-    find "$DOTS_HOME/$directory" -type f -print 2>/dev/null | while IFS= read -r absolute; do
+    find "$DOTS_HOME/$directory" -type f -print0 2>/dev/null | while IFS= read -r -d '' absolute; do
       path=${absolute#"$DOTS_HOME"/}
       add_candidate "$path" "$approved" "$out"
     done
   done
   for directory in .claude/skills .codex/skills .cursor/skills .grok/skills; do
     test -d "$DOTS_HOME/$directory" && test ! -L "$DOTS_HOME/$directory" || continue
-    find "$DOTS_HOME/$directory" -type f -name SKILL.md -print 2>/dev/null | while IFS= read -r absolute; do
+    find "$DOTS_HOME/$directory" -type f -name SKILL.md -print0 2>/dev/null | while IFS= read -r -d '' absolute; do
       path=${absolute#"$DOTS_HOME"/}
       add_candidate "$path" "$approved" "$out"
     done
   done
   if test -d "$DOTS_HOME/.config" && test ! -L "$DOTS_HOME/.config"; then
-    find "$DOTS_HOME/.config" -type f -print 2>/dev/null | while IFS= read -r absolute; do
+    find "$DOTS_HOME/.config" -type f -print0 2>/dev/null | while IFS= read -r -d '' absolute; do
       path=${absolute#"$DOTS_HOME"/}
       add_candidate "$path" "$approved" "$out"
     done
@@ -783,6 +788,7 @@ update_command() {
   select_candidates "$temp/candidates" "$temp"
   build_manifest_with_selection "$DOTS_HOME/$MANIFEST" "$temp/selected" "$temp/proposed-manifest" "$temp/live-manifest" || fail "could not build proposed manifest"
   validate_manifest_file "$temp/proposed-manifest" "$temp/proposed-list" || fail "proposed manifest is unsafe"
+  validate_live_paths "$temp/proposed-list" || fail "proposed manifest names an unsafe live path"
   list_with_manifest "$temp/proposed-list" "$temp/proposed-paths"
   : >"$temp/update-paths"
   append_unique_list "$temp/head-paths" "$temp/update-paths"
