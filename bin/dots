@@ -26,7 +26,7 @@ say() { printf '%s\n' "$*"; }
 fail() { printf 'dots: %s\n' "$*" >&2; exit 1; }
 usage() { cat <<'EOF'
 Usage:
-  dots init [--discover] [remote] [branch]
+  dots init [--discover] [--backup-existing] [remote] [branch]
   dots status
   dots sync [--continue]
   dots update
@@ -562,6 +562,8 @@ init_command() {
     preview_candidates "$temp"
     exit 0
   fi
+  backup_existing=false
+  if test "${1:-}" = --backup-existing; then backup_existing=true; shift; fi
   test $# -le 2 || { usage >&2; exit 2; }
   auto_default=false
   if test $# -eq 0 && test -e "$REPO"; then
@@ -622,12 +624,26 @@ init_command() {
   revision=$(git_dir "$candidate_repo" rev-parse "refs/heads/$branch" 2>/dev/null) || fail "requested branch has no revision"
   validate_tree "$candidate_repo" "$revision" "$temp/manifest-paths" "$temp" || fail "candidate manifest or repository tree is unsafe"
   scan_git_revision "$candidate_repo" "$revision" || fail "credential scan failed for candidate revision"
-  # Every target, including the manifest, must be absent for a first initialization.
+  # Every target, including the manifest, must be absent or already identical, unless
+  # --backup-existing moves a differing regular file into a private backup first.
   list_with_manifest "$temp/manifest-paths" "$temp/candidate-paths"
+  : >"$temp/backup-paths"
   while IFS= read -r path; do
     safe_live_path "$path" || fail "candidate path has an unsafe live parent"
-    test ! -e "$DOTS_HOME/$path" && test ! -L "$DOTS_HOME/$path" || fail "refusing to overwrite an existing live file"
+    test ! -e "$DOTS_HOME/$path" && test ! -L "$DOTS_HOME/$path" && continue
+    test -f "$DOTS_HOME/$path" && test ! -L "$DOTS_HOME/$path" || fail "refusing to replace an existing live path that is not a regular file"
+    git_dir "$candidate_repo" cat-file blob "$revision:$path" 2>/dev/null | cmp -s - "$DOTS_HOME/$path" && continue
+    test "$backup_existing" = true || fail "refusing to overwrite an existing live file; rerun with --backup-existing to back it up and use the repository version"
+    printf '%s\n' "$path" >>"$temp/backup-paths"
   done <"$temp/candidate-paths"
+  backup_dir=
+  if test -s "$temp/backup-paths"; then
+    mkdir -p "$DOTS_DATA/backups" || fail "cannot create backup directory"
+    backup_dir=$(mktemp -d "$DOTS_DATA/backups/init-$(date +%Y%m%d%H%M%S).XXXXXX") || fail "cannot create backup directory"
+    while IFS= read -r path; do
+      mkdir -p "$backup_dir/$(dirname "$path")" && cp -p "$DOTS_HOME/$path" "$backup_dir/$path" || fail "could not back up existing live files; nothing was replaced"
+    done <"$temp/backup-paths"
+  fi
   mv "$candidate_repo" "$REPO" || fail "could not install repository metadata"
   git_repo config status.showUntrackedFiles no || fail "could not configure repository"
   git_repo config dots.branch "$branch" || fail "could not record branch"
@@ -638,6 +654,7 @@ init_command() {
   while IFS= read -r path; do set -- "$@" "$path"; done <"$temp/candidate-paths"
   git_repo checkout --quiet "$revision" -- "$@" || fail "checkout failed after preflight; inspect live files before retrying"
   git_repo config dots.initialized true || fail "could not finalize initialization"
+  test -z "$backup_dir" || say "backed up $(wc -l <"$temp/backup-paths" | tr -d ' ') existing file(s) to $backup_dir"
   say "initialized $branch at $revision"
 }
 

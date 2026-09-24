@@ -50,7 +50,15 @@ dots status
 dots sync
 ```
 
-An existing configuration repository must already contain a valid manifest. `init` clones into its private data location, validates the remote tree and manifest, scans it with gitleaks, and refuses any existing target collision before it checks out only approved paths. Running the same `init` again is a no-op. A different remote or branch is refused.
+An existing configuration repository must already contain a valid manifest. `init` clones into its private data location, validates the remote tree and manifest, and scans it with gitleaks before it checks out only approved paths. Running the same `init` again is a no-op. A different remote or branch is refused.
+
+On a second machine some approved files may already exist. A file identical to the repository version is adopted as is. A differing file is refused unless you opt in:
+
+```sh
+dots init --backup-existing
+```
+
+This copies each differing file into a private `~/.local/share/dots/backups/init-*` directory, then uses the repository version. Symlinks, directories, and unsafe parents are always refused.
 
 `status` validates both the repository and live manifest, fetches only remote metadata for an accurate ahead/behind report, then reports only allowlisted files. It never runs an unscoped home-directory status.
 

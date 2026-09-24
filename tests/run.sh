@@ -185,6 +185,18 @@ if expect_fail run_public_default_init "$home"; then pass "derived public defaul
 # Initial collisions are never overwritten, and repeating a successful init is a no-op.
 remote=$TMP/collision.git; new_remote "$remote"; home=$TMP/home-collision; mkdir -p "$home/.config/example"; printf old >"$home/.config/example/settings"
 if expect_fail run_dots "$home" init "$remote" main && test "$(cat "$home/.config/example/settings")" = old; then pass "collision refused"; else fail "collision refused"; fi
+# A second machine: identical files are adopted, different files need --backup-existing.
+home=$TMP/home-identical; mkdir -p "$home/.config/example"; printf 'base\n' >"$home/.config/example/settings"
+if expect_ok run_dots "$home" init "$remote" main && test ! -e "$home/data/backups"; then pass "identical existing file is adopted"; else fail "identical existing file is adopted"; fi
+home=$TMP/home-collision-hint; mkdir -p "$home/.config/example"; printf old >"$home/.config/example/settings"
+if run_dots "$home" init "$remote" main 2>&1 | grep -F -- --backup-existing >/dev/null; then pass "collision error names --backup-existing"; else fail "collision error names --backup-existing"; fi
+if expect_ok run_dots "$home" init --backup-existing "$remote" main && test "$(cat "$home/.config/example/settings")" = base; then pass "backup-existing applies repository version"; else fail "backup-existing applies repository version"; fi
+backup=$(find "$home/data/backups" -path '*/.config/example/settings' -type f 2>/dev/null | head -1)
+if test -n "$backup" && test "$(cat "$backup")" = old && test "$(stat -f %Lp "$(dirname "$(dirname "$(dirname "$backup")")")")" = 700; then pass "backup-existing keeps a private backup"; else fail "backup-existing keeps a private backup"; fi
+home=$TMP/home-backup-symlink; mkdir -p "$home/.config/example"; ln -s /tmp "$home/.config/example/settings"
+if expect_fail run_dots "$home" init --backup-existing "$remote" main && test -L "$home/.config/example/settings"; then pass "backup-existing refuses symlink targets"; else fail "backup-existing refuses symlink targets"; fi
+home=$TMP/home-backup-dir; mkdir -p "$home/.config/example/settings"
+if expect_fail run_dots "$home" init --backup-existing "$remote" main && test -d "$home/.config/example/settings"; then pass "backup-existing refuses directory targets"; else fail "backup-existing refuses directory targets"; fi
 home=$TMP/home-idempotent; mkdir -p "$home"
 if expect_ok run_dots "$home" init "$remote" main && expect_ok run_dots "$home" init "$remote" main; then pass "idempotent init"; else fail "idempotent init"; fi
 
