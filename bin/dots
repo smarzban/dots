@@ -201,13 +201,14 @@ run_gitleaks() {
     3)
       say "gitleaks found what looks like a secret (values are not shown):" >&2
       # Only names that are valid manifest paths (printable ASCII, no whitespace or
-      # control characters) are shown; anything else is summarised.
+      # control characters), and for history scans only names in that revision's
+      # manifest (GL_SHOWN), are shown. A history-only name could itself be a secret.
       gl_n=0
       cat "$gl_dir/report" >"$gl_dir/report.lines" 2>/dev/null || : >"$gl_dir/report.lines"
       while IFS=$TAB read -r gl_file gl_line gl_rule; do
         gl_n=$((gl_n + 1))
         test "$gl_n" -le 20 || continue
-        valid_manifest_path "$gl_file" || gl_file='a file in the repository history'
+        { valid_manifest_path "$gl_file" && { test -z "${GL_SHOWN:-}" || path_in_list "$gl_file" "$GL_SHOWN"; }; } || gl_file='a file in the repository history'
         case $gl_line in ''|*[!0-9]*) gl_line='?' ;; esac
         case $gl_rule in ''|*[!A-Za-z0-9_-]*) gl_rule=unknown ;; esac
         printf '  %s, line %s (%s)\n' "$gl_file" "$gl_line" "$gl_rule" >&2
@@ -228,8 +229,14 @@ scan_fail() {
 }
 
 scan_git_revision() {
-  # gitleaks receives only a revision.
+  # gitleaks receives only a revision. Findings name only files in its manifest.
+  GL_SHOWN=$(mktemp "${TMPDIR:-/tmp}/dots-shown.XXXXXX") || return 1
+  { printf '%s\n' "$MANIFEST"; git_dir "$1" show "$2:$MANIFEST" 2>/dev/null; } >"$GL_SHOWN"
   run_gitleaks git "$1" --log-opts "$2"
+  sg_status=$?
+  rm -f "$GL_SHOWN"
+  GL_SHOWN=
+  return "$sg_status"
 }
 
 copy_live_candidates_for_scan() {

@@ -647,6 +647,14 @@ if REAL_GITLEAKS=$(command -v gitleaks 2>/dev/null); then
   printf '[allowlist]\nregexes = [".*"]\n' >"$TMP/cwd-ignore/.gitleaks.toml"; printf '*\n' >"$TMP/cwd-ignore/.gitleaksignore"
   real_out=$( (cd "$TMP/cwd-ignore" && GITLEAKS_CONFIG=$TMP/cwd-ignore/.gitleaks.toml HOME=$real_home DOTS_DATA_DIR=$real_home/data DOTS_GITLEAKS=$REAL_GITLEAKS "$DOTS" init "$real_remote" main) 2>&1)
   if test ! -e "$real_home/.config/example/settings" && printf '%s' "$real_out" | grep -F '.config/example/settings, line 1 (' >/dev/null && ! printf '%s' "$real_out" | grep -F "$real_token" >/dev/null; then pass "real gitleaks default rules block a token"; else fail "real gitleaks default rules block a token"; fi
+  # A file only in history is not named, since its name could itself be a secret.
+  hist_remote=$TMP/history-secret.git; new_remote "$hist_remote"
+  hist_name="gh""p_Q7w3Er9Ty2Ui8Op4As6Df1Gh5Jk0Lz3Xc7V"
+  remote_edit "$hist_remote" "printf 'token = \"%s\"\\n' '$real_token' > \"\$1/.$hist_name\"" || exit 1
+  remote_edit "$hist_remote" "rm -f \"\$1/.$hist_name\"" || exit 1
+  hist_home=$TMP/home-history-secret; mkdir -p "$hist_home"
+  hist_out=$(HOME=$hist_home DOTS_DATA_DIR=$hist_home/data DOTS_GITLEAKS=$REAL_GITLEAKS "$DOTS" init "$hist_remote" main 2>&1)
+  if printf '%s' "$hist_out" | grep -F 'a file in the repository history' >/dev/null && ! printf '%s' "$hist_out" | grep -F -e "$hist_name" -e "$real_token" >/dev/null; then pass "history-only file names are not shown"; else fail "history-only file names are not shown"; fi
 else
   pass "real gitleaks default rules (gitleaks unavailable, skipped)"
 fi
