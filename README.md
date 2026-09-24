@@ -1,97 +1,157 @@
 # dots
 
-`dots` is a small, allowlist-only macOS shell CLI for keeping selected live files in `$HOME` in a Git repository. Its commands are `init`, `status`, `sync`, and `update`.
+Keep a hand-picked list of dotfiles in sync across your Macs through a private GitHub repository.
 
-It is intentionally not a replacement for chezmoi or yadm. Snapshots, restore, cloud services, background work, templates, encryption, plugins, and auth transfer are out of scope.
+`dots` is a single-file Bash CLI for macOS. You choose exactly which files in your home directory are tracked, changes reach the repository as pull requests, and every other Mac pulls them with one command.
+
+- **Explicit allowlist.** Only files listed in `~/.config/dots/manifest` are ever tracked. No directories, globs, or symlinks.
+- **Your real home is the working tree.** Files stay where your tools expect them. No symlink farm, no copies.
+- **Changes go through pull requests.** `dots update` opens a PR, so you review every change before it lands.
+- **Secret scanning built in.** Incoming and outgoing content is scanned with [gitleaks](https://github.com/gitleaks/gitleaks) before anything is written or pushed.
+- **Never overwrites silently.** A local file that differs is only replaced when you choose to, and `init` backs it up first.
+- **Private repository, created for you.** `dots init` sets up `<your-github-account>/dotfiles` as a private repo.
+
+## Requirements
+
+- macOS, with Apple's Command Line Tools (for `/usr/bin/git`)
+- [gitleaks](https://github.com/gitleaks/gitleaks)
+- [GitHub CLI](https://cli.github.com/) (`gh`), signed in
+
+```sh
+xcode-select --install
+brew install gitleaks gh
+gh auth login
+```
 
 ## Install
-
-After a release is published, install the checksum-verified release asset:
 
 ```sh
 curl -fsSL https://github.com/smarzban/dots/releases/latest/download/install.sh | sh
 ```
 
-It installs `dots` to `~/.local/bin`; ensure that directory is on your `PATH`. To select a release or destination, set `DOTS_VERSION=v0.1.0` or `DOTS_BIN_DIR=/some/bin` before running the installer.
+The installer verifies the release checksum and puts `dots` in `~/.local/bin`. Make sure that directory is on your `PATH`.
 
-The command requires `/usr/bin/git` and `gitleaks` at runtime. For commits and non-fast-forward merges, provide Git identity through `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL` or repository-local config, `git --git-dir="$HOME/.local/share/dots/repo.git" config user.name "Your Name"` (and `user.email`). `dots` deliberately ignores `$HOME/.gitconfig` while running Git, so a managed configuration file cannot alter its own operations.
+To pin a version or choose another directory, set `DOTS_VERSION` or `DOTS_BIN_DIR`:
 
-## Repository model
-
-Git metadata is stored separately at `~/.local/share/dots/repo.git`. Your real `$HOME` is the worktree. The tracked `.config/dots/manifest` is the authority for configuration paths.
-
-A manifest contains one relative file path per line. Blank lines and `#` comments are allowed. Paths may not be absolute, contain `..`, globs, whitespace, controls, duplicates, directories, or symlinks. A listed directory does not approve its descendants. The manifest itself is tracked as special metadata.
-
-```text
-# Explicit files only
-.gitconfig
-.config/example/settings.toml
+```sh
+curl -fsSL https://github.com/smarzban/dots/releases/latest/download/install.sh | DOTS_VERSION=v0.1.0 DOTS_BIN_DIR="$HOME/bin" sh
 ```
 
-For the default private configuration repository, run this from a terminal:
+## Quickstart: your first Mac
+
+1. Preview which files `dots` would suggest. This changes nothing:
+
+   ```sh
+   dots init --discover
+   ```
+
+2. Create the private `<your-account>/dotfiles` repository and connect this Mac. `dots` asks before creating it:
+
+   ```sh
+   dots init
+   ```
+
+3. Give `dots` a commit identity. It deliberately ignores `~/.gitconfig`, so set this once on its own repository:
+
+   ```sh
+   git --git-dir="$HOME/.local/share/dots/repo.git" config user.name "Your Name"
+   git --git-dir="$HOME/.local/share/dots/repo.git" config user.email "you@example.com"
+   ```
+
+4. Pick the files to track. `dots update` lists candidates by name, you choose them (for example `1,3-5`), confirm, and give the PR a title:
+
+   ```sh
+   dots update
+   ```
+
+5. Review and merge the pull request on GitHub, then bring this Mac up to date:
+
+   ```sh
+   dots sync
+   ```
+
+## Add another Mac
+
+Install `dots` and its requirements, then connect to the same repository:
 
 ```sh
 dots init
 ```
 
-`dots` derives the authenticated GitHub account from `gh`, then uses `<account>/dotfiles`. If that repository is missing, it asks before creating it privately. It seeds an empty versioned manifest, no configuration is adopted automatically. `gh` is needed only for no-argument initialization, automatic creation, and `update` PRs.
-
-Before initialization, inspect a names-only candidate preview without changing files, Git state, or the network:
-
-```sh
-dots init --discover
-```
-
-You can also initialize an existing repository:
-
-```sh
-dots init git@github.com:example/config.git main
-dots status
-dots sync
-```
-
-An existing configuration repository must already contain a valid manifest. `init` clones into its private data location, validates the remote tree and manifest, and scans it with gitleaks before it checks out only approved paths. Running the same `init` again is a no-op. A different remote or branch is refused.
-
-On a second machine some approved files may already exist. A file identical to the repository version is adopted as is. A differing file is refused unless you opt in:
+If some tracked files already exist on this Mac, identical ones are adopted as they are. To replace differing ones with the repository version, keeping a backup in `~/.local/share/dots/backups/`, run:
 
 ```sh
 dots init --backup-existing
 ```
 
-This copies each differing file into a private `~/.local/share/dots/backups/init-*` directory, then uses the repository version. Symlinks, directories, and unsafe parents are always refused.
+## Everyday use
 
-`status` validates both the repository and live manifest, fetches only remote metadata for an accurate ahead/behind report, then reports only allowlisted files. It never runs an unscoped home-directory status.
+| You want to | Run |
+|---|---|
+| See what changed locally and whether the repository is ahead | `dots status` |
+| Share a local change, or start tracking a new file | `dots update`, then merge the PR |
+| Get the latest configuration on this Mac | `dots sync` |
 
-`sync` fetches, validates, and scans the repository before updating live files. With no local approved changes, it applies the repository configuration locally and never pushes. If local files differ, it offers to use the repository version, keep local files unchanged, create an update PR, or merge the remote into local files only.
+When `dots sync` finds local changes, it asks what to do:
 
-A local-only merge happens in `~/.local/share/dots/conflict-workspace`, never in live configuration. If it conflicts, resolve and commit there with normal Git, then run:
+1. Use the repository version and replace the local files
+2. Keep the local files and change nothing
+3. Create a PR from the local changes
+4. Merge the repository changes into the local files only
+
+If a merge conflicts, `dots` prints the path of a private workspace. Resolve and commit there with normal Git, then run:
 
 ```sh
 dots sync --continue
 ```
 
-`update` detects approved local changes, presents new names-only candidates for exact selection, scans the proposed content, then creates and pushes a `dots/update-*` branch and opens a GitHub PR. It never changes live files or the manifest while preparing the PR. It requires an authenticated `gh` and a GitHub origin remote.
+## Commands
 
-## Safety boundaries and caveats
-
-Incoming paths, manifests, revision names, and filenames are treated as untrusted. Any invalid manifest/tree, symlink, unapproved tracked file, credential scan failure, collision (except an identical file, or a differing file with `init --backup-existing`), or unsafe parent fails closed without printing file contents or scanner findings.
-
-All checkable preflight happens before `$HOME` is changed. A disk, permission, or process failure while Git is actually checking out or merging can still interrupt multi-file filesystem changes. For `sync`, Git's normal recovery state is retained. For `init`, the incomplete repository is removed so you can rerun `init`: files already replaced now match and are adopted, and the originals of differing files remain in the reported backup directory. `gitleaks` reduces accidental secret commits, it is not a proof that a value is non-sensitive.
-
-## Publishing a release
-
-Maintainers tag the release commit, create the assets from that clean checkout, then upload `dist/dots`, `dist/dots.sha256`, and `dist/install.sh` to the matching GitHub release:
-
-```sh
-git tag v0.1.0
-scripts/package.sh v0.1.0
+```text
+dots init [--discover] [--backup-existing] [remote] [branch]
+dots status
+dots sync [--continue]
+dots update
 ```
 
-## Verification
+| Command | What it does |
+|---|---|
+| `init` | Connects this Mac to your repository. With no arguments it uses `<your-account>/dotfiles`, creating it privately if needed. Pass a remote (and branch) to use a different repository, which must already contain a manifest. |
+| `init --discover` | Lists candidate configuration files by name, without changing anything. |
+| `init --backup-existing` | Backs up differing local files, then uses the repository version. |
+| `status` | Shows the branch, how far this Mac is ahead or behind, and which tracked files changed locally. |
+| `sync` | Fetches, checks, and applies the repository configuration. Never pushes. |
+| `update` | Opens a pull request with local changes and any newly selected files. Never changes local files. |
+
+## How it works
+
+- Git metadata lives in `~/.local/share/dots/repo.git`. Your home directory is its working tree.
+- The manifest at `~/.config/dots/manifest` lists one relative path per line. `#` comments and blank lines are allowed:
+
+  ```text
+  # Shell and Git
+  .zshrc
+  .gitconfig
+  .config/starship.toml
+  ```
+
+- Paths must be plain files inside your home directory: no absolute paths, `..`, globs, whitespace, or symlinks.
+- Before anything is written or pushed, `dots` validates the repository contents against the manifest and scans them with gitleaks. Any problem stops the command without printing file contents.
+
+## Development
+
+Keep `bin/dots` compatible with macOS `/bin/bash` 3.2. Tests use temporary home directories and local remotes only.
 
 ```sh
 /bin/bash -n bin/dots
 shellcheck -S warning bin/dots
 tests/run.sh
 git diff --check
+```
+
+To publish a release, tag the commit, build the assets, and upload `dist/dots`, `dist/dots.sha256`, and `dist/install.sh` to the GitHub release:
+
+```sh
+git tag -a v0.1.0 -m "dots v0.1.0"
+scripts/package.sh v0.1.0
 ```
