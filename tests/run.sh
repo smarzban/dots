@@ -574,6 +574,17 @@ run_sync "$hc_home" $'4\n' >/dev/null 2>&1
 hc_workspace=$hc_home/data/conflict-workspace
 if test -d "$hc_workspace/.git" && /usr/bin/git -C "$hc_workspace" checkout --theirs -- .config/example/settings && /usr/bin/git -C "$hc_workspace" add -- .config/example/settings && /usr/bin/git -C "$hc_workspace" commit -qm resolve && (run_dots "$hc_home" sync --continue) >/dev/null 2>&1 && grep -Fx 'use .handext.ts' "$hc_home/data/selection" >/dev/null && test "$(cat "$hc_home/.handext.ts")" = ext; then pass "hand-added path survives sync --continue"; else fail "hand-added path survives sync --continue"; fi
 
+# After this Mac's own update is merged, its local changes are already in the repository:
+# sync fast-forwards without asking, and changes that differ still bring up the menu.
+remote=$TMP/own-merged.git; new_remote "$remote"; om_home=$TMP/home-own-merged; mkdir -p "$om_home"; expect_ok run_dots "$om_home" init "$remote" main
+printf 'shell\n' >"$om_home/.zshrc"; printf '.zshrc\n' >>"$om_home/.config/dots/manifest"
+remote_edit "$remote" "printf '%s\\n' '.config/example/settings' '.zshrc' > \"\$1/.config/dots/manifest\"; printf 'shell\\n' > \"\$1/.zshrc\"" || exit 1
+om_out=$(run_sync "$om_home" '' 2>&1)
+if printf '%s' "$om_out" | grep -F 'already in the repository' >/dev/null && ! printf '%s' "$om_out" | grep -F 'Choose [1-4]' >/dev/null && run_dots "$om_home" status 2>&1 | grep -F 'ahead 0, behind 0' >/dev/null && run_dots "$om_home" status 2>&1 | grep -Fx 'tracked configuration changes: none' >/dev/null && test ! -e "$om_home/data/backups"; then pass "sync skips the menu for changes already merged"; else fail "sync skips the menu for changes already merged"; fi
+printf 'edited again\n' >"$om_home/.zshrc"
+remote_edit "$remote" "printf changed > \"\$1/.config/example/settings\"" || exit 1
+if run_sync "$om_home" '' 2>&1 | grep -F 'Choose [1-4]' >/dev/null && test "$(cat "$om_home/.zshrc")" = 'edited again'; then pass "sync still asks about changes not in the repository"; else fail "sync still asks about changes not in the repository"; fi
+
 # Confirmed ticks are saved before publishing, so a failed PR creation keeps them.
 remote=$TMP/update-fail.git; fail_home=$TMP/home-update-fail; mkdir -p "$fail_home"
 run_derived_default_init "$fail_home" "$remote" $'y\n' >/dev/null 2>&1 || exit 1
