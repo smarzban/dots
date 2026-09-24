@@ -193,6 +193,10 @@ if run_dots "$home" init "$remote" main 2>&1 | grep -F -- --backup-existing >/de
 if expect_ok run_dots "$home" init --backup-existing "$remote" main && test "$(cat "$home/.config/example/settings")" = base; then pass "backup-existing applies repository version"; else fail "backup-existing applies repository version"; fi
 backup=$(find "$home/data/backups" -path '*/.config/example/settings' -type f 2>/dev/null | head -1)
 if test -n "$backup" && test "$(cat "$backup")" = old && test "$(stat -f %Lp "$(dirname "$(dirname "$(dirname "$backup")")")")" = 700; then pass "backup-existing keeps a private backup"; else fail "backup-existing keeps a private backup"; fi
+# A checkout failure after backup names the backup and leaves init retryable.
+home=$TMP/home-backup-retry; mkdir -p "$home/.config/example"; printf old >"$home/.config/example/settings"; chmod 555 "$home/.config/example"
+failure=$(run_dots "$home" init --backup-existing "$remote" main 2>&1); chmod 755 "$home/.config/example"
+if printf '%s' "$failure" | grep -F 'backup:' >/dev/null && test ! -e "$home/data/repo.git" && expect_ok run_dots "$home" init --backup-existing "$remote" main && test "$(cat "$home/.config/example/settings")" = base; then pass "failed backup init names the backup and can be retried"; else fail "failed backup init names the backup and can be retried"; fi
 home=$TMP/home-backup-symlink; mkdir -p "$home/.config/example"; ln -s /tmp "$home/.config/example/settings"
 if expect_fail run_dots "$home" init --backup-existing "$remote" main && test -L "$home/.config/example/settings"; then pass "backup-existing refuses symlink targets"; else fail "backup-existing refuses symlink targets"; fi
 home=$TMP/home-backup-dir; mkdir -p "$home/.config/example/settings"

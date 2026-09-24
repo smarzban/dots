@@ -641,20 +641,28 @@ init_command() {
     mkdir -p "$DOTS_DATA/backups" || fail "cannot create backup directory"
     backup_dir=$(mktemp -d "$DOTS_DATA/backups/init-$(date +%Y%m%d%H%M%S).XXXXXX") || fail "cannot create backup directory"
     while IFS= read -r path; do
-      mkdir -p "$backup_dir/$(dirname "$path")" && cp -p "$DOTS_HOME/$path" "$backup_dir/$path" || fail "could not back up existing live files; nothing was replaced"
+      mkdir -p "$backup_dir/$(dirname "$path")" && cp -p "$DOTS_HOME/$path" "$backup_dir/$path" || fail "could not back up existing live files; nothing was replaced (partial backup: $backup_dir)"
+    done <"$temp/backup-paths"
+    say "backed up $(wc -l <"$temp/backup-paths" | tr -d ' ') existing file(s) to $backup_dir"
+    # A file edited after its backup would lose that edit, so re-check just before replacing.
+    while IFS= read -r path; do
+      cmp -s "$backup_dir/$path" "$DOTS_HOME/$path" || fail "an existing live file changed during init; nothing was replaced (backup: $backup_dir)"
     done <"$temp/backup-paths"
   fi
+  backup_note=
+  test -z "$backup_dir" || backup_note=" (backup: $backup_dir)"
   mv "$candidate_repo" "$REPO" || fail "could not install repository metadata"
-  git_repo config status.showUntrackedFiles no || fail "could not configure repository"
-  git_repo config dots.branch "$branch" || fail "could not record branch"
-  git_repo update-ref "refs/heads/$branch" "$revision" || fail "could not set requested branch"
-  git_repo symbolic-ref HEAD "refs/heads/$branch" || fail "could not select requested branch"
+  # From here a failure removes the incomplete repository so init can be retried.
+  init_abort() { rm -rf "$REPO"; fail "$1$backup_note"; }
+  git_repo config status.showUntrackedFiles no || init_abort "could not configure repository"
+  git_repo config dots.branch "$branch" || init_abort "could not record branch"
+  git_repo update-ref "refs/heads/$branch" "$revision" || init_abort "could not set requested branch"
+  git_repo symbolic-ref HEAD "refs/heads/$branch" || init_abort "could not select requested branch"
   # Checkout only validated, explicit paths. This is never a broad checkout.
   set --
   while IFS= read -r path; do set -- "$@" "$path"; done <"$temp/candidate-paths"
-  git_repo checkout --quiet "$revision" -- "$@" || fail "checkout failed after preflight; inspect live files before retrying"
-  git_repo config dots.initialized true || fail "could not finalize initialization"
-  test -z "$backup_dir" || say "backed up $(wc -l <"$temp/backup-paths" | tr -d ' ') existing file(s) to $backup_dir"
+  git_repo checkout --quiet "$revision" -- "$@" || init_abort "checkout failed after preflight; inspect live files before retrying"
+  git_repo config dots.initialized true || init_abort "could not finalize initialization"
   say "initialized $branch at $revision"
 }
 

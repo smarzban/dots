@@ -74,7 +74,7 @@ dots sync --continue
 
 ## Safety boundaries and caveats
 
-Incoming paths, manifests, revision names, and filenames are treated as untrusted. Any invalid manifest/tree, symlink, unapproved tracked file, credential scan failure, collision, or unsafe parent fails closed without printing file contents or scanner findings.
+Incoming paths, manifests, revision names, and filenames are treated as untrusted. Any invalid manifest/tree, symlink, unapproved tracked file, credential scan failure, collision (except an identical file, or a differing file with `init --backup-existing`), or unsafe parent fails closed without printing file contents or scanner findings.
 
 All checkable preflight happens before `$HOME` is changed. A disk, permission, or process failure while Git is actually checking out or merging can still interrupt multi-file filesystem changes, Git's normal recovery state is retained in that case. `gitleaks` reduces accidental secret commits, it is not a proof that a value is non-sensitive.
 
