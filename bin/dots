@@ -549,7 +549,11 @@ check_new_tree_collisions() {
     grep -F -x -- "$path" "$temp/base-names" >/dev/null 2>&1 && continue
     test "$path" = "$MANIFEST" && continue
     safe_live_path "$path" || return 1
-    test -e "$DOTS_HOME/$path" && return 1
+    test -e "$DOTS_HOME/$path" || test -L "$DOTS_HOME/$path" || continue
+    # A live file identical to the incoming one is already in place, for example on
+    # the machine whose update PR added it. Anything else is still a collision.
+    test -f "$DOTS_HOME/$path" && test ! -L "$DOTS_HOME/$path" || return 1
+    git_dir "$gitdir" cat-file blob "$candidate:$path" 2>/dev/null | cmp -s - "$DOTS_HOME/$path" || return 1
   done <"$temp/candidate-names"
   return 0
 }

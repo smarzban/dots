@@ -307,6 +307,12 @@ mkdir -p "$collision_home/.config/example"; printf local >"$collision_home/.conf
 remote_edit "$remote" "printf '%s\\n' '.config/example/settings' '.config/example/new' > \"\$1/.config/dots/manifest\"; printf remote > \"\$1/.config/example/new\"" || exit 1
 if ! run_sync "$collision_home" '' >/dev/null 2>&1 && test "$(cat "$collision_home/.config/example/new")" = local; then pass "incoming live collision"; else fail "incoming live collision"; fi
 
+# After an update PR merges, the originating machine already has the new file; identical content syncs.
+remote=$TMP/incoming-identical.git; new_remote "$remote"; identical_home=$TMP/home-incoming-identical; mkdir -p "$identical_home"; expect_ok run_dots "$identical_home" init "$remote" main
+printf 'shell\n' >"$identical_home/.zshrc"
+remote_edit "$remote" "printf '%s\\n' '.config/example/settings' '.zshrc' > \"\$1/.config/dots/manifest\"; printf 'shell\\n' > \"\$1/.zshrc\"" || exit 1
+if run_sync "$identical_home" '' >/dev/null 2>&1 && test "$(/usr/bin/git --git-dir="$identical_home/data/repo.git" rev-parse HEAD)" = "$(/usr/bin/git --git-dir="$remote" rev-parse main)" && test "$(cat "$identical_home/.zshrc")" = shell; then pass "incoming file identical to live file syncs"; else fail "incoming file identical to live file syncs"; fi
+
 # A live symlink is refused during status, without following its target.
 remote=$TMP/live-symlink.git; new_remote "$remote"; symlink_home=$TMP/home-live-symlink; mkdir -p "$symlink_home"; expect_ok run_dots "$symlink_home" init "$remote" main
 rm "$symlink_home/.config/example/settings"; ln -s /tmp "$symlink_home/.config/example/settings"
