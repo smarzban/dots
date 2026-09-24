@@ -1,0 +1,39 @@
+# Run a command in a pseudo-terminal and answer its prompts from a script, without
+# fixed delays: drive.expect INPUT COMMAND [ARG...]
+#
+# INPUT holds the answers, one per line. Each is typed when the command shows a
+# prompt (dots prompts end in ": " or "] "). Once the answers run out, further
+# prompts get end-of-file (Ctrl-D), as a closed pipe did before. The command's
+# output, including echoed answers, is passed through, and its exit status is
+# returned.
+set timeout 60
+set input [lindex $argv 0]
+set command [lrange $argv 1 end]
+set stty_init "rows 40 columns 200"
+
+set answers [split $input "\n"]
+# A trailing newline ends the last answer rather than adding an empty one.
+if {[string index $input end] eq "\n"} { set answers [lrange $answers 0 end-1] }
+if {$input eq ""} { set answers {} }
+
+log_user 1
+spawn -noecho {*}$command
+set prompt {(: |\] )$}
+set finished 0
+
+foreach answer $answers {
+  expect {
+    -re $prompt { send -- "$answer\r" }
+    eof { set finished 1; break }
+    timeout { puts stderr "drive.expect: no prompt within $timeout seconds"; exit 124 }
+  }
+}
+if {!$finished} {
+  expect {
+    -re $prompt { send "\004"; exp_continue }
+    eof {}
+    timeout { puts stderr "drive.expect: command did not finish within $timeout seconds"; exit 124 }
+  }
+}
+set result [wait]
+exit [lindex $result 3]

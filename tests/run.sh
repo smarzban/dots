@@ -7,6 +7,8 @@ export DOTS_PLAIN_PROMPTS
 
 ROOT=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
 DOTS=$ROOT/bin/dots
+DRIVE=$ROOT/tests/drive.expect
+command -v expect >/dev/null 2>&1 || { echo "tests need expect (macOS includes /usr/bin/expect)" >&2; exit 1; }
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/dots-tests.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT HUP INT TERM
 PASS=0
@@ -125,19 +127,19 @@ run_sync() {
   home=$1
   input=$2
   # BSD script supplies a pseudo-terminal, needed by the intentional sync guard.
-  (sleep 3; printf '%s' "$input") | HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid TERM=dumb /usr/bin/script -q /dev/null /bin/sh -c "$DOTS sync"
+  HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid TERM=dumb expect "$DRIVE" "$input" "$DOTS" sync
 }
 
 run_discover() {
   home=$1
   input=$2
-  (sleep 3; printf '%s' "$input") | HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid TERM=dumb /usr/bin/script -q /dev/null /bin/sh -c "$DOTS init --discover"
+  HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid TERM=dumb expect "$DRIVE" "$input" "$DOTS" init --discover
 }
 
 run_default_init() {
   home=$1
   remote=$2
-  (sleep 3; printf 'y\n') | HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK DOTS_GH=$MOCK_GH DOTS_DEFAULT_REMOTE=$remote DOTS_DEFAULT_GITHUB_REPO=smarzban/dotfiles DOTS_TEST_GH_REMOTE=$remote GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid TERM=dumb /usr/bin/script -q /dev/null /bin/sh -c "$DOTS init"
+  HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK DOTS_GH=$MOCK_GH DOTS_DEFAULT_REMOTE=$remote DOTS_DEFAULT_GITHUB_REPO=smarzban/dotfiles DOTS_TEST_GH_REMOTE=$remote GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid TERM=dumb expect "$DRIVE" $'y\n' "$DOTS" init
 }
 
 run_existing_default_init() {
@@ -157,7 +159,7 @@ run_derived_default_init() {
   response=$3
   log=$TMP/gh-create.log
   : >"$log"
-  (sleep 3; printf '%s' "$response") | HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK DOTS_GH=$MOCK_GH DOTS_GIT=$MOCK_GIT DOTS_TEST_GH_REMOTE=$remote DOTS_TEST_GH_LOG=$log GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid TERM=dumb /usr/bin/script -q /dev/null /bin/sh -c "$DOTS init"
+  HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK DOTS_GH=$MOCK_GH DOTS_GIT=$MOCK_GIT DOTS_TEST_GH_REMOTE=$remote DOTS_TEST_GH_LOG=$log GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid TERM=dumb expect "$DRIVE" "$response" "$DOTS" init
 }
 
 run_update() {
@@ -166,14 +168,14 @@ run_update() {
   input=$3
   log=$TMP/gh-update.log
   : >"$log"
-  (sleep 3; printf '%s' "$input") | DOTS_TEST_GH_REPO_EXISTS=1 HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK DOTS_GH=$MOCK_GH DOTS_GIT=$MOCK_GIT DOTS_TEST_GH_REMOTE=$remote DOTS_TEST_GH_LOG=$log GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid TERM=dumb /usr/bin/script -q /dev/null /bin/sh -c "$DOTS update"
+  DOTS_TEST_GH_REPO_EXISTS=1 HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK DOTS_GH=$MOCK_GH DOTS_GIT=$MOCK_GIT DOTS_TEST_GH_REMOTE=$remote DOTS_TEST_GH_LOG=$log GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid TERM=dumb expect "$DRIVE" "$input" "$DOTS" update
 }
 
 run_dots_pty() {
   home=$1
   input=$2
   shift 2
-  (sleep 3; printf '%s' "$input") | HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid TERM=dumb /usr/bin/script -q /dev/null "$DOTS" "$@"
+  HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid TERM=dumb expect "$DRIVE" "$input" "$DOTS" "$@"
 }
 
 make_mock_gitleaks
@@ -443,14 +445,20 @@ set timeout 20
 set key [lindex $argv 0]
 set stty_init "rows 30 columns 100"
 spawn -noecho /bin/sh -c "\"[lindex $argv 1]\" init \"[lindex $argv 2]\" main; stty -a"
-expect { "selected" {} timeout { exit 1 } }
+expect {
+  "selected" {}
+  timeout { exit 1 }
+}
 if {$key eq "Q"} { send "q" } else { send "\003" }
 expect {
   -re {lflags:[^\r\n]*} { set flags $expect_out(0,string) }
   timeout { exit 1 }
 }
 if {[string match "*-icanon*" $flags] || [string match "*-echo *" $flags]} { exit 1 }
-expect eof
+expect {
+  eof {}
+  timeout { exit 1 }
+}
 exit 0
 EXPECT
   for key in Q C; do
@@ -488,12 +496,24 @@ if command -v expect >/dev/null 2>&1; then
 set timeout 20
 set stty_init "rows 30 columns 100"
 spawn -noecho {*}$argv
-expect { "selected" {} timeout { exit 1 } }
+expect {
+  "selected" {}
+  timeout { exit 1 }
+}
 send "\033\[C"
-expect { -re {Page 2 of 2: previously ignored[^\r\n]*} {} timeout { exit 1 } }
-expect { "\[ \] .vimrc" {} timeout { exit 1 } }
+expect {
+  -re {Page 2 of 2: previously ignored[^\r\n]*} {}
+  timeout { exit 1 }
+}
+expect {
+  -ex {[ ] .vimrc} {}
+  timeout { exit 1 }
+}
 send "q"
-expect eof
+expect {
+  eof {}
+  timeout { exit 1 }
+}
 exit 0
 EXPECT
   if DOTS_TEST_GH_REPO_EXISTS=1 HOME=$ignore_home DOTS_DATA_DIR=$ignore_home/data DOTS_GITLEAKS=$MOCK DOTS_GH=$MOCK_GH DOTS_GIT=$MOCK_GIT DOTS_TEST_GH_REMOTE=$remote DOTS_TEST_GH_LOG=$TMP/gh-update.log DOTS_PLAIN_PROMPTS=0 TERM=xterm-256color expect "$ignored_script" "$DOTS" update >/dev/null 2>&1; then pass "checklist shows a previously ignored page"; else fail "checklist shows a previously ignored page"; fi
@@ -633,7 +653,7 @@ run_dots_pty "$stop_home" $'1\nn\n' select >/dev/null 2>&1
 if test "$(cat "$stop_home/.config/example/settings")" = mine && grep -Fx 'skip .config/example/settings' "$stop_home/data/selection" >/dev/null; then pass "declined select changes nothing"; else fail "declined select changes nothing"; fi
 # DOTS_PLAIN_PROMPTS=1 forces the numbered list even in a capable terminal.
 plain_home=$TMP/home-plain; mkdir -p "$plain_home"
-plain=$( (sleep 3; printf '\n') | HOME=$plain_home DOTS_DATA_DIR=$plain_home/data DOTS_GITLEAKS=$MOCK DOTS_PLAIN_PROMPTS=1 TERM=xterm-256color /usr/bin/script -q /dev/null "$DOTS" init "$TMP/merge-unused.git" main 2>&1)
+plain=$( HOME=$plain_home DOTS_DATA_DIR=$plain_home/data DOTS_GITLEAKS=$MOCK DOTS_PLAIN_PROMPTS=1 TERM=xterm-256color expect "$DRIVE" $'\n' "$DOTS" init "$TMP/merge-unused.git" main 2>&1)
 if printf '%s' "$plain" | grep -F 'Toggle numbers' >/dev/null; then pass "DOTS_PLAIN_PROMPTS forces numbered prompts"; else fail "DOTS_PLAIN_PROMPTS forces numbered prompts"; fi
 
 # With the real scanner, dots uses gitleaks' default rules: a planted repository config
