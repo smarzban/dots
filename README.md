@@ -142,7 +142,13 @@ In checklists, use Up/Down to move, Left/Right to change folder page, Space to t
 - every file under `~/.config`
 - inside any other `~/.<name>` folder, files up to two levels deep whose names look like configuration (`.json`, `.toml`, `.yaml`, `.conf`, `.ini`, `.md`, `.sh`, `.lua`, names ending in `rc`, and similar)
 
-Only small text files (up to 64 KB) are suggested. Keys and credentials (`~/.ssh`, `~/.gnupg`, `.netrc`, `.npmrc`, names containing `token`, `secret`, `auth`, and similar), caches, logs, history, sessions, and Git checkouts inside tool folders are always left out. Whatever you tick is still scanned with gitleaks before it is pushed.
+Only small text files (up to 64 KB) are suggested. Always left out:
+
+- keys and credentials: `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `.netrc`, `.npmrc`, and names containing `token`, `secret`, `auth`, `private`, `password`, or `mcp` (MCP server configs usually hold API keys)
+- caches, logs, history, sessions, and similar machine-local state
+- files inside a Git checkout, which belong to that project
+
+Whatever you tick is still scanned with gitleaks, using its default rules, before it is pushed.
 
 To tune the suggestions, create `~/.config/dots/discover` with one rule per line, then share it like any other file so every Mac gets the same suggestions:
 
@@ -154,7 +160,7 @@ include .claude/skills/*/SKILL.md
 exclude .config/some-app/*
 ```
 
-Patterns are relative to your home folder, and `*` also matches `/`. Exclusions win over includes, and the built-in exclusions always apply.
+Patterns are relative to your home folder and `*` also matches `/`. Write out the first folder (`.claude/…`, not `.*/…`); a pattern without a folder matches files directly in your home folder. Exclusions win over includes, and the built-in exclusions always apply.
 
 ## How it works
 

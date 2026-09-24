@@ -176,11 +176,26 @@ validate_tree() {
   return 0
 }
 
+# Run gitleaks with exactly its default rules. A private config extends them, so a
+# repository .gitleaks.toml or the environment cannot replace them (an empty config
+# such as /dev/null would load no rules at all), and the .gitleaksignore lookup
+# points at an empty folder rather than the current directory. Reports are
+# suppressed and fully redacted.
+run_gitleaks() {
+  gl_mode=$1
+  shift
+  gl_dir=$(mktemp -d "${TMPDIR:-/tmp}/dots-gitleaks.XXXXXX") || return 1
+  printf '[extend]\nuseDefault = true\n' >"$gl_dir/rules.toml" || { rm -rf "$gl_dir"; return 1; }
+  mkdir "$gl_dir/ignore" || { rm -rf "$gl_dir"; return 1; }
+  (unset GITLEAKS_CONFIG GITLEAKS_CONFIG_TOML; "$GITLEAKS" "$gl_mode" --no-banner --no-color --redact=100 --config "$gl_dir/rules.toml" --gitleaks-ignore-path "$gl_dir/ignore" "$@" >/dev/null 2>&1)
+  gl_status=$?
+  rm -rf "$gl_dir"
+  return "$gl_status"
+}
+
 scan_git_revision() {
-  gitdir=$1
-  rev=$2
-  # gitleaks receives only a revision, its report is suppressed and fully redacted.
-  (unset GITLEAKS_CONFIG GITLEAKS_CONFIG_TOML; "$GITLEAKS" git --no-banner --no-color --redact=100 --config /dev/null --log-opts "$rev" "$gitdir" >/dev/null 2>&1)
+  # gitleaks receives only a revision.
+  run_gitleaks git --log-opts "$2" "$1"
 }
 
 copy_live_candidates_for_scan() {
@@ -200,11 +215,11 @@ scan_live_candidates() {
   scan=$temp/live-scan
   mkdir -p "$scan" || return 1
   copy_live_candidates_for_scan "$list" "$scan" || return 1
-  (unset GITLEAKS_CONFIG GITLEAKS_CONFIG_TOML; "$GITLEAKS" dir --no-banner --no-color --redact=100 --config /dev/null "$scan" >/dev/null 2>&1)
+  run_gitleaks dir "$scan"
 }
 
 scan_directory() {
-  (unset GITLEAKS_CONFIG GITLEAKS_CONFIG_TOML; "$GITLEAKS" dir --no-banner --no-color --redact=100 --config /dev/null "$1" >/dev/null 2>&1)
+  run_gitleaks dir "$1"
 }
 
 append_unique_list() {
@@ -482,13 +497,14 @@ candidate_is_excluded() {
   esac
   ce_lower=$(printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]')
   case "/$ce_lower" in
-    # Folders of credentials or keys.
-    /.ssh/*|/.gnupg/*|/.kube/*|/.config/gh/*|/.config/configstore/*|/.docker/config.json) return 0 ;;
+    # Folders of credentials or keys, and files known to hold them.
+    /.ssh/*|/.gnupg/*|/.kube/*|/.aws/*|/.azure/*|/.config/gh/*|/.config/hub|/.config/op/*|/.config/gcloud/*|/.config/pass/*|/.config/chezmoi/*|/.config/configstore/*|/.docker/config.json) return 0 ;;
     # Caches, logs, transcripts, and other machine-local state.
     */.git/*|*/.system/*|*/logs/*|*/log/*|*-logs/*|*_logs/*|*/tmp/*|*/temp/*|*/runtime/*|*/sessions/*|*/state/*|*/history/*|*/projects/*|*/node_modules/*|*/backups/*|*/.trash/*) return 0 ;;
     # Private content that tools keep next to their settings.
     */memories/*|*/memory/*|*/attachments/*|*/transcripts/*) return 0 ;;
-    *auth*|*credential*|*token*|*secret*|*password*|*passwd*|*history*|*session*|*state*|*backup*|*cache*|*telemetry*|*analytics*) return 0 ;;
+    # MCP server configurations usually carry API keys in their environment blocks.
+    *auth*|*credential*|*token*|*secret*|*private*|*password*|*passwd*|*mcp*|*history*|*session*|*state*|*backup*|*cache*|*telemetry*|*analytics*) return 0 ;;
   esac
   case ${ce_lower##*/} in
     .netrc|.npmrc|.pypirc|.pgpass|.my.cnf|.git-credentials|.env|.env.*|*.env|*.env.*|*.pem|*.key|*.p12|*.pfx|*.crt|*.keychain*|id_*|*.db|*.db-*|*.sqlite*|*.lock|*.log|*.pid|*.bak|*.old|*.swp|*~) return 0 ;;
@@ -525,12 +541,26 @@ path_matches_list() {
 }
 
 # Rule patterns are HOME-relative printable ASCII globs without spaces or "..".
+# A pattern naming a folder must spell out its first folder, which is where the
+# include walk starts (".*/x" would otherwise mean the whole home folder).
 valid_rule_pattern() {
   test -n "$1" || return 1
   printf '%s' "$1" | LC_ALL=C grep '[^!-~]' >/dev/null && return 1
   case $1 in .*) ;; *) return 1 ;; esac
   case $1 in *'..'*|*'\\'*|*'//'*|*/) return 1 ;; esac
+  case $1 in */*) case ${1%%/*} in *[*?[]*) return 1 ;; esac ;; esac
   return 0
+}
+
+# A file inside a Git checkout (other than HOME or ~/.config themselves) belongs to
+# that project, not to this Mac's configuration.
+inside_git_checkout() {
+  gc_dir=${1%/*}
+  while test "$gc_dir" != "$1" && test -n "$gc_dir"; do
+    test "$gc_dir" = .config || { test ! -e "$DOTS_HOME/$gc_dir/.git" && test ! -L "$DOTS_HOME/$gc_dir/.git"; } || return 0
+    case $gc_dir in */*) gc_dir=${gc_dir%/*} ;; *) break ;; esac
+  done
+  return 1
 }
 
 # Parse the optional rules file into include and exclude pattern lists.
@@ -562,6 +592,8 @@ load_discover_rules() {
 # add_candidate path [config-names]; appends to $DC_OUT unless approved or filtered.
 add_candidate() {
   ac_path=$1
+  # Every source is a hidden path in HOME; anything else is a forged or stray name.
+  case $ac_path in .*) ;; *) return 0 ;; esac
   valid_manifest_path "$ac_path" || return 0
   candidate_is_excluded "$ac_path" && return 0
   test "${2:-}" != config-names || config_like_name "$ac_path" || return 0
@@ -569,6 +601,7 @@ add_candidate() {
   # A symlinked parent (for example ~/.claude -> elsewhere) would publish files from outside HOME.
   safe_live_path "$ac_path" || return 0
   test -f "$DOTS_HOME/$ac_path" && test ! -L "$DOTS_HOME/$ac_path" || return 0
+  inside_git_checkout "$ac_path" && return 0
   is_reserved_path "$ac_path" && return 0
   path_in_list "$ac_path" "$DC_APPROVED" && return 0
   small_text_file "$DOTS_HOME/$ac_path" || return 0
@@ -615,10 +648,7 @@ collect_candidates() {
     valid_manifest_path "$dc_dir" || continue
     is_reserved_path "$dc_dir" && continue
     walk_files "$dc_dir" 2 | while IFS= read -r -d '' dc_file; do
-      dc_path=${dc_file#"$DOTS_HOME"/}
-      # A Git checkout inside a tool folder (a vendored project) is not configuration.
-      case $dc_path in */*/*) test ! -e "$DOTS_HOME/${dc_path%/*}/.git" || continue ;; esac
-      add_candidate "$dc_path" config-names
+      add_candidate "${dc_file#"$DOTS_HOME"/}" config-names
     done
   done
   # Rule includes: walk from the pattern's fixed leading folder, then match.

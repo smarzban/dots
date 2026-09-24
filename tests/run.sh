@@ -247,40 +247,46 @@ head -c 70000 /dev/zero | tr '\000' a >"$disc/.unknowntool/huge.json"; printf 'a
 # Credentials and machine state are never suggested.
 mkdir -p "$disc/.ssh" "$disc/.docker" "$disc/.cache" "$disc/.config/gh"
 printf 'Host x' >"$disc/.ssh/config"; printf '{}' >"$disc/.docker/config.json"; printf 'k' >"$disc/.netrc"; printf 'k' >"$disc/.npmrc"
+mkdir -p "$disc/.aws" "$disc/.config/acme" "$disc/.config/vendored/.git" "$disc/.project/.git"
+printf '[default]' >"$disc/.aws/config"; printf '{}' >"$disc/.config/acme/private.json"; printf '{}' >"$disc/.config/acme/mcp.json"
+printf '{}' >"$disc/.config/vendored/settings.json"; printf '{}' >"$disc/.project/config.json"
 printf '{}' >"$disc/.cache/z.json"; printf 'h' >"$disc/.config/gh/hosts.yml"; printf h >"$disc/.zsh_history"; printf s >"$disc/.DS_Store"; printf '{}' >"$disc/.claude.json"
 # A symlinked parent must not expose files from outside HOME.
 printf outside >"$outside/config.toml"; ln -s "$outside" "$disc/.grok"
-# A newline inside a filename must not forge another path (checked with an include below).
-printf x >"$disc/.pi/agent/agents/a
-.forged"
+# A newline inside a filename must not forge another path: the piece after it names a
+# real file that is never suggested (not hidden), so reading line by line would leak it.
+printf private >"$disc/forged-notes"; printf x >"$disc/.config/newtool/a
+forged-notes"; printf x >"$disc/.pi/agent/agents/a
+forged-notes"
 discovery=$(run_dots "$disc" init --discover 2>&1)
 listed() { printf '%s\n' "$discovery" | grep -E "^ *[0-9]+  $1\$" >/dev/null; }
 if listed .gitconfig && listed .zshrc && ! printf '%s' "$discovery" | grep -F '\n' >/dev/null; then pass "discovery renders one candidate per line"; else fail "discovery renders one candidate per line"; fi
 if listed .zprofile && listed .vimrc && listed .claude/settings.json && listed .pi/agent/settings.json && listed .config/newtool/anything && listed .unknowntool/settings.yaml && listed .unknowntool/sub/prefs.toml; then pass "generic discovery finds dotfiles and unknown tools"; else fail "generic discovery finds dotfiles and unknown tools"; fi
 if ! printf '%s' "$discovery" | grep -F -e too-deep.json -e data.bin -e huge.json -e binary.json -e models_cache.json -e /cache/ -e node_modules -e vendored -e .pi/agent/agents/helper.md >/dev/null; then pass "generic discovery skips deep, binary, large, cache, and vendored files"; else fail "generic discovery skips deep, binary, large, cache, and vendored files"; fi
-if ! printf '%s' "$discovery" | grep -F -e .ssh/ -e .docker/config.json -e .netrc -e .npmrc -e .cache/ -e .config/gh/ -e .zsh_history -e .DS_Store -e .claude.json -e dev.env.tmpl -e .config/dots/manifest >/dev/null; then pass "discovery never suggests credentials or machine state"; else fail "discovery never suggests credentials or machine state"; fi
+if ! printf '%s' "$discovery" | grep -F -e .ssh/ -e .docker/config.json -e .netrc -e .npmrc -e .cache/ -e .config/gh/ -e .zsh_history -e .DS_Store -e .claude.json -e dev.env.tmpl -e .config/dots/manifest -e .aws/ -e private.json -e mcp.json -e .config/mcp/ -e .config/vendored/ -e .project/ >/dev/null; then pass "discovery never suggests credentials or machine state"; else fail "discovery never suggests credentials or machine state"; fi
 # A rules file adds what the scan misses and drops what it should not suggest.
 mkdir -p "$disc/.config/dots"
 printf '%s\n' '# rules for this test' 'include .pi/agent/agents/*' 'include .codex/skills/*/SKILL.md' 'exclude .config/mcp/*' 'exclude .pi/web-search.json' '' >"$disc/.config/dots/discover"
 discovery=$(run_dots "$disc" init --discover 2>&1)
-if listed .pi/agent/agents/helper.md && listed .codex/skills/demo/SKILL.md && listed .config/dots/discover && ! printf '%s' "$discovery" | grep -F -e '.pi/agent/agents/a' -e .forged >/dev/null; then pass "discover rules include extra files"; else fail "discover rules include extra files"; fi
+if listed .pi/agent/agents/helper.md && listed .codex/skills/demo/SKILL.md && listed .config/dots/discover && ! printf '%s' "$discovery" | grep -F -e '.pi/agent/agents/a' -e forged-notes >/dev/null; then pass "discover rules include extra files"; else fail "discover rules include extra files"; fi
 if ! printf '%s' "$discovery" | grep -F -e notes.md -e .config/mcp/ -e .pi/web-search.json >/dev/null; then pass "discover rules exclude files"; else fail "discover rules exclude files"; fi
-# Includes still obey the built-in exclusions.
-printf '%s\n' 'include .ssh/*' 'include .unknowntool/*' >"$disc/.config/dots/discover"
+# Includes still obey the built-in exclusions, symlink checks, and Git checkout rule.
+printf '%s\n' 'include .ssh/*' 'include .unknowntool/*' 'include .grok/*' 'include .grok/config.toml' 'include .project/*' 'include .config/vendored/*' >"$disc/.config/dots/discover"
 discovery=$(run_dots "$disc" init --discover 2>&1)
-if listed .unknowntool/sub/deeper/too-deep.json && ! printf '%s' "$discovery" | grep -F -e .ssh/ -e huge.json -e /cache/ >/dev/null; then pass "discover includes keep built-in exclusions"; else fail "discover includes keep built-in exclusions"; fi
+if listed .unknowntool/sub/deeper/too-deep.json && ! printf '%s' "$discovery" | grep -F -e .ssh/ -e huge.json -e /cache/ -e .grok/ -e .project/ -e .config/vendored/ >/dev/null; then pass "discover includes keep built-in exclusions"; else fail "discover includes keep built-in exclusions"; fi
 # A malformed rules file fails closed with the line number.
 printf '%s\n' 'include .pi/agent/agents/*' 'includ .zshrc' >"$disc/.config/dots/discover"
 if ! (run_dots "$disc" init --discover) >"$TMP/rules.out" 2>&1 && grep -F 'discover line 2' "$TMP/rules.out" >/dev/null; then pass "invalid discover rule fails with its line"; else fail "invalid discover rule fails with its line"; fi
-for bad in 'include /etc/*' 'exclude ../x' 'include .a b'; do
+for bad in 'include /etc/*' 'exclude ../x' 'include .a b' 'include .*/AGENTS.md' 'include .c*/settings.json'; do
   printf '%s\n' "$bad" >"$disc/.config/dots/discover"
   if (run_dots "$disc" init --discover) >/dev/null 2>&1; then fail "unsafe discover pattern refused: $bad"; else pass "unsafe discover pattern refused: $bad"; fi
 done
-rm -f "$disc/.config/dots/discover"; ln -s "$outside/config.toml" "$disc/.config/dots/discover"
+printf '%s\n' 'include .pi/agent/agents/*' >"$outside/rules"
+rm -f "$disc/.config/dots/discover"; ln -s "$outside/rules" "$disc/.config/dots/discover"
 if ! (run_dots "$disc" init --discover) >/dev/null 2>&1; then pass "symlinked discover rules refused"; else fail "symlinked discover rules refused"; fi
 rm -f "$disc/.config/dots/discover"
 discovery=$(run_dots "$disc" init --discover 2>&1)
-if ! printf '%s' "$discovery" | grep -F -e .grok/ -e .forged >/dev/null; then pass "discovery refuses symlinked parents and forged names"; else fail "discovery refuses symlinked parents and forged names"; fi
+if ! printf '%s' "$discovery" | grep -F -e .grok/ -e forged-notes >/dev/null; then pass "discovery refuses symlinked parents and forged names"; else fail "discovery refuses symlinked parents and forged names"; fi
 
 # status scopes itself to the allowlist and never reports an unrelated home file.
 printf private >"$home/private-token"
@@ -454,8 +460,45 @@ first=$(printf '%s\n' "$ignore_out" | grep -E '^ *1  \[' | head -1)
 if printf '%s' "$first" | grep -F .gitconfig >/dev/null && printf '%s' "$ignore_out" | grep -E '^ *3  \[ \] \.zshrc' >/dev/null; then pass "update lists new candidates before ignored ones"; else fail "update lists new candidates before ignored ones"; fi
 # Ticking a previously ignored file shares it and drops the ignore entry; select and sync keep the others.
 if run_update "$ignore_home" "$remote" $'3\ny\nShare shell\n' >/dev/null 2>&1 && grep -Fx 'pending .zshrc' "$ignore_home/data/selection" >/dev/null && ! grep -Fx 'ignore .zshrc' "$ignore_home/data/selection" >/dev/null && grep -Fx 'ignore .vimrc' "$ignore_home/data/selection" >/dev/null; then pass "ticking an ignored file shares it"; else fail "ticking an ignored file shares it"; fi
-run_dots_pty "$ignore_home" $'\n' select >/dev/null 2>&1
-if grep -Fx 'ignore .vimrc' "$ignore_home/data/selection" >/dev/null; then pass "select keeps ignore entries"; else fail "select keeps ignore entries"; fi
+# An ignored file that is not offered this time (deleted for now) stays ignored.
+mv "$ignore_home/.vimrc" "$TMP/vimrc.saved"
+printf 'ignore .unrelated\n' >>"$ignore_home/data/selection"
+grep -v -x 'ignore .gitconfig' "$ignore_home/data/selection" >"$TMP/sel" && mv "$TMP/sel" "$ignore_home/data/selection"
+DOTS_TEST_GH_PR_FAIL=1 run_update "$ignore_home" "$remote" $'\ny\nRetry\n' >/dev/null 2>&1
+mv "$TMP/vimrc.saved" "$ignore_home/.vimrc"
+# The selection was rewritten (the stray entry for a path never offered is kept too).
+if grep -Fx 'ignore .gitconfig' "$ignore_home/data/selection" >/dev/null && grep -Fx 'ignore .vimrc' "$ignore_home/data/selection" >/dev/null && grep -Fx 'ignore .unrelated' "$ignore_home/data/selection" >/dev/null; then pass "ignore entries survive while the file is gone"; else fail "ignore entries survive while the file is gone"; fi
+# The arrow-key checklist shows ignored files on their own last page.
+if command -v expect >/dev/null 2>&1; then
+  ignored_script=$TMP/ignored.expect
+  cat >"$ignored_script" <<'EXPECT'
+set timeout 20
+set stty_init "rows 30 columns 100"
+spawn -noecho {*}$argv
+expect { "selected" {} timeout { exit 1 } }
+send "\033\[C"
+expect { -re {Page 2 of 2: previously ignored[^\r\n]*} {} timeout { exit 1 } }
+expect { "\[ \] .vimrc" {} timeout { exit 1 } }
+send "q"
+expect eof
+exit 0
+EXPECT
+  if DOTS_TEST_GH_REPO_EXISTS=1 HOME=$ignore_home DOTS_DATA_DIR=$ignore_home/data DOTS_GITLEAKS=$MOCK DOTS_GH=$MOCK_GH DOTS_GIT=$MOCK_GIT DOTS_TEST_GH_REMOTE=$remote DOTS_TEST_GH_LOG=$TMP/gh-update.log DOTS_PLAIN_PROMPTS=0 TERM=xterm-256color expect "$ignored_script" "$DOTS" update >/dev/null 2>&1; then pass "checklist shows a previously ignored page"; else fail "checklist shows a previously ignored page"; fi
+else
+  pass "previously ignored page (expect unavailable, skipped)"
+fi
+# select and sync rewrite the selection and keep ignore entries.
+remote=$TMP/ignore-keep.git; new_remote "$remote"; keep_ignore=$TMP/home-ignore-keep; mkdir -p "$keep_ignore"; expect_ok run_dots "$keep_ignore" init "$remote" main
+printf 'ignore .vimrc\n' >>"$keep_ignore/data/selection"
+run_dots_pty "$keep_ignore" $'1\n' select >/dev/null 2>&1
+if grep -Fx 'skip .config/example/settings' "$keep_ignore/data/selection" >/dev/null && grep -Fx 'ignore .vimrc' "$keep_ignore/data/selection" >/dev/null; then pass "select keeps ignore entries"; else fail "select keeps ignore entries"; fi
+remote_edit "$remote" "printf '%s\\n' '.config/example/settings' '.zshrc' > \"\$1/.config/dots/manifest\"; printf shell > \"\$1/.zshrc\"" || exit 1
+if run_sync "$keep_ignore" $'\n' >/dev/null 2>&1 && grep -Fx 'use .zshrc' "$keep_ignore/data/selection" >/dev/null && grep -Fx 'ignore .vimrc' "$keep_ignore/data/selection" >/dev/null; then pass "sync keeps ignore entries"; else fail "sync keeps ignore entries"; fi
+# A newly discovered file holding a secret is refused by update before anything is pushed.
+secret_remote=$TMP/update-secret.git; secret_home=$TMP/home-update-secret; mkdir -p "$secret_home/.newtool"
+run_derived_default_init "$secret_home" "$secret_remote" $'y\n' >/dev/null 2>&1 || exit 1
+printf 'key = "DOTS_TEST_SECRET"\n' >"$secret_home/.newtool/config.toml"
+if ! DOTS_TEST_GITLEAKS_FAIL=1 run_update "$secret_home" "$secret_remote" $'1\ny\nShare new tool\n' >/dev/null 2>&1 && test -z "$(/usr/bin/git --git-dir="$secret_remote" for-each-ref 'refs/heads/dots/update-*')" && ! grep -F 'pr create' "$TMP/gh-update.log" >/dev/null; then pass "update scans newly discovered files before pushing"; else fail "update scans newly discovered files before pushing"; fi
 # Declining the confirmation saves no ignore entries.
 decline_home=$TMP/home-update-decline; mkdir -p "$decline_home"
 run_derived_default_init "$decline_home" "$TMP/update-decline.git" $'y\n' >/dev/null 2>&1 || exit 1
@@ -544,6 +587,20 @@ if test "$(cat "$stop_home/.config/example/settings")" = mine && grep -Fx 'skip 
 plain_home=$TMP/home-plain; mkdir -p "$plain_home"
 plain=$( (sleep 3; printf '\n') | HOME=$plain_home DOTS_DATA_DIR=$plain_home/data DOTS_GITLEAKS=$MOCK DOTS_PLAIN_PROMPTS=1 TERM=xterm-256color /usr/bin/script -q /dev/null "$DOTS" init "$TMP/merge-unused.git" main 2>&1)
 if printf '%s' "$plain" | grep -F 'Toggle numbers' >/dev/null; then pass "DOTS_PLAIN_PROMPTS forces numbered prompts"; else fail "DOTS_PLAIN_PROMPTS forces numbered prompts"; fi
+
+# With the real scanner, dots uses gitleaks' default rules: a planted repository config
+# or a .gitleaksignore in the current directory cannot switch them off.
+if REAL_GITLEAKS=$(command -v gitleaks 2>/dev/null); then
+  real_remote=$TMP/real-gitleaks.git; new_remote "$real_remote"
+  # Split so the literal token never appears in this file.
+  real_token="gh""p_R8x2Kq7Lm4Nv9Pz3Ts6Wb1Yc5Hd0Jf8Ga2E"
+  remote_edit "$real_remote" "printf 'token = \"%s\"\\n' '$real_token' > \"\$1/.config/example/settings\"" || exit 1
+  real_home=$TMP/home-real-gitleaks; mkdir -p "$real_home" "$TMP/cwd-ignore"
+  printf '[allowlist]\nregexes = [".*"]\n' >"$TMP/cwd-ignore/.gitleaks.toml"; printf '*\n' >"$TMP/cwd-ignore/.gitleaksignore"
+  if ! (cd "$TMP/cwd-ignore" && GITLEAKS_CONFIG=$TMP/cwd-ignore/.gitleaks.toml HOME=$real_home DOTS_DATA_DIR=$real_home/data DOTS_GITLEAKS=$REAL_GITLEAKS "$DOTS" init "$real_remote" main) >/dev/null 2>&1 && test ! -e "$real_home/.config/example/settings"; then pass "real gitleaks default rules block a token"; else fail "real gitleaks default rules block a token"; fi
+else
+  pass "real gitleaks default rules (gitleaks unavailable, skipped)"
+fi
 
 # Repository internals are never valid manifest targets, even when DOTS_DATA is under HOME.
 remote=$TMP/reserved-path.git; new_remote "$remote"
