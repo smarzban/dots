@@ -991,6 +991,8 @@ apply_workspace_result() {
   scan_directory "$workspace" || return 1
   if test ! -f "$temp/use"; then
     load_selection "$temp" "$temp/result-manifest" || return 1
+    # Own merged files are newly used here, so an edited copy is backed up, not a collision.
+    cat "$temp/arrived" >>"$temp/newly-used"
     # sync --continue: restore choices made about new files before the conflict.
     if test -f "$workspace/.git/dots-newly-used"; then
       cp "$workspace/.git/dots-newly-used" "$temp/newly-used" || return 1
