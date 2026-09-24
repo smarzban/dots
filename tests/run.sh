@@ -22,16 +22,26 @@ make_mock_gitleaks() {
   cat >"$MOCK" <<'EOF'
 #!/bin/sh
 # Tests use this only to make scanner failures deterministic. It prints no finding.
+# Like the real scanner with --exit-code 3, findings exit 3 and the report names files only.
 if [ "${DOTS_TEST_GITLEAKS_FAIL:-0}" = 1 ]; then
+  want=
   for arg in "$@"; do
+    case $want in
+      log) revision=$arg ;;
+      report) report=$arg ;;
+    esac
+    want=
+    case $arg in --log-opts) want=log ;; --report-path) want=report ;; esac
     last=$arg
-    if [ "${next:-0}" = 1 ]; then revision=$arg; next=0; fi
-    [ "$arg" = --log-opts ] && next=1
   done
   case " $* " in
-    *' git '*) /usr/bin/git --git-dir="$last" grep -q DOTS_TEST_SECRET "${revision:-HEAD}" && exit 1 ;;
-    *) grep -R -q DOTS_TEST_SECRET "$last" 2>/dev/null && exit 1 ;;
+    *' git '*) found=$(/usr/bin/git --git-dir="$last" grep -l DOTS_TEST_SECRET "${revision:-HEAD}" 2>/dev/null | sed 's/^[^:]*://') ;;
+    *) found=$(grep -R -l DOTS_TEST_SECRET "$last" 2>/dev/null | sed 's|^\./||') ;;
   esac
+  if [ -n "$found" ]; then
+    printf '%s\n' "$found" | awk '{ printf "%s\t1\tgeneric-api-key\n", $0 }' >"${report:-/dev/null}"
+    exit 3
+  fi
 fi
 exit 0
 EOF
@@ -500,7 +510,8 @@ if run_sync "$keep_ignore" $'\n' >/dev/null 2>&1 && grep -Fx 'use .zshrc' "$keep
 secret_remote=$TMP/update-secret.git; secret_home=$TMP/home-update-secret; mkdir -p "$secret_home/.newtool"
 run_derived_default_init "$secret_home" "$secret_remote" $'y\n' >/dev/null 2>&1 || exit 1
 printf 'key = "DOTS_TEST_SECRET"\n' >"$secret_home/.newtool/config.toml"
-if ! DOTS_TEST_GITLEAKS_FAIL=1 run_update "$secret_home" "$secret_remote" $'1\ny\nShare new tool\n' >/dev/null 2>&1 && test -z "$(/usr/bin/git --git-dir="$secret_remote" for-each-ref 'refs/heads/dots/update-*')" && ! grep -F 'pr create' "$TMP/gh-update.log" >/dev/null; then pass "update scans newly discovered files before pushing"; else fail "update scans newly discovered files before pushing"; fi
+secret_out=$(DOTS_TEST_GITLEAKS_FAIL=1 run_update "$secret_home" "$secret_remote" $'1\ny\nShare new tool\n' 2>&1)
+if printf '%s' "$secret_out" | grep -F '.newtool/config.toml, line 1 (generic-api-key)' >/dev/null && printf '%s' "$secret_out" | grep -F 'nothing was pushed' >/dev/null && ! printf '%s' "$secret_out" | grep -F 'key = ' >/dev/null && ! printf '%s' "$secret_out" | grep -F DOTS_TEST_SECRET >/dev/null && test -z "$(/usr/bin/git --git-dir="$secret_remote" for-each-ref 'refs/heads/dots/update-*')" && ! grep -F 'pr create' "$TMP/gh-update.log" >/dev/null; then pass "update scans newly discovered files before pushing"; else fail "update scans newly discovered files before pushing"; fi
 # Declining the confirmation saves no ignore entries.
 decline_home=$TMP/home-update-decline; mkdir -p "$decline_home"
 run_derived_default_init "$decline_home" "$TMP/update-decline.git" $'y\n' >/dev/null 2>&1 || exit 1
@@ -630,7 +641,8 @@ if REAL_GITLEAKS=$(command -v gitleaks 2>/dev/null); then
   remote_edit "$real_remote" "printf 'token = \"%s\"\\n' '$real_token' > \"\$1/.config/example/settings\"" || exit 1
   real_home=$TMP/home-real-gitleaks; mkdir -p "$real_home" "$TMP/cwd-ignore"
   printf '[allowlist]\nregexes = [".*"]\n' >"$TMP/cwd-ignore/.gitleaks.toml"; printf '*\n' >"$TMP/cwd-ignore/.gitleaksignore"
-  if ! (cd "$TMP/cwd-ignore" && GITLEAKS_CONFIG=$TMP/cwd-ignore/.gitleaks.toml HOME=$real_home DOTS_DATA_DIR=$real_home/data DOTS_GITLEAKS=$REAL_GITLEAKS "$DOTS" init "$real_remote" main) >/dev/null 2>&1 && test ! -e "$real_home/.config/example/settings"; then pass "real gitleaks default rules block a token"; else fail "real gitleaks default rules block a token"; fi
+  real_out=$( (cd "$TMP/cwd-ignore" && GITLEAKS_CONFIG=$TMP/cwd-ignore/.gitleaks.toml HOME=$real_home DOTS_DATA_DIR=$real_home/data DOTS_GITLEAKS=$REAL_GITLEAKS "$DOTS" init "$real_remote" main) 2>&1)
+  if test ! -e "$real_home/.config/example/settings" && printf '%s' "$real_out" | grep -F '.config/example/settings, line 1 (' >/dev/null && ! printf '%s' "$real_out" | grep -F "$real_token" >/dev/null; then pass "real gitleaks default rules block a token"; else fail "real gitleaks default rules block a token"; fi
 else
   pass "real gitleaks default rules (gitleaks unavailable, skipped)"
 fi

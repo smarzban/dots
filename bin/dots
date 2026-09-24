@@ -176,26 +176,42 @@ validate_tree() {
   return 0
 }
 
-# Run gitleaks with exactly its default rules. A private config extends them, so a
-# repository .gitleaks.toml or the environment cannot replace them (an empty config
-# such as /dev/null would load no rules at all), and the .gitleaksignore lookup
-# points at an empty folder rather than the current directory. Reports are
-# suppressed and fully redacted.
+# Run gitleaks with exactly its default rules: run_gitleaks dir|git target [flags].
+# A private config extends them, so a repository .gitleaks.toml or the environment
+# cannot replace them (an empty config such as /dev/null would load no rules), and
+# the .gitleaksignore lookup points at an empty folder rather than the current
+# directory. Findings are reported by file, line, and rule only; values never are.
 run_gitleaks() {
   gl_mode=$1
-  shift
+  gl_target=$2
+  shift 2
   gl_dir=$(mktemp -d "${TMPDIR:-/tmp}/dots-gitleaks.XXXXXX") || return 1
-  printf '[extend]\nuseDefault = true\n' >"$gl_dir/rules.toml" || { rm -rf "$gl_dir"; return 1; }
-  mkdir "$gl_dir/ignore" || { rm -rf "$gl_dir"; return 1; }
-  (unset GITLEAKS_CONFIG GITLEAKS_CONFIG_TOML; "$GITLEAKS" "$gl_mode" --no-banner --no-color --redact=100 --config "$gl_dir/rules.toml" --gitleaks-ignore-path "$gl_dir/ignore" "$@" >/dev/null 2>&1)
+  { printf '[extend]\nuseDefault = true\n' >"$gl_dir/rules.toml" &&
+    printf '{{ range . }}{{ .File }}\t{{ .StartLine }}\t{{ .RuleID }}\n{{ end }}' >"$gl_dir/report.tmpl" &&
+    mkdir "$gl_dir/ignore"; } || { rm -rf "$gl_dir"; return 1; }
+  (
+    unset GITLEAKS_CONFIG GITLEAKS_CONFIG_TOML
+    # Scanning a folder from inside it keeps report paths relative to it.
+    if test "$gl_mode" = dir; then cd "$gl_target" || exit 2; gl_target=.; fi
+    "$GITLEAKS" "$gl_mode" --no-banner --no-color --redact=100 --exit-code 3 --config "$gl_dir/rules.toml" --gitleaks-ignore-path "$gl_dir/ignore" --report-format template --report-template "$gl_dir/report.tmpl" --report-path "$gl_dir/report" "$@" "$gl_target" >/dev/null 2>&1
+  )
   gl_status=$?
+  case $gl_status in
+    0) ;;
+    3)
+      say "gitleaks found what looks like a secret (values are not shown):"
+      # Printable characters only, so a hostile file name cannot drive the terminal.
+      LC_ALL=C tr -cd '\11\12\40-\176' <"$gl_dir/report" 2>/dev/null |
+        awk -F '\t' 'NF >= 3 { n++; if (n <= 20) printf "  %s, line %s (%s)\n", $1, $2, $3 } END { if (n > 20) printf "  and %d more\n", n - 20; if (!n) print "  (no details available)" }' >&2 ;;
+    *) say "gitleaks could not complete the scan (exit status $gl_status)" ;;
+  esac
   rm -rf "$gl_dir"
   return "$gl_status"
 }
 
 scan_git_revision() {
   # gitleaks receives only a revision.
-  run_gitleaks git --log-opts "$2" "$1"
+  run_gitleaks git "$1" --log-opts "$2"
 }
 
 copy_live_candidates_for_scan() {
@@ -1062,7 +1078,7 @@ init_command() {
   git_dir "$candidate_repo" fetch --no-tags origin "refs/heads/$branch:refs/heads/$branch" >/dev/null 2>&1 || fail "could not fetch requested branch"
   revision=$(git_dir "$candidate_repo" rev-parse "refs/heads/$branch" 2>/dev/null) || fail "requested branch has no revision"
   validate_tree "$candidate_repo" "$revision" "$temp/manifest-paths" "$temp" || fail "candidate manifest or repository tree is unsafe"
-  scan_git_revision "$candidate_repo" "$revision" || fail "credential scan failed for candidate revision"
+  scan_git_revision "$candidate_repo" "$revision" || fail "nothing was changed on this Mac. Remove the secret from the repository, then run dots init again"
   # Choose which repository files this Mac uses. Without a terminal, all are used.
   cp "$temp/manifest-paths" "$temp/use" || fail "could not prepare file selection"
   if test -s "$temp/manifest-paths" && test -t 0 && test -t 1; then
@@ -1217,7 +1233,7 @@ sync_command() {
   validate_current_state "$temp" || fail "repository tree or live manifest is unsafe"
   git_repo diff --cached --quiet || fail "repository index has staged changes; resolve or unstage them before sync"
   git_repo diff --name-only --diff-filter=U | grep . >/dev/null 2>&1 && fail "repository index has conflicts; resolve them before sync"
-  scan_live_candidates "$temp/selected-paths" "$temp" || fail "credential scan failed for local candidates"
+  scan_live_candidates "$temp/selected-paths" "$temp" || fail "nothing was changed. Remove the secret from the local file, then run dots sync again"
   branch=$(current_branch)
   base=$(head_revision) || fail "cannot resolve current revision"
   remote=$(fetch_validated_remote "$temp" "$branch") || fail "incoming repository data is unsafe or unavailable"
@@ -1393,7 +1409,7 @@ update_command() {
   : >"$temp/update-paths"
   append_unique_list "$temp/head-paths" "$temp/update-paths"
   append_unique_list "$temp/proposed-paths" "$temp/update-paths"
-  scan_live_candidates "$temp/scan-paths" "$temp" || fail "credential scan failed for local update candidates"
+  scan_live_candidates "$temp/scan-paths" "$temp" || fail "nothing was pushed. Remove the secret from the file, or untick the file, then run dots update again"
   update_workspace=$temp/update-workspace
   "$GIT" clone --quiet --no-checkout -- "$REPO" "$update_workspace" || fail "could not prepare update workspace"
   "$GIT" -C "$update_workspace" checkout --quiet "$base" || fail "could not prepare update base"
