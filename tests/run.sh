@@ -524,6 +524,13 @@ remote=$TMP/hand-both.git; new_remote "$remote"; both_home=$TMP/home-hand-both; 
 printf 'mine\n' >"$both_home/.zshrc"; printf '.zshrc\n' >>"$both_home/.config/dots/manifest"
 remote_edit "$remote" "printf '%s\\n' '.config/example/settings' '.zshrc' > \"\$1/.config/dots/manifest\"; printf 'theirs\\n' > \"\$1/.zshrc\"" || exit 1
 if run_sync "$both_home" $'y\n1\n' >/dev/null 2>&1 && test "$(cat "$both_home/.zshrc")" = theirs && test "$(cat "$(find "$both_home/data/backups" -path '*/.zshrc' -type f | head -1)")" = mine && grep -Fx 'use .zshrc' "$both_home/data/selection" >/dev/null; then pass "hand-added path also shared remotely is backed up"; else fail "hand-added path also shared remotely is backed up"; fi
+# Declining it keeps the local copy, even when a conflict is continued later.
+remote=$TMP/hand-decline.git; new_remote "$remote"; hd_home=$TMP/home-hand-decline; mkdir -p "$hd_home"; expect_ok run_dots "$hd_home" init "$remote" main
+printf 'mine\n' >"$hd_home/.zshrc"; printf '.zshrc\n' >>"$hd_home/.config/dots/manifest"; printf two >"$hd_home/.config/example/settings"
+remote_edit "$remote" "printf '%s\\n' '.config/example/settings' '.zshrc' > \"\$1/.config/dots/manifest\"; printf 'theirs\\n' > \"\$1/.zshrc\"; printf one > \"\$1/.config/example/settings\"" || exit 1
+run_sync "$hd_home" $'n\n4\n' >/dev/null 2>&1
+hd_workspace=$hd_home/data/conflict-workspace
+if test -d "$hd_workspace/.git" && /usr/bin/git -C "$hd_workspace" checkout --theirs -- .config/example/settings && /usr/bin/git -C "$hd_workspace" add -- .config/example/settings && /usr/bin/git -C "$hd_workspace" commit -qm resolve && (run_dots "$hd_home" sync --continue) >/dev/null 2>&1 && test "$(cat "$hd_home/.zshrc")" = mine && grep -Fx 'skip .zshrc' "$hd_home/data/selection" >/dev/null; then pass "declined hand-added path stays local after sync --continue"; else fail "declined hand-added path stays local after sync --continue"; fi
 # A hand-added path stays used across a conflict and sync --continue.
 remote=$TMP/hand-conflict.git; new_remote "$remote"; hc_home=$TMP/home-hand-conflict; mkdir -p "$hc_home"; expect_ok run_dots "$hc_home" init "$remote" main
 printf 'ext\n' >"$hc_home/.handext.ts"; printf '.handext.ts\n' >>"$hc_home/.config/dots/manifest"; printf two >"$hc_home/.config/example/settings"

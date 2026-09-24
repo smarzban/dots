@@ -1259,6 +1259,8 @@ sync_command() {
       *)
         list_minus "$temp/newly-used" "$temp/differing" "$temp/newly-used.next" && mv -f "$temp/newly-used.next" "$temp/newly-used"
         list_minus "$temp/use" "$temp/differing" "$temp/use.next" && mv -f "$temp/use.next" "$temp/use"
+        # Declined files keep their repository version in a local merge (option 4).
+        cat "$temp/differing" >>"$temp/unselected"
         cat "$temp/differing" >>"$temp/newly-skipped"
         say "left unused on this Mac; bring them in later with: dots select" ;;
     esac
@@ -1289,7 +1291,7 @@ sync_command() {
       "$GIT" -C "$workspace" checkout --quiet "$base" || fail "could not prepare conflict workspace"
       configure_merge_identity "$workspace" || fail "could not configure temporary merge workspace"
       # Choices about new repository files apply when the merge is continued.
-      cp "$temp/newly-used" "$workspace/.git/dots-newly-used" && cp "$temp/newly-skipped" "$workspace/.git/dots-newly-skipped" && cp "$temp/hand-added" "$workspace/.git/dots-hand-added" || fail "could not prepare conflict workspace"
+      cp "$temp/newly-used" "$workspace/.git/dots-newly-used" && cp "$temp/newly-skipped" "$workspace/.git/dots-newly-skipped" && list_minus "$temp/hand-added" "$temp/newly-skipped" "$workspace/.git/dots-hand-added" || fail "could not prepare conflict workspace"
       prepare_local_sandbox "$workspace" "$temp/head-paths" "$temp/live-paths" "$temp/all-paths" "$DOTS_HOME/$MANIFEST" "$temp/unselected" || fail "could not prepare local merge candidate"
       "$GIT" -C "$workspace" commit --quiet -m "dots local changes" || fail "could not prepare local merge candidate"
       "$GIT" -C "$workspace" config dots.remoteRevision "$remote"
