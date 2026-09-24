@@ -74,6 +74,7 @@ case "$1:$2" in
   repo:view) if [ "${DOTS_TEST_GH_PUBLIC:-0}" = 1 ]; then printf '%s\n' false; elif [ "${DOTS_TEST_GH_REPO_EXISTS:-0}" = 1 ]; then printf '%s\n' true; else exit 1; fi ;;
   repo:create) printf '%s\n' "$*" >>"$DOTS_TEST_GH_LOG"; /usr/bin/git init -q --bare "$DOTS_TEST_GH_REMOTE" ;;
   pr:create) printf '%s\n' "$*" >>"$DOTS_TEST_GH_LOG" ;;
+  pr:list) test -z "${DOTS_TEST_GH_OPEN_PR:-}" || printf '%s\n' "$DOTS_TEST_GH_OPEN_PR" ;;
   *) exit 2 ;;
 esac
 EOF
@@ -86,8 +87,14 @@ fi
 case " $* " in
   *' remote get-url origin'*) printf '%s\n' https://github.com/example/dotfiles.git; exit 0 ;;
 esac
+# Only a push to the real GitHub URL reaches the test remote; "origin" inside a
+# temporary clone would be the local data repository, which is the bug this guards.
 if [ "$1" = -C ] && [ "${3:-}" = push ]; then
-  exec /usr/bin/git -C "$2" push "$4" "$DOTS_TEST_GH_REMOTE" "$6"
+  target=$5
+  [ "$target" != origin ] || target=$(/usr/bin/git -C "$2" remote get-url origin 2>/dev/null)
+  if [ "$target" = https://github.com/example/dotfiles.git ]; then
+    exec /usr/bin/git -C "$2" push "$4" "$DOTS_TEST_GH_REMOTE" "$6"
+  fi
 fi
 exec /usr/bin/git "$@"
 EOF
@@ -297,7 +304,16 @@ if run_sync "$two" '' >/dev/null 2>&1 && test "$(cat "$two/.config/example/setti
 remote=$TMP/update.git; update_home=$TMP/home-update; mkdir -p "$update_home"
 run_derived_default_init "$update_home" "$remote" $'y\n' >/dev/null 2>&1 || exit 1
 printf shell >"$update_home/.zshrc"
-if run_update "$update_home" "$remote" $'1\ny\nAdd shell configuration\n' >/dev/null 2>&1 && ! grep -Fx .zshrc "$update_home/.config/dots/manifest" >/dev/null && /usr/bin/git --git-dir="$remote" show-ref | grep -F 'refs/heads/dots/update-' >/dev/null && grep -F 'pr create' "$TMP/gh-update.log" >/dev/null && grep -Fx 'use .zshrc' "$update_home/data/selection" >/dev/null; then pass "update creates candidate PR"; else fail "update creates candidate PR"; fi
+if run_update "$update_home" "$remote" $'1\ny\nAdd shell configuration\n' >/dev/null 2>&1 && ! grep -Fx .zshrc "$update_home/.config/dots/manifest" >/dev/null && /usr/bin/git --git-dir="$remote" show-ref | grep -F 'refs/heads/dots/update-' >/dev/null && grep -F 'pr create' "$TMP/gh-update.log" >/dev/null && grep -Fx 'pending .zshrc' "$update_home/data/selection" >/dev/null; then pass "update creates candidate PR"; else fail "update creates candidate PR"; fi
+# While that PR is open, another update is refused instead of racing it.
+if DOTS_TEST_GH_OPEN_PR=https://github.com/example/dotfiles/pull/1 run_update "$update_home" "$remote" '' 2>&1 | grep -F 'still open' >/dev/null; then pass "update refuses while an update PR is open"; else fail "update refuses while an update PR is open"; fi
+# Pending ticks are pre-ticked next time, for example after a failed PR attempt.
+if run_update "$update_home" "$remote" $'\n' 2>&1 | grep -F '[x] .zshrc' >/dev/null; then pass "update remembers pending ticks"; else fail "update remembers pending ticks"; fi
+# Once the PR is merged, sync treats the file as used here without asking.
+merged_ref=$(/usr/bin/git --git-dir="$remote" for-each-ref --format='%(refname)' 'refs/heads/dots/update-*' | head -1)
+/usr/bin/git --git-dir="$remote" update-ref refs/heads/main "$merged_ref"
+merge_out=$(run_sync "$update_home" '' 2>&1)
+if ! printf '%s' "$merge_out" | grep -F 'New files in the repository' >/dev/null && grep -Fx 'use .zshrc' "$update_home/data/selection" >/dev/null && ! grep -F 'pending' "$update_home/data/selection" >/dev/null && grep -Fx .zshrc "$update_home/.config/dots/manifest" >/dev/null; then pass "merged pending files become used without asking"; else fail "merged pending files become used without asking"; fi
 
 # ── Per-Mac file selection ─────────────────────────────────
 # Checklist rows list home-folder files first, sorted, then other directories.

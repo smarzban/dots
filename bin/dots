@@ -259,8 +259,10 @@ list_minus() {
 list_count() { wc -l <"$1" | tr -d ' '; }
 
 # ── Machine selection ───────────────────────────────────────
-# Format: a comment header, then "use <path>" or "skip <path>" lines. Paths are
-# validated manifest paths, so they contain no whitespace.
+# Format: a comment header, then "use <path>", "skip <path>", or "pending <path>"
+# lines. Pending paths were shared from this Mac by an update PR that is not merged
+# yet; they become used once they appear in the manifest. Paths are validated
+# manifest paths, so they contain no whitespace.
 selection_list() {
   kind=$1
   out=$2
@@ -280,11 +282,21 @@ load_selection() {
   if test -f "$SELECTION"; then
     selection_list use "$temp/use"
     selection_list skip "$temp/skip"
+    selection_list pending "$temp/pending"
   else
     cp "$manifest_union" "$temp/use" || return 1
     : >"$temp/skip"
+    : >"$temp/pending"
   fi
   : >"$temp/newly-used"
+  pending_arrived "$temp" "$manifest_union"
+}
+
+# Pending paths that reached the given manifest are used on this Mac from now on.
+pending_arrived() {
+  list_intersect "$1/pending" "$2" "$1/arrived"
+  cat "$1/arrived" >>"$1/use"
+  list_minus "$1/pending" "$1/arrived" "$1/pending.next" && mv -f "$1/pending.next" "$1/pending"
 }
 
 # Save use/skip entries for paths present in the given manifest list.
@@ -292,6 +304,7 @@ write_selection() {
   use=$1
   skip=$2
   manifest=$3
+  pending=${4:-/dev/null}
   tmp=$(mktemp "$DOTS_DATA/.selection.XXXXXX") || return 1
   {
     printf '%s\n' '# dots selection v1: repository files this Mac uses. Change with: dots select'
@@ -301,6 +314,9 @@ write_selection() {
     while IFS= read -r path; do
       if ! path_in_list "$path" "$use" && path_in_list "$path" "$skip"; then printf 'skip %s\n' "$path"; fi
     done <"$manifest"
+    while IFS= read -r path; do
+      if ! path_in_list "$path" "$manifest" && valid_manifest_path "$path"; then printf 'pending %s\n' "$path"; fi
+    done <"$pending"
   } >"$tmp" || { rm -f "$tmp"; return 1; }
   mv -f "$tmp" "$SELECTION"
 }
@@ -989,7 +1005,7 @@ apply_workspace_result() {
   if test -s "$temp/backup-paths"; then backup_live_files "$temp/backup-paths" sync || return 1; fi
   copy_sandbox_paths_to_home "$workspace" "$temp/apply-paths" || return 1
   advance_to_remote_revision "$branch" "$remote" || return 1
-  write_selection "$temp/use" "$temp/skip" "$temp/result-manifest"
+  write_selection "$temp/use" "$temp/skip" "$temp/result-manifest" "$temp/pending"
 }
 
 sync_continue_command() {
@@ -1026,6 +1042,8 @@ sync_command() {
   base=$(head_revision) || fail "cannot resolve current revision"
   remote=$(fetch_validated_remote "$temp" "$branch") || fail "incoming repository data is unsafe or unavailable"
   git_repo merge-base --is-ancestor "$base" "$remote" || test "$base" = "$remote" || fail "remote history is not a safe fast-forward"
+  # This Mac's own merged update PRs: its pending files are used here, not offered.
+  pending_arrived "$temp" "$temp/remote-manifest"
   # Files another Mac added that this Mac has not been asked about yet. The choice is
   # saved only when the repository configuration is applied.
   list_minus "$temp/remote-manifest" "$temp/use" "$temp/unseen-used"
@@ -1119,11 +1137,24 @@ update_command() {
   branch=$(current_branch)
   base=$(head_revision) || fail "cannot resolve current revision"
   remote=$(fetch_validated_remote "$temp" "$branch") || fail "incoming repository data is unsafe or unavailable"
+  origin=$(git_repo remote get-url origin 2>/dev/null || true)
+  case $origin in
+    https://github.com/*/*.git) repo_name=${origin#https://github.com/}; repo_name=${repo_name%.git} ;;
+    git@github.com:*/*.git) repo_name=${origin#git@github.com:}; repo_name=${repo_name%.git} ;;
+    *) fail "update PRs require a GitHub origin remote" ;;
+  esac
+  safe_github_component "${repo_name%%/*}" && safe_github_component "${repo_name##*/}" || fail "origin is not an accessible GitHub repository"
+  "$GH" repo view "$repo_name" --json nameWithOwner >/dev/null 2>&1 || fail "origin is not an accessible GitHub repository"
+  # One update PR at a time: a second one would conflict on the manifest.
+  open_prs=$("$GH" pr list --repo "$repo_name" --state open --json headRefName,url --jq '.[] | select(.headRefName | startswith("dots/update-")) | .url' 2>/dev/null) || fail "could not check for open update PRs"
+  test -z "$open_prs" || fail "an earlier update PR is still open: $(printf '%s\n' "$open_prs" | head -1). Merge or close it, run dots sync, then try again"
   collect_candidates "$temp/live-manifest" "$temp/candidates" || fail "could not collect candidates"
-  # Ticked rows are shared from this Mac; new candidates start unticked.
+  # Ticked rows are shared from this Mac; new candidates start unticked unless an
+  # earlier update already chose them (pending).
   list_intersect "$temp/live-manifest" "$temp/use" "$temp/shared"
   list_union "$temp/shared" "$temp/candidates" "$temp/choices"
-  cp "$temp/shared" "$temp/chosen" || fail "could not prepare file selection"
+  list_intersect "$temp/candidates" "$temp/pending" "$temp/pending-ticked"
+  list_union "$temp/shared" "$temp/pending-ticked" "$temp/chosen"
   if test -s "$temp/choices"; then
     build_rows "$temp/choices" "$temp/rows"
     checklist "$temp/rows" "$temp/chosen" "Files shared from this Mac. Unticking a shared file removes it from the repository for every Mac." || fail "update cancelled, nothing was changed"
@@ -1135,7 +1166,16 @@ update_command() {
     test ! -s "$temp/removed" || { say "Remove from the repository for every Mac (local files are kept):"; sed 's/^/  /' "$temp/removed"; }
     printf 'Continue? [y/N] ' >&2
     IFS= read -r answer || fail "update cancelled"
-    case $answer in y|Y|yes|YES) ;; *) : >"$temp/added"; : >"$temp/removed"; say "no file changes selected" ;; esac
+    case $answer in
+      y|Y|yes|YES) confirmed=true ;;
+      *) confirmed=false; : >"$temp/added"; : >"$temp/removed"; say "no file changes selected" ;;
+    esac
+  else
+    confirmed=true
+  fi
+  # Remember the ticks right away, so a failed push or PR does not lose them.
+  if test "$confirmed" = true; then
+    write_selection "$temp/use" "$temp/skip" "$temp/manifest-union" "$temp/added" || fail "could not save the file selection"
   fi
   build_proposed_manifest "$DOTS_HOME/$MANIFEST" "$temp/removed" "$temp/added" "$temp/proposed-manifest" || fail "could not build proposed manifest"
   validate_manifest_file "$temp/proposed-manifest" "$temp/proposed-list" || fail "proposed manifest is unsafe"
@@ -1165,21 +1205,12 @@ update_command() {
   tree=$("$GIT" -C "$update_workspace" rev-parse 'HEAD^{tree}') || fail "could not read update tree"
   validate_tree "$update_workspace/.git" "$tree" "$temp/update-manifest" "$temp" || fail "update tree is unsafe"
   scan_directory "$update_workspace" || fail "credential scan failed for update"
-  origin=$(git_repo remote get-url origin 2>/dev/null || true)
-  case $origin in
-    https://github.com/*/*.git) repo_name=${origin#https://github.com/}; repo_name=${repo_name%.git} ;;
-    git@github.com:*/*.git) repo_name=${origin#git@github.com:}; repo_name=${repo_name%.git} ;;
-    *) fail "update PRs require a GitHub origin remote" ;;
-  esac
-  safe_github_component "${repo_name%%/*}" && safe_github_component "${repo_name##*/}" || fail "origin is not an accessible GitHub repository"
-  "$GH" repo view "$repo_name" --json nameWithOwner >/dev/null 2>&1 || fail "origin is not an accessible GitHub repository"
   enable_gh_git_credentials
-  "$GIT" -C "$update_workspace" push --quiet origin "$update_branch" || fail "could not push update branch"
+  # Push to the GitHub remote itself: "origin" in this temporary clone is the local data repository.
+  "$GIT" -C "$update_workspace" push --quiet "$origin" "$update_branch" || fail "could not push update branch"
   "$GH" pr create --repo "$repo_name" --base "$branch" --head "$update_branch" --title "$title" --body "Created by dots update." || fail "branch was pushed but PR creation failed"
-  # Files added here are used here once the PR is merged and synced.
-  list_union "$temp/manifest-union" "$temp/added" "$temp/selection-scope"
-  write_selection "$temp/used-after" "$temp/skip" "$temp/selection-scope" || fail "PR created, but the file selection could not be saved"
   say "update PR created, local files and manifest remain unchanged"
+  say "after merging it on GitHub, run: dots sync"
 }
 
 select_command() {
@@ -1223,7 +1254,7 @@ select_command() {
     while IFS= read -r path; do set -- "$@" "$path"; done <"$temp/newly-used"
     git_repo checkout --quiet "$head" -- "$@" || fail "could not bring in the chosen files${BACKUP_DIR:+ (backup: $BACKUP_DIR)}"
   fi
-  write_selection "$temp/chosen" "$temp/skip" "$temp/head-manifest" || fail "could not save the file selection"
+  write_selection "$temp/chosen" "$temp/skip" "$temp/head-manifest" "$temp/pending" || fail "could not save the file selection"
   say "this Mac uses $(list_count "$temp/chosen") of $(list_count "$temp/head-manifest") repository file(s)"
 }
 
