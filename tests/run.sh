@@ -508,6 +508,17 @@ printf shell >"$decline_home/.zshrc"; printf vim >"$decline_home/.vimrc"
 run_update "$decline_home" "$TMP/update-decline.git" $'1\nn\n' >/dev/null 2>&1
 if ! grep -F ignore "$decline_home/data/selection" >/dev/null; then pass "declined update saves no ignore entries"; else fail "declined update saves no ignore entries"; fi
 
+# A line added to the manifest by hand counts as used here, with or without a saved selection.
+for hand_mode in no-selection with-selection; do
+  hand_remote=$TMP/hand-$hand_mode.git; hand_home=$TMP/home-hand-$hand_mode; mkdir -p "$hand_home"
+  run_derived_default_init "$hand_home" "$hand_remote" $'y\n' >/dev/null 2>&1 || exit 1
+  printf 'ext\n' >"$hand_home/.handext.ts"; printf '.handext.ts\n' >>"$hand_home/.config/dots/manifest"
+  test "$hand_mode" = with-selection || rm -f "$hand_home/data/selection"
+  run_update "$hand_home" "$hand_remote" $'\ny\nHand added\n' >/dev/null 2>&1
+  hand_ref=$(/usr/bin/git --git-dir="$hand_remote" for-each-ref --format='%(refname)' 'refs/heads/dots/update-*' | head -1)
+  if test -n "$hand_ref" && test "$(/usr/bin/git --git-dir="$hand_remote" show "$hand_ref:.handext.ts")" = ext && grep -Fx 'use .handext.ts' "$hand_home/data/selection" >/dev/null; then pass "hand-added manifest line is shared ($hand_mode)"; else fail "hand-added manifest line is shared ($hand_mode)"; fi
+done
+
 # Confirmed ticks are saved before publishing, so a failed PR creation keeps them.
 remote=$TMP/update-fail.git; fail_home=$TMP/home-update-fail; mkdir -p "$fail_home"
 run_derived_default_init "$fail_home" "$remote" $'y\n' >/dev/null 2>&1 || exit 1

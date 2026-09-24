@@ -360,6 +360,11 @@ validate_current_state() {
   while IFS= read -r path; do is_reserved_path "$path" && return 1; done <"$temp/live-manifest"
   list_union "$temp/head-manifest" "$temp/live-manifest" "$temp/manifest-union"
   load_selection "$temp" "$temp/manifest-union" || return 1
+  # Lines added to the live manifest by hand on this Mac are used here. The live
+  # manifest only differs from HEAD through local edits, since sync rewrites both.
+  list_minus "$temp/live-manifest" "$temp/head-manifest" "$temp/hand-added-all"
+  list_minus "$temp/hand-added-all" "$temp/skip" "$temp/hand-added"
+  cat "$temp/hand-added" >>"$temp/use"
   # Only files this Mac uses are live-checked, scanned, reported, or written.
   list_intersect "$temp/manifest-union" "$temp/use" "$temp/selected-manifest"
   list_minus "$temp/manifest-union" "$temp/use" "$temp/unselected"
