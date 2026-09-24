@@ -5,6 +5,7 @@ Keep a hand-picked list of dotfiles in sync across your Macs through a private G
 `dots` is a single-file Bash CLI for macOS. You choose exactly which files in your home directory are tracked, changes reach the repository as pull requests, and every other Mac pulls them with one command.
 
 - **Explicit allowlist.** Only the files listed in `~/.config/dots/manifest`, plus the manifest itself, are ever tracked. No directories, globs, or symlinks.
+- **Each Mac picks its own files.** Choose which shared files to bring to each Mac, and change your mind later with `dots select`.
 - **Your real home is the working tree.** Files stay where your tools expect them. No symlink farm, no copies.
 - **Changes go through pull requests.** `dots update` opens a PR, so you review every change before it lands.
 - **Secret scanning built in.** Incoming and outgoing content is scanned with [gitleaks](https://github.com/gitleaks/gitleaks) before anything is written or pushed.
@@ -58,7 +59,7 @@ curl -fsSL https://github.com/smarzban/dots/releases/latest/download/install.sh 
    git --git-dir="$HOME/.local/share/dots/repo.git" config user.email "you@example.com"
    ```
 
-4. Pick the files to track. `dots update` lists candidates by name, you choose them (for example `1,3-5`), confirm, and give the PR a title:
+4. Pick the files to share. `dots update` opens a checklist of candidate files grouped by folder. Tick the ones you want, confirm, and give the PR a title:
 
    ```sh
    dots update
@@ -78,7 +79,9 @@ Install `dots` and its requirements, then connect to the same repository:
 dots init
 ```
 
-If some tracked files already exist on this Mac, identical ones are adopted as they are. To replace differing ones with the repository version, keeping a backup in `~/.local/share/dots/backups/`, run:
+`init` shows a checklist of the files in the repository, all ticked. Untick any you don't want on this Mac. The choice is remembered for every later sync, and you can change it any time with `dots select`.
+
+If some chosen files already exist on this Mac, identical ones are adopted as they are. To replace differing ones with the repository version, keeping a backup in `~/.local/share/dots/backups/`, run:
 
 ```sh
 dots init --backup-existing
@@ -89,8 +92,12 @@ dots init --backup-existing
 | You want to | Run |
 |---|---|
 | See what changed locally and whether the repository is ahead | `dots status` |
-| Share a local change, or start tracking a new file | `dots update`, then merge the PR |
+| Share a local change, or start sharing a new file | `dots update`, then merge the PR |
+| Stop sharing a file on every Mac | `dots update`, untick it, then merge the PR |
+| Choose which shared files this Mac uses | `dots select` |
 | Get the latest configuration on this Mac | `dots sync` |
+
+When another Mac starts sharing a new file, the next `dots sync` asks whether to use it here. Your answer is remembered.
 
 When `dots sync` finds local changes, it asks what to do:
 
@@ -109,6 +116,7 @@ dots sync --continue
 
 ```text
 dots init [--discover] [--backup-existing] [remote] [branch]
+dots select
 dots status
 dots sync [--continue]
 dots update
@@ -116,12 +124,15 @@ dots update
 
 | Command | What it does |
 |---|---|
-| `init` | Connects this Mac to your repository. With no arguments it uses `<your-account>/dotfiles`, creating it privately if needed. Pass a remote (and branch) to use a different repository, which must already contain a manifest. |
+| `init` | Connects this Mac to your repository and asks which files to bring here. With no arguments it uses `<your-account>/dotfiles`, creating it privately if needed. Pass a remote (and branch) to use a different repository, which must already contain a manifest. |
 | `init --discover` | Lists candidate configuration files by name, without changing anything. |
 | `init --backup-existing` | Backs up differing local files, then uses the repository version. |
-| `status` | Shows the branch, how far this Mac is ahead or behind, and which tracked files changed locally. |
-| `sync` | Fetches, checks, and applies the repository configuration. It only pushes if you choose to create a PR from local changes. |
-| `update` | Opens a pull request with local changes and any newly selected files. Never changes local files. |
+| `select` | Changes which repository files this Mac uses. Newly chosen files are brought in; a differing local copy is backed up first, after you confirm. Unchosen files stay on disk but stop syncing. |
+| `status` | Shows the branch, how far this Mac is ahead or behind, how many repository files this Mac uses, and which of them changed locally. |
+| `sync` | Fetches, checks, and applies the repository configuration to the files this Mac uses. It only pushes if you choose to create a PR from local changes. |
+| `update` | Opens a pull request with local changes, newly ticked files, and unticked files to remove from the repository. Never changes local files. |
+
+In checklists, use Up/Down to move, Left/Right to change folder page, Space to toggle, `a` or `n` to tick all or none on the page, Enter to confirm, and `q` to cancel. Without a full terminal, or with `DOTS_PLAIN_PROMPTS=1`, `dots` shows a numbered list instead: type numbers such as `1,3-5` to toggle them.
 
 ## How it works
 
@@ -136,6 +147,7 @@ dots update
   ```
 
 - Paths must be plain files inside your home directory: no absolute paths, `..`, globs, whitespace, or symlinks.
+- Which of those files this Mac uses is saved in `~/.local/share/dots/selection`. It stays on this Mac and is never synced.
 - Before anything is written or pushed, `dots` validates the repository contents against the manifest and scans them with gitleaks. Any problem stops the command without printing file contents.
 
 ## Development

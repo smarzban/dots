@@ -21,12 +21,15 @@ DEFAULT_REMOTE=${DOTS_DEFAULT_REMOTE:-}
 DEFAULT_GITHUB_REPO=${DOTS_DEFAULT_GITHUB_REPO:-}
 DEFAULT_GITHUB_REPO_NAME=${DOTS_DEFAULT_GITHUB_REPO_NAME:-dotfiles}
 MANIFEST=.config/dots/manifest
+# Machine-local choice of which repository files this Mac uses. Never synced.
+SELECTION=$DOTS_DATA/selection
 
 say() { printf '%s\n' "$*"; }
 fail() { printf 'dots: %s\n' "$*" >&2; exit 1; }
 usage() { cat <<'EOF'
 Usage:
   dots init [--discover] [--backup-existing] [remote] [branch]
+  dots select
   dots status
   dots sync [--continue]
   dots update
@@ -239,13 +242,81 @@ live_manifest_list() {
 
 head_revision() { git_repo rev-parse HEAD 2>/dev/null; }
 
+# ── Path lists ──────────────────────────────────────────────
+# Lists are newline-delimited files of validated manifest paths.
+list_union() { cat "$1" "$2" | LC_ALL=C sort -u >"$3"; }
+list_intersect() {
+  : >"$3"
+  while IFS= read -r path; do path_in_list "$path" "$2" && printf '%s\n' "$path" >>"$3"; done <"$1"
+  return 0
+}
+list_minus() {
+  : >"$3"
+  while IFS= read -r path; do path_in_list "$path" "$2" || printf '%s\n' "$path" >>"$3"; done <"$1"
+  return 0
+}
+list_count() { wc -l <"$1" | tr -d ' '; }
+
+# ── Machine selection ───────────────────────────────────────
+# Format: a comment header, then "use <path>" or "skip <path>" lines. Paths are
+# validated manifest paths, so they contain no whitespace.
+selection_list() {
+  kind=$1
+  out=$2
+  : >"$out"
+  test -f "$SELECTION" && test ! -L "$SELECTION" || return 0
+  awk -v kind="$kind" '$1 == kind && NF == 2 { print $2 }' "$SELECTION" | while IFS= read -r path; do
+    valid_manifest_path "$path" && printf '%s\n' "$path"
+  done >"$out"
+  return 0
+}
+
+# Load use/skip lists into temp. Before a selection exists (initial setup or an
+# upgrade from a version without one), every repository file counts as used.
+load_selection() {
+  temp=$1
+  manifest_union=$2
+  if test -f "$SELECTION"; then
+    selection_list use "$temp/use"
+    selection_list skip "$temp/skip"
+  else
+    cp "$manifest_union" "$temp/use" || return 1
+    : >"$temp/skip"
+  fi
+  : >"$temp/newly-used"
+}
+
+# Save use/skip entries for paths present in the given manifest list.
+write_selection() {
+  use=$1
+  skip=$2
+  manifest=$3
+  tmp=$SELECTION.tmp.$$
+  {
+    printf '%s\n' '# dots selection v1: repository files this Mac uses. Change with: dots select'
+    while IFS= read -r path; do
+      path_in_list "$path" "$use" && printf 'use %s\n' "$path"
+    done <"$manifest"
+    while IFS= read -r path; do
+      path_in_list "$path" "$use" || { path_in_list "$path" "$skip" && printf 'skip %s\n' "$path"; }
+    done <"$manifest"
+  } >"$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$SELECTION"
+}
+
 validate_current_state() {
   temp=$1
   head=$(head_revision) || return 1
   validate_tree "$REPO" "$head" "$temp/head-manifest" "$temp" || return 1
-  validate_live_paths "$temp/head-manifest" || return 1
   live_manifest_list "$temp/live-manifest" || return 1
-  validate_live_paths "$temp/live-manifest" || return 1
+  while IFS= read -r path; do is_reserved_path "$path" && return 1; done <"$temp/live-manifest"
+  list_union "$temp/head-manifest" "$temp/live-manifest" "$temp/manifest-union"
+  load_selection "$temp" "$temp/manifest-union" || return 1
+  # Only files this Mac uses are live-checked, scanned, reported, or written.
+  list_intersect "$temp/manifest-union" "$temp/use" "$temp/selected-manifest"
+  list_minus "$temp/manifest-union" "$temp/use" "$temp/unselected"
+  validate_live_paths "$temp/selected-manifest" || return 1
+  list_with_manifest "$temp/selected-manifest" "$temp/selected-paths"
   list_with_manifest "$temp/live-manifest" "$temp/live-paths"
   list_with_manifest "$temp/head-manifest" "$temp/head-paths"
   : >"$temp/all-paths"
@@ -423,42 +494,198 @@ print_candidates() {
   awk '{ printf "%3d  %s\n", NR, $0 }' "$candidates"
 }
 
-select_candidates() {
-  candidates=$1
-  temp=$2
-  selected=$temp/selected
-  : >"$selected"
-  count=$(wc -l <"$candidates" | tr -d ' ')
-  print_candidates "$candidates"
-  test "$count" -gt 0 || return 0
-  printf 'Select files for the update PR (for example 1,3-5, Enter for none): ' >&2
-  IFS= read -r selection || fail "candidate selection cancelled"
-  test -n "$selection" || { say "no files selected"; return 0; }
-  case $selection in ,*|*,|*,,*|*[!0-9,-]*) fail "selection must contain only numbers, commas, and ranges" ;; esac
+# ── Checklist ───────────────────────────────────────────────
+# Rows are "group|path" lines. The chosen file holds the initial ticks and is
+# rewritten with the final ticks. Returns 1 when the user cancels.
+build_rows() {
+  # Home-folder files first, then one group per top-level directory.
+  awk '{ i = index($0, "/"); if (i) print "1|" substr($0, 1, i - 1) "|" $0; else print "0|home|" $0 }' "$1" |
+    LC_ALL=C sort -t '|' -k1,1 -k2,2 -k3,3 | cut -d '|' -f 2- >"$2"
+}
+
+list_toggle() {
+  if path_in_list "$1" "$2"; then
+    awk -v path="$1" '$0 != path' "$2" >"$2.next" && mv -f "$2.next" "$2"
+  else
+    printf '%s\n' "$1" >>"$2"
+  fi
+}
+
+# Expand "1,3-5" into one number per line; fails on malformed or out-of-range input.
+expand_numbers() {
+  numbers=$1
+  count=$2
+  out=$3
+  : >"$out"
+  case $numbers in ,*|*,|*,,*|*[!0-9,-]*) return 1 ;; esac
   oldifs=$IFS
   IFS=,
-  set -- $selection
+  set -- $numbers
   IFS=$oldifs
   for item in "$@"; do
     case $item in
-      *-*) start=${item%-*}; finish=${item#*-}; test -n "$start" && test -n "$finish" && test "$start" -le "$finish" || fail "invalid selection range" ;;
+      *-*) start=${item%-*}; finish=${item#*-} ;;
       *) start=$item; finish=$item ;;
     esac
-    test "$start" -ge 1 2>/dev/null && test "$finish" -le "$count" 2>/dev/null || fail "selection is out of range"
+    test -n "$start" && test -n "$finish" && test "$start" -ge 1 2>/dev/null && test "$finish" -le "$count" 2>/dev/null && test "$start" -le "$finish" || return 1
     number=$start
     while test "$number" -le "$finish"; do
-      path=$(sed -n "${number}p" "$candidates") || fail "could not read selected candidate"
-      path_in_list "$path" "$selected" && fail "selection contains a duplicate"
-      printf '%s\n' "$path" >>"$selected"
+      path_in_list "$number" "$out" && return 1
+      printf '%s\n' "$number" >>"$out"
       number=$((number + 1))
     done
   done
-  test -s "$selected" || { say "no files selected"; return 0; }
-  say "Will include in the update PR:"
-  cat "$selected"
-  printf 'Include these paths? [y/N] ' >&2
-  IFS= read -r answer || fail "candidate selection cancelled"
-  case $answer in y|Y|yes|YES) ;; *) : >"$selected"; say "no candidates selected" ;; esac
+  return 0
+}
+
+checklist() {
+  if test -t 0 && test -t 1 && test "${TERM:-dumb}" != dumb && test "${DOTS_PLAIN_PROMPTS:-0}" != 1; then
+    checklist_tui "$@"
+  else
+    checklist_plain "$@"
+  fi
+}
+
+checklist_plain() {
+  cl_rows=$1
+  cl_chosen=$2
+  say "$3"
+  number=0
+  while IFS='|' read -r _group path; do
+    number=$((number + 1))
+    if path_in_list "$path" "$cl_chosen"; then mark='[x]'; else mark='[ ]'; fi
+    printf '%3d  %s %s\n' "$number" "$mark" "$path"
+  done <"$cl_rows"
+  printf 'Toggle numbers (for example 1,3-5), Enter to keep as shown: ' >&2
+  IFS= read -r numbers || return 1
+  test -n "$numbers" || return 0
+  expand_numbers "$numbers" "$number" "$cl_chosen.numbers" || fail "selection must be numbers, commas, and ranges within the list"
+  while IFS= read -r number; do
+    path=$(sed -n "${number}p" "$cl_rows" | cut -d '|' -f 2-)
+    list_toggle "$path" "$cl_chosen"
+  done <"$cl_chosen.numbers"
+  rm -f "$cl_chosen.numbers"
+}
+
+CL_ACTIVE=0
+BACKUP_DIR=
+checklist_stop() {
+  test "$CL_ACTIVE" -eq 1 || return 0
+  stty "$CL_STTY" <&3 >/dev/null 2>&1 || :
+  printf '\033[?25h\033[?1049l' >&3 2>/dev/null || :
+  exec 3>&-
+  CL_ACTIVE=0
+}
+
+checklist_page_rows() { awk -F '|' -v group="$CL_GROUP" '$1 == group { n++ } END { print n + 0 }' "$CL_ROWS"; }
+
+checklist_current_path() {
+  awk -F '|' -v group="$CL_GROUP" -v wanted="$CL_CURSOR" '$1 == group { n++; if (n == wanted) { print $2; exit } }' "$CL_ROWS"
+}
+
+checklist_draw() {
+  size=$(stty size <&3 2>/dev/null || printf '24 80')
+  lines=${size%% *}
+  columns=${size#* }
+  case $lines in ''|*[!0-9]*) lines=24 ;; esac
+  case $columns in ''|*[!0-9]*) columns=80 ;; esac
+  width=$((columns - 1))
+  printf '\033[H\033[2J' >&3
+  CL_TOO_SMALL=0
+  if test "$lines" -lt 8 || test "$columns" -lt 30; then
+    CL_TOO_SMALL=1
+    printf '%s' 'Terminal too small. Enlarge it, or press q to cancel.' >&3
+    return
+  fi
+  height=$((lines - 6))
+  test "$CL_CURSOR" -ge "$CL_TOP" || CL_TOP=$CL_CURSOR
+  test "$CL_CURSOR" -lt $((CL_TOP + height)) || CL_TOP=$((CL_CURSOR - height + 1))
+  printf '%.*s\n' "$width" "$CL_TITLE" >&3
+  printf '%.*s\n' "$width" "Page $CL_PAGE of $CL_PAGES: $CL_GROUP" >&3
+  printf '%.*s\n\n' "$width" 'Up/Down move  Left/Right page  Space toggle  a all  n none  Enter confirm  q cancel' >&3
+  row=0
+  shown=0
+  while IFS='|' read -r group path; do
+    test "$group" = "$CL_GROUP" || continue
+    row=$((row + 1))
+    test "$row" -ge "$CL_TOP" || continue
+    test "$shown" -lt "$height" || break
+    if path_in_list "$path" "$CL_CHOSEN"; then mark='[x]'; else mark='[ ]'; fi
+    if test "$row" -eq "$CL_CURSOR"; then prefix='> '; else prefix='  '; fi
+    printf '%.*s\n' "$width" "$prefix$mark $path" >&3
+    shown=$((shown + 1))
+  done <"$CL_ROWS"
+  printf '\n%.*s' "$width" "$(list_count "$CL_CHOSEN") of $(list_count "$CL_ROWS") selected" >&3
+}
+
+checklist_set_page() {
+  CL_GROUP=$(sed -n "${CL_PAGE}p" "$CL_GROUPS")
+  CL_PAGE_ROWS=$(checklist_page_rows)
+  CL_CURSOR=1
+  CL_TOP=1
+}
+
+checklist_tui() {
+  CL_ROWS=$1
+  CL_CHOSEN=$2
+  CL_TITLE=$3
+  CL_GROUPS=$CL_CHOSEN.groups
+  awk -F '|' '!seen[$1]++ { print $1 }' "$CL_ROWS" >"$CL_GROUPS" || return 1
+  CL_PAGES=$(list_count "$CL_GROUPS")
+  test "$CL_PAGES" -gt 0 || return 0
+  CL_PAGE=1
+  checklist_set_page
+  exec 3<>/dev/tty || return 1
+  CL_STTY=$(stty -g <&3)
+  CL_ACTIVE=1
+  # Restore the terminal however the command ends.
+  trap 'checklist_stop; rm -rf "$temp"' EXIT
+  trap 'checklist_stop; rm -rf "$temp"; exit 130' HUP INT TERM
+  stty -echo -icanon min 1 time 0 <&3
+  printf '\033[?1049h\033[?25l' >&3
+  cl_status=0
+  cl_escape=0
+  while :; do
+    checklist_draw
+    IFS= read -r -s -n 1 key <&3 || { cl_status=1; break; }
+    if test "$cl_escape" -eq 1; then
+      cl_escape=0
+      case $key in '['|O) cl_escape=2; continue ;; esac
+    elif test "$cl_escape" -eq 2; then
+      cl_escape=0
+      case $key in A) key=k ;; B) key=j ;; C) key=l ;; D) key=h ;; *) continue ;; esac
+    fi
+    # Only cancelling works until the terminal is large enough to show the list.
+    if test "$CL_TOO_SMALL" -eq 1; then test "$key" = q && { cl_status=1; break; }; continue; fi
+    case $key in
+      $'\033') cl_escape=1 ;;
+      k) test "$CL_CURSOR" -le 1 || CL_CURSOR=$((CL_CURSOR - 1)) ;;
+      j) test "$CL_CURSOR" -ge "$CL_PAGE_ROWS" || CL_CURSOR=$((CL_CURSOR + 1)) ;;
+      h) test "$CL_PAGE" -le 1 || { CL_PAGE=$((CL_PAGE - 1)); checklist_set_page; } ;;
+      l) test "$CL_PAGE" -ge "$CL_PAGES" || { CL_PAGE=$((CL_PAGE + 1)); checklist_set_page; } ;;
+      ' ') path=$(checklist_current_path); test -z "$path" || list_toggle "$path" "$CL_CHOSEN" ;;
+      a) awk -F '|' -v group="$CL_GROUP" '$1 == group { print $2 }' "$CL_ROWS" | while IFS= read -r path; do path_in_list "$path" "$CL_CHOSEN" || printf '%s\n' "$path" >>"$CL_CHOSEN"; done ;;
+      n) awk -F '|' -v group="$CL_GROUP" '$1 == group { print $2 }' "$CL_ROWS" >"$CL_CHOSEN.page"; list_minus "$CL_CHOSEN" "$CL_CHOSEN.page" "$CL_CHOSEN.next"; mv -f "$CL_CHOSEN.next" "$CL_CHOSEN" ;;
+      ''|$'\r'|$'\n') break ;;
+      q) cl_status=1; break ;;
+    esac
+  done
+  checklist_stop
+  trap 'rm -rf "$temp"' EXIT HUP INT TERM
+  rm -f "$CL_GROUPS" "$CL_CHOSEN.page"
+  return "$cl_status"
+}
+
+# Copy live files into a new private backup directory, printing where they went.
+backup_live_files() {
+  paths=$1
+  label=$2
+  mkdir -p "$DOTS_DATA/backups" || return 1
+  BACKUP_DIR=$(mktemp -d "$DOTS_DATA/backups/$label-$(date +%Y%m%d%H%M%S).XXXXXX") || return 1
+  while IFS= read -r path; do
+    mkdir -p "$BACKUP_DIR/$(dirname "$path")" && cp -p "$DOTS_HOME/$path" "$BACKUP_DIR/$path" || return 1
+  done <"$paths"
+  say "backed up $(list_count "$paths") existing file(s) to $BACKUP_DIR"
 }
 
 preview_candidates() {
@@ -469,15 +696,20 @@ preview_candidates() {
   say "Preview only, no files, manifest, repository, or network state changed."
 }
 
-build_manifest_with_selection() {
+# Keep the current manifest's comments and order, drop removed paths, append added ones.
+build_proposed_manifest() {
   current=$1
-  selected=$2
-  out=$3
-  approved=$4
-  cat "$current" >"$out" || return 1
+  removed=$2
+  added=$3
+  out=$4
+  : >"$out" || return 1
+  while IFS= read -r line || test -n "$line"; do
+    case $line in ''|'#'*) printf '%s\n' "$line" >>"$out"; continue ;; esac
+    path_in_list "$line" "$removed" || printf '%s\n' "$line" >>"$out"
+  done <"$current"
   while IFS= read -r path; do
-    path_in_list "$path" "$approved" || printf '%s\n' "$path" >>"$out"
-  done <"$selected"
+    path_in_list "$path" "$out" || printf '%s\n' "$path" >>"$out"
+  done <"$added"
   validate_manifest_file "$out" "$out.validated"
 }
 
@@ -500,20 +732,29 @@ prepare_local_sandbox() {
   live_paths=$3
   all_paths=$4
   proposed_manifest=$5
+  # Repository files this Mac does not use keep their repository version.
+  unused=${6:-/dev/null}
+  # Removals are staged by git rm; only copied files need adding afterwards.
+  : >"$sandbox.copied"
   while IFS= read -r path; do
     if test "$path" = "$MANIFEST"; then
       mkdir -p "$sandbox/$(dirname "$path")" || return 1
       cp -p "$proposed_manifest" "$sandbox/$path" || return 1
+      printf '%s\n' "$path" >>"$sandbox.copied"
+    elif path_in_list "$path" "$unused"; then
+      continue
     elif path_in_list "$path" "$live_paths"; then
       test -f "$DOTS_HOME/$path" && test ! -L "$DOTS_HOME/$path" || return 1
       mkdir -p "$sandbox/$(dirname "$path")" || return 1
       cp -p "$DOTS_HOME/$path" "$sandbox/$path" || return 1
+      printf '%s\n' "$path" >>"$sandbox.copied"
     else
-      "$GIT" -C "$sandbox" rm -f --ignore-unmatch -- "$path" >/dev/null || return 1
+      "$GIT" -C "$sandbox" rm -f --quiet --ignore-unmatch -- "$path" >/dev/null || return 1
     fi
   done <"$all_paths"
   set --
-  while IFS= read -r path; do set -- "$@" "$path"; done <"$all_paths"
+  while IFS= read -r path; do set -- "$@" "$path"; done <"$sandbox.copied"
+  rm -f "$sandbox.copied"
   "$GIT" -C "$sandbox" add -A -- "$@"
 }
 
@@ -536,28 +777,28 @@ advance_to_remote_revision() {
   git_repo read-tree "$remote"
 }
 
-check_new_tree_collisions() {
+# Decide how incoming files reach HOME. Files already managed here were covered by
+# the local-change check. A new or newly chosen file may replace a live file only
+# when identical, or, when the user just chose it, after a backup.
+plan_apply() {
   gitdir=$1
   base=$2
-  candidate=$3
-  temp=$4
-  # Both trees were validated, so their names contain no controls and can safely
-  # use line-oriented system tools (BSD grep has no -z option).
+  temp=$3
   git_dir "$gitdir" ls-tree -r --name-only "$base" >"$temp/base-names" || return 1
-  git_dir "$gitdir" ls-tree -r --name-only "$candidate" >"$temp/candidate-names" || return 1
+  : >"$temp/backup-paths"
   while IFS= read -r path; do
-    grep -F -x -- "$path" "$temp/base-names" >/dev/null 2>&1 && continue
     test "$path" = "$MANIFEST" && continue
     safe_live_path "$path" || return 1
+    if path_in_list "$path" "$temp/base-names" && ! path_in_list "$path" "$temp/newly-used"; then continue; fi
     test -e "$DOTS_HOME/$path" || test -L "$DOTS_HOME/$path" || continue
-    # A live file identical to the incoming one is already in place, for example on
-    # the machine whose update PR added it. Compare against the workspace copy, which
-    # is exactly what will be written. Anything else is still a collision.
     test -f "$DOTS_HOME/$path" && test ! -L "$DOTS_HOME/$path" || return 1
+    # Compare against the workspace copy, which is exactly what will be written.
     incoming=${gitdir%/.git}/$path
     test -f "$incoming" && test ! -L "$incoming" || return 1
-    cmp -s "$incoming" "$DOTS_HOME/$path" || return 1
-  done <"$temp/candidate-names"
+    cmp -s "$incoming" "$DOTS_HOME/$path" && continue
+    path_in_list "$path" "$temp/newly-used" || return 1
+    printf '%s\n' "$path" >>"$temp/backup-paths"
+  done <"$temp/apply-paths"
   return 0
 }
 
@@ -631,9 +872,16 @@ init_command() {
   revision=$(git_dir "$candidate_repo" rev-parse "refs/heads/$branch" 2>/dev/null) || fail "requested branch has no revision"
   validate_tree "$candidate_repo" "$revision" "$temp/manifest-paths" "$temp" || fail "candidate manifest or repository tree is unsafe"
   scan_git_revision "$candidate_repo" "$revision" || fail "credential scan failed for candidate revision"
-  # Every target, including the manifest, must be absent or already identical, unless
-  # --backup-existing moves a differing regular file into a private backup first.
-  list_with_manifest "$temp/manifest-paths" "$temp/candidate-paths"
+  # Choose which repository files this Mac uses. Without a terminal, all are used.
+  cp "$temp/manifest-paths" "$temp/use" || fail "could not prepare file selection"
+  if test -s "$temp/manifest-paths" && test -t 0 && test -t 1; then
+    build_rows "$temp/manifest-paths" "$temp/rows"
+    checklist "$temp/rows" "$temp/use" "Choose which files to bring to this Mac" || { say "init cancelled, nothing was changed"; exit 0; }
+  fi
+  list_minus "$temp/manifest-paths" "$temp/use" "$temp/skip"
+  # Every chosen target, including the manifest, must be absent or already identical,
+  # unless --backup-existing moves a differing regular file into a private backup first.
+  list_with_manifest "$temp/use" "$temp/candidate-paths"
   : >"$temp/backup-paths"
   while IFS= read -r path; do
     safe_live_path "$path" || fail "candidate path has an unsafe live parent"
@@ -669,7 +917,12 @@ init_command() {
   set --
   while IFS= read -r path; do set -- "$@" "$path"; done <"$temp/candidate-paths"
   git_repo checkout --quiet "$revision" -- "$@" || init_abort "checkout failed after preflight; inspect live files before retrying"
+  # The index records every repository file; only chosen ones exist in HOME.
+  git_repo read-tree "$revision" || init_abort "could not record the repository index"
+  write_selection "$temp/use" "$temp/skip" "$temp/manifest-paths" || init_abort "could not save the file selection"
   git_repo config dots.initialized true || init_abort "could not finalize initialization"
+  skipped=$(list_count "$temp/skip")
+  test "$skipped" -eq 0 || say "not using $skipped repository file(s) on this Mac; change with: dots select"
   say "initialized $branch at $revision"
 }
 
@@ -689,7 +942,8 @@ status_command() {
   say "branch: $branch"
   say "revision: $head"
   say "divergence: ahead $1, behind $2"
-  if show_changes "$temp/all-paths" "$temp/changes"; then
+  say "files used on this Mac: $(list_count "$temp/selected-manifest") of $(list_count "$temp/manifest-union")"
+  if show_changes "$temp/selected-paths" "$temp/changes"; then
     say "tracked configuration changes:"
     cat "$temp/changes"
   else
@@ -717,11 +971,16 @@ apply_workspace_result() {
   branch=$5
   temp=$6
   validate_tree "$workspace/.git" "$tree" "$temp/result-manifest" "$temp" || return 1
-  list_with_manifest "$temp/result-manifest" "$temp/result-paths"
   scan_directory "$workspace" || return 1
-  check_new_tree_collisions "$workspace/.git" "$base" "$tree" "$temp" || return 1
-  copy_sandbox_paths_to_home "$workspace" "$temp/result-paths" || return 1
-  advance_to_remote_revision "$branch" "$remote"
+  test -f "$temp/use" || load_selection "$temp" "$temp/result-manifest" || return 1
+  # Only files this Mac uses are written to HOME.
+  list_intersect "$temp/result-manifest" "$temp/use" "$temp/apply-manifest"
+  list_with_manifest "$temp/apply-manifest" "$temp/apply-paths"
+  plan_apply "$workspace/.git" "$base" "$temp" || return 1
+  if test -s "$temp/backup-paths"; then backup_live_files "$temp/backup-paths" sync || return 1; fi
+  copy_sandbox_paths_to_home "$workspace" "$temp/apply-paths" || return 1
+  advance_to_remote_revision "$branch" "$remote" || return 1
+  write_selection "$temp/use" "$temp/skip" "$temp/result-manifest"
 }
 
 sync_continue_command() {
@@ -753,13 +1012,25 @@ sync_command() {
   validate_current_state "$temp" || fail "repository tree or live manifest is unsafe"
   git_repo diff --cached --quiet || fail "repository index has staged changes; resolve or unstage them before sync"
   git_repo diff --name-only --diff-filter=U | grep . >/dev/null 2>&1 && fail "repository index has conflicts; resolve them before sync"
-  scan_live_candidates "$temp/live-paths" "$temp" || fail "credential scan failed for local candidates"
+  scan_live_candidates "$temp/selected-paths" "$temp" || fail "credential scan failed for local candidates"
   branch=$(current_branch)
   base=$(head_revision) || fail "cannot resolve current revision"
   remote=$(fetch_validated_remote "$temp" "$branch") || fail "incoming repository data is unsafe or unavailable"
   git_repo merge-base --is-ancestor "$base" "$remote" || test "$base" = "$remote" || fail "remote history is not a safe fast-forward"
+  # Files another Mac added that this Mac has not been asked about yet. The choice is
+  # saved only when the repository configuration is applied.
+  list_minus "$temp/remote-manifest" "$temp/use" "$temp/unseen-used"
+  list_minus "$temp/unseen-used" "$temp/skip" "$temp/unseen"
+  if test -s "$temp/unseen"; then
+    build_rows "$temp/unseen" "$temp/unseen-rows"
+    cp "$temp/unseen" "$temp/newly-used"
+    checklist "$temp/unseen-rows" "$temp/newly-used" "New files in the repository: choose which to use on this Mac" || fail "sync cancelled, nothing was changed"
+    list_minus "$temp/unseen" "$temp/newly-used" "$temp/newly-skipped"
+    cat "$temp/newly-used" >>"$temp/use"
+    cat "$temp/newly-skipped" >>"$temp/skip"
+  fi
   has_local=false
-  if show_changes "$temp/all-paths" "$temp/changes"; then has_local=true; show_change_summary "$temp/all-paths" "$temp/changes"; else result=$?; test "$result" -eq 1 || fail "could not inspect approved configuration changes"; fi
+  if show_changes "$temp/selected-paths" "$temp/changes"; then has_local=true; show_change_summary "$temp/selected-paths" "$temp/changes"; else result=$?; test "$result" -eq 1 || fail "could not inspect approved configuration changes"; fi
   remote_workspace=$temp/remote-workspace
   "$GIT" clone --quiet --no-checkout -- "$REPO" "$remote_workspace" || fail "could not prepare remote workspace"
   "$GIT" -C "$remote_workspace" checkout --quiet "$remote" || fail "could not prepare remote revision"
@@ -786,7 +1057,7 @@ sync_command() {
       "$GIT" clone --quiet --no-checkout -- "$REPO" "$workspace" || fail "could not create conflict workspace"
       "$GIT" -C "$workspace" checkout --quiet "$base" || fail "could not prepare conflict workspace"
       configure_merge_identity "$workspace" || fail "could not configure temporary merge workspace"
-      prepare_local_sandbox "$workspace" "$temp/head-paths" "$temp/live-paths" "$temp/all-paths" "$DOTS_HOME/$MANIFEST" || fail "could not prepare local merge candidate"
+      prepare_local_sandbox "$workspace" "$temp/head-paths" "$temp/live-paths" "$temp/all-paths" "$DOTS_HOME/$MANIFEST" "$temp/unselected" || fail "could not prepare local merge candidate"
       "$GIT" -C "$workspace" commit --quiet -m "dots local changes" || fail "could not prepare local merge candidate"
       "$GIT" -C "$workspace" config dots.remoteRevision "$remote"
       "$GIT" -C "$workspace" config dots.baseRevision "$base"
@@ -817,20 +1088,41 @@ update_command() {
   base=$(head_revision) || fail "cannot resolve current revision"
   remote=$(fetch_validated_remote "$temp" "$branch") || fail "incoming repository data is unsafe or unavailable"
   collect_candidates "$temp/live-manifest" "$temp/candidates" || fail "could not collect candidates"
-  select_candidates "$temp/candidates" "$temp"
-  build_manifest_with_selection "$DOTS_HOME/$MANIFEST" "$temp/selected" "$temp/proposed-manifest" "$temp/live-manifest" || fail "could not build proposed manifest"
+  # Ticked rows are shared from this Mac; new candidates start unticked.
+  list_intersect "$temp/live-manifest" "$temp/use" "$temp/shared"
+  list_union "$temp/shared" "$temp/candidates" "$temp/choices"
+  cp "$temp/shared" "$temp/chosen" || fail "could not prepare file selection"
+  if test -s "$temp/choices"; then
+    build_rows "$temp/choices" "$temp/rows"
+    checklist "$temp/rows" "$temp/chosen" "Files shared from this Mac. Unticking a shared file removes it from the repository for every Mac." || fail "update cancelled, nothing was changed"
+  fi
+  list_intersect "$temp/chosen" "$temp/candidates" "$temp/added"
+  list_minus "$temp/shared" "$temp/chosen" "$temp/removed"
+  if test -s "$temp/added" || test -s "$temp/removed"; then
+    test ! -s "$temp/added" || { say "Add to the repository:"; sed 's/^/  /' "$temp/added"; }
+    test ! -s "$temp/removed" || { say "Remove from the repository for every Mac (local files are kept):"; sed 's/^/  /' "$temp/removed"; }
+    printf 'Continue? [y/N] ' >&2
+    IFS= read -r answer || fail "update cancelled"
+    case $answer in y|Y|yes|YES) ;; *) : >"$temp/added"; : >"$temp/removed"; say "no file changes selected" ;; esac
+  fi
+  build_proposed_manifest "$DOTS_HOME/$MANIFEST" "$temp/removed" "$temp/added" "$temp/proposed-manifest" || fail "could not build proposed manifest"
   validate_manifest_file "$temp/proposed-manifest" "$temp/proposed-list" || fail "proposed manifest is unsafe"
-  validate_live_paths "$temp/proposed-list" || fail "proposed manifest names an unsafe live path"
+  # Only files this Mac uses are read from HOME; the rest keep their repository version.
+  list_union "$temp/use" "$temp/added" "$temp/used-after"
+  list_intersect "$temp/proposed-list" "$temp/used-after" "$temp/proposed-used"
+  list_minus "$temp/proposed-list" "$temp/used-after" "$temp/proposed-unused"
+  validate_live_paths "$temp/proposed-used" || fail "proposed manifest names an unsafe live path"
   list_with_manifest "$temp/proposed-list" "$temp/proposed-paths"
+  list_with_manifest "$temp/proposed-used" "$temp/scan-paths"
   : >"$temp/update-paths"
   append_unique_list "$temp/head-paths" "$temp/update-paths"
   append_unique_list "$temp/proposed-paths" "$temp/update-paths"
-  scan_live_candidates "$temp/proposed-paths" "$temp" || fail "credential scan failed for local update candidates"
+  scan_live_candidates "$temp/scan-paths" "$temp" || fail "credential scan failed for local update candidates"
   update_workspace=$temp/update-workspace
   "$GIT" clone --quiet --no-checkout -- "$REPO" "$update_workspace" || fail "could not prepare update workspace"
   "$GIT" -C "$update_workspace" checkout --quiet "$base" || fail "could not prepare update base"
   configure_sandbox_identity "$update_workspace" || fail "Git author identity is required for an update PR"
-  prepare_local_sandbox "$update_workspace" "$temp/head-paths" "$temp/proposed-paths" "$temp/update-paths" "$temp/proposed-manifest" || fail "could not prepare local update"
+  prepare_local_sandbox "$update_workspace" "$temp/head-paths" "$temp/proposed-paths" "$temp/update-paths" "$temp/proposed-manifest" "$temp/proposed-unused" || fail "could not prepare local update"
   "$GIT" -C "$update_workspace" diff --cached --quiet && { say "no local changes or candidates to update"; return; }
   printf 'PR title: ' >&2
   IFS= read -r title || fail "PR title cancelled"
@@ -852,11 +1144,56 @@ update_command() {
   enable_gh_git_credentials
   "$GIT" -C "$update_workspace" push --quiet origin "$update_branch" || fail "could not push update branch"
   "$GH" pr create --repo "$repo_name" --base "$branch" --head "$update_branch" --title "$title" --body "Created by dots update." || fail "branch was pushed but PR creation failed"
+  # Files added here are used here once the PR is merged and synced.
+  list_union "$temp/manifest-union" "$temp/added" "$temp/selection-scope"
+  write_selection "$temp/used-after" "$temp/skip" "$temp/selection-scope" || fail "PR created, but the file selection could not be saved"
   say "update PR created, local files and manifest remain unchanged"
+}
+
+select_command() {
+  test $# -eq 0 || { usage >&2; exit 2; }
+  require_dependencies
+  ensure_initialized
+  test -t 0 && test -t 1 || fail "select requires an interactive terminal"
+  temp=$(mktemp_dir); trap 'rm -rf "$temp"' EXIT HUP INT TERM
+  validate_current_state "$temp" || fail "repository tree or live manifest is unsafe"
+  test -s "$temp/head-manifest" || { say "the repository has no files yet; add some with: dots update"; return 0; }
+  list_intersect "$temp/head-manifest" "$temp/use" "$temp/chosen"
+  cp "$temp/chosen" "$temp/before" || fail "could not prepare file selection"
+  build_rows "$temp/head-manifest" "$temp/rows"
+  checklist "$temp/rows" "$temp/chosen" "Choose which repository files this Mac uses" || { say "selection unchanged"; return 0; }
+  list_minus "$temp/chosen" "$temp/before" "$temp/newly-used"
+  list_minus "$temp/head-manifest" "$temp/chosen" "$temp/skip"
+  head=$(head_revision) || fail "cannot resolve current revision"
+  # Newly chosen files come from the current repository revision. Identical or absent
+  # live files are fine; differing ones are backed up after confirmation.
+  : >"$temp/backup-paths"
+  while IFS= read -r path; do
+    safe_live_path "$path" || fail "a chosen file has an unsafe live parent; selection unchanged"
+    test -e "$DOTS_HOME/$path" || test -L "$DOTS_HOME/$path" || continue
+    test -f "$DOTS_HOME/$path" && test ! -L "$DOTS_HOME/$path" || fail "a chosen file exists locally but is not a regular file; selection unchanged"
+    git_repo cat-file blob "$head:$path" 2>/dev/null | cmp -s - "$DOTS_HOME/$path" || printf '%s\n' "$path" >>"$temp/backup-paths"
+  done <"$temp/newly-used"
+  if test -s "$temp/backup-paths"; then
+    say "These local files differ from the repository version:"
+    sed 's/^/  /' "$temp/backup-paths"
+    printf 'Back them up and use the repository version? [y/N] ' >&2
+    IFS= read -r answer || fail "selection cancelled"
+    case $answer in y|Y|yes|YES) ;; *) say "selection unchanged"; return 0 ;; esac
+    backup_live_files "$temp/backup-paths" select || fail "could not back up local files; selection unchanged"
+  fi
+  if test -s "$temp/newly-used"; then
+    set --
+    while IFS= read -r path; do set -- "$@" "$path"; done <"$temp/newly-used"
+    git_repo checkout --quiet "$head" -- "$@" || fail "could not bring in the chosen files${BACKUP_DIR:+ (backup: $BACKUP_DIR)}"
+  fi
+  write_selection "$temp/chosen" "$temp/skip" "$temp/head-manifest" || fail "could not save the file selection"
+  say "this Mac uses $(list_count "$temp/chosen") of $(list_count "$temp/head-manifest") repository file(s)"
 }
 
 case ${1:-} in
   init) shift; init_command "$@" ;;
+  select) shift; select_command "$@" ;;
   status) shift; status_command "$@" ;;
   sync) shift; sync_command "$@" ;;
   update) shift; update_command "$@" ;;
