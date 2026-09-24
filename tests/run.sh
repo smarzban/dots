@@ -519,6 +519,19 @@ for hand_mode in no-selection with-selection; do
   if test -n "$hand_ref" && test "$(/usr/bin/git --git-dir="$hand_remote" show "$hand_ref:.handext.ts")" = ext && grep -Fx 'use .handext.ts' "$hand_home/data/selection" >/dev/null; then pass "hand-added manifest line is shared ($hand_mode)"; else fail "hand-added manifest line is shared ($hand_mode)"; fi
 done
 
+# A hand-added path that another Mac also shared is confirmed and backed up, not a collision.
+remote=$TMP/hand-both.git; new_remote "$remote"; both_home=$TMP/home-hand-both; mkdir -p "$both_home"; expect_ok run_dots "$both_home" init "$remote" main
+printf 'mine\n' >"$both_home/.zshrc"; printf '.zshrc\n' >>"$both_home/.config/dots/manifest"
+remote_edit "$remote" "printf '%s\\n' '.config/example/settings' '.zshrc' > \"\$1/.config/dots/manifest\"; printf 'theirs\\n' > \"\$1/.zshrc\"" || exit 1
+if run_sync "$both_home" $'y\n1\n' >/dev/null 2>&1 && test "$(cat "$both_home/.zshrc")" = theirs && test "$(cat "$(find "$both_home/data/backups" -path '*/.zshrc' -type f | head -1)")" = mine && grep -Fx 'use .zshrc' "$both_home/data/selection" >/dev/null; then pass "hand-added path also shared remotely is backed up"; else fail "hand-added path also shared remotely is backed up"; fi
+# A hand-added path stays used across a conflict and sync --continue.
+remote=$TMP/hand-conflict.git; new_remote "$remote"; hc_home=$TMP/home-hand-conflict; mkdir -p "$hc_home"; expect_ok run_dots "$hc_home" init "$remote" main
+printf 'ext\n' >"$hc_home/.handext.ts"; printf '.handext.ts\n' >>"$hc_home/.config/dots/manifest"; printf two >"$hc_home/.config/example/settings"
+remote_edit "$remote" "printf one > \"\$1/.config/example/settings\"" || exit 1
+run_sync "$hc_home" $'4\n' >/dev/null 2>&1
+hc_workspace=$hc_home/data/conflict-workspace
+if test -d "$hc_workspace/.git" && /usr/bin/git -C "$hc_workspace" checkout --theirs -- .config/example/settings && /usr/bin/git -C "$hc_workspace" add -- .config/example/settings && /usr/bin/git -C "$hc_workspace" commit -qm resolve && (run_dots "$hc_home" sync --continue) >/dev/null 2>&1 && grep -Fx 'use .handext.ts' "$hc_home/data/selection" >/dev/null && test "$(cat "$hc_home/.handext.ts")" = ext; then pass "hand-added path survives sync --continue"; else fail "hand-added path survives sync --continue"; fi
+
 # Confirmed ticks are saved before publishing, so a failed PR creation keeps them.
 remote=$TMP/update-fail.git; fail_home=$TMP/home-update-fail; mkdir -p "$fail_home"
 run_derived_default_init "$fail_home" "$remote" $'y\n' >/dev/null 2>&1 || exit 1

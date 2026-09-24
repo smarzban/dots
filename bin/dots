@@ -1167,6 +1167,12 @@ apply_workspace_result() {
       cat "$workspace/.git/dots-newly-used" >>"$temp/use"
       cat "$workspace/.git/dots-newly-skipped" >>"$temp/skip" 2>/dev/null
     fi
+    # Paths added to the manifest by hand before the conflict are still used here;
+    # their resolved content may differ from the live copy, which is backed up.
+    if test -f "$workspace/.git/dots-hand-added"; then
+      cat "$workspace/.git/dots-hand-added" >>"$temp/use" || return 1
+      cat "$workspace/.git/dots-hand-added" >>"$temp/newly-used" || return 1
+    fi
   fi
   # Only files this Mac uses are written to HOME.
   list_intersect "$temp/result-manifest" "$temp/use" "$temp/apply-manifest"
@@ -1214,6 +1220,10 @@ sync_command() {
   git_repo merge-base --is-ancestor "$base" "$remote" || test "$base" = "$remote" || fail "remote history is not a safe fast-forward"
   # This Mac's own merged update PRs: its pending files are used here, not offered.
   pending_arrived "$temp" "$temp/remote-manifest"
+  # A path added to the manifest by hand here that another Mac also shared is newly
+  # used too, so a differing local copy is confirmed and backed up, not a collision.
+  list_intersect "$temp/hand-added" "$temp/remote-manifest" "$temp/hand-arrived"
+  cat "$temp/hand-arrived" >>"$temp/newly-used"
   # Files another Mac added that this Mac has not been asked about yet. The choice is
   # saved only when the repository configuration is applied.
   list_minus "$temp/remote-manifest" "$temp/use" "$temp/unseen-used"
@@ -1279,7 +1289,7 @@ sync_command() {
       "$GIT" -C "$workspace" checkout --quiet "$base" || fail "could not prepare conflict workspace"
       configure_merge_identity "$workspace" || fail "could not configure temporary merge workspace"
       # Choices about new repository files apply when the merge is continued.
-      cp "$temp/newly-used" "$workspace/.git/dots-newly-used" && cp "$temp/newly-skipped" "$workspace/.git/dots-newly-skipped" || fail "could not prepare conflict workspace"
+      cp "$temp/newly-used" "$workspace/.git/dots-newly-used" && cp "$temp/newly-skipped" "$workspace/.git/dots-newly-skipped" && cp "$temp/hand-added" "$workspace/.git/dots-hand-added" || fail "could not prepare conflict workspace"
       prepare_local_sandbox "$workspace" "$temp/head-paths" "$temp/live-paths" "$temp/all-paths" "$DOTS_HOME/$MANIFEST" "$temp/unselected" || fail "could not prepare local merge candidate"
       "$GIT" -C "$workspace" commit --quiet -m "dots local changes" || fail "could not prepare local merge candidate"
       "$GIT" -C "$workspace" config dots.remoteRevision "$remote"
