@@ -1180,7 +1180,9 @@ live_states() {
 tree_states() {
   # Validated trees hold no names with newlines, so NUL-separated output can become
   # lines without Git's quoting.
-  git_repo ls-tree -r -z "$1" | tr '\0' '\n' >"$2.raw" || return 1
+  git_repo ls-tree -r -z "$1" >"$2.z" || return 1
+  tr '\0' '\n' <"$2.z" >"$2.raw" || return 1
+  rm -f "$2.z"
   awk -F '\t' '{ split($1, meta, " "); print meta[1] " " meta[3] "\t" $2 }' "$2.raw" >"$2"
   rm -f "$2.raw"
 }
@@ -1480,7 +1482,9 @@ update_command() {
   report_open_update_prs "$(cat "$temp/open-prs")"
   # A PR is built on the latest revision, so catch up first (as sync would, without
   # questions), then look at this Mac again.
+  caught_up=
   if test "$base" != "$remote"; then
+    caught_up=yes
     refuse_old_conflict_workspace
     git_repo diff --cached --quiet || fail "repository index has staged changes; resolve or unstage them first"
     git_repo merge-base --is-ancestor "$base" "$remote" || fail "remote history is not a safe fast-forward"
@@ -1530,7 +1534,7 @@ update_command() {
   labelled_rows "$temp/unchanged" "shared files (untick to stop sharing on every Mac)" "$temp/rows"
   labelled_rows "$temp/ignored-candidates" "previously ignored (tick to start sharing)" "$temp/rows"
   if test -s "$temp/rows"; then
-    checklist "$temp/rows" "$temp/chosen" "Choose what this update sends to the repository" || fail "update cancelled, nothing was changed"
+    checklist "$temp/rows" "$temp/chosen" "Choose what this update sends to the repository" || fail "update cancelled, nothing was sent${caught_up:+ (this Mac did catch up with the repository first)}"
   fi
   list_intersect "$temp/chosen" "$temp/candidates" "$temp/added"
   # Unticked unchanged files stop being shared; a ticked deletion removes the file.
