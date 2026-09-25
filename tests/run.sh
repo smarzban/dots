@@ -405,6 +405,11 @@ mv "$update_home/.zshrc" "$TMP/zshrc.kept"
 deleted_out=$(run_update "$update_home" "$remote" $'\ny\nStop sharing shell\n' 2>&1 | tr -d '\r')
 deleted_ref=$(/usr/bin/git --git-dir="$remote" for-each-ref --sort=-refname --format='%(refname)' 'refs/heads/dots/update-*' | head -1)
 if printf '%s' "$deleted_out" | grep -E '\[x\] \.zshrc  \(deleted here\)$' >/dev/null && printf '%s' "$deleted_out" | grep -F 'Stop sharing on every Mac' >/dev/null && ! /usr/bin/git --git-dir="$remote" show "$deleted_ref:.config/dots/manifest" | grep -Fx .zshrc >/dev/null && ! /usr/bin/git --git-dir="$remote" cat-file -e "$deleted_ref:.zshrc" 2>/dev/null; then pass "update sends a local deletion as stop sharing"; else fail "update sends a local deletion as stop sharing"; fi
+# Declining that confirmation keeps the file shared and sends the other edits.
+printf 'input\n' >"$update_home/.inputrc"
+declined_out=$(run_update "$update_home" "$remote" $'\nn\nDecline\n' 2>&1 | tr -d '\r')
+rm -f "$update_home/.inputrc"
+if printf '%s' "$declined_out" | grep -F 'no files added or removed' >/dev/null && ! printf '%s' "$declined_out" | grep -F 'could not prepare' >/dev/null; then pass "declining a sent deletion keeps the file shared"; else fail "declining a sent deletion keeps the file shared ($(printf '%s' "$declined_out" | tail -1))"; fi
 mv "$TMP/zshrc.kept" "$update_home/.zshrc"
 
 # ── Per-Mac file selection ─────────────────────────────────

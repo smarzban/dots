@@ -1541,7 +1541,11 @@ update_command() {
     IFS= read -r answer || fail "update cancelled"
     case $answer in
       y|Y|yes|YES) confirmed=true ;;
-      *) confirmed=false; : >"$temp/added"; : >"$temp/removed"; say "no files added or removed" ;;
+      *)
+        confirmed=false
+        # A declined deletion is held like any unticked edit: the repository keeps the file.
+        cat "$temp/deleted-sent" >>"$temp/held"
+        : >"$temp/added"; : >"$temp/removed"; say "no files added or removed" ;;
     esac
   else
     confirmed=true

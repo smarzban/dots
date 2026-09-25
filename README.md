@@ -115,7 +115,7 @@ Finishes a merge that stopped on a conflict (see below).
 
 ### The update checklist
 
-`dots update` shows up to four pages. Empty pages are skipped, so if you only edited files you'll see just the first.
+`dots update` shows up to four pages, in this order, skipping empty ones. Your edits are always on the first page.
 
 | Page | What's on it | Ticked means |
 |---|---|---|
