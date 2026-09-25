@@ -609,6 +609,15 @@ remote_edit "$behind_remote" "printf '%s\\n' '.zshrc' > \"\$1/.config/dots/manif
 behind_out=$(run_update "$behind_home" "$behind_remote" $'1\ny\nTitle\n' 2>&1)
 if printf '%s' "$behind_out" | grep -F 'Run dots sync first' >/dev/null && ! printf '%s' "$behind_out" | grep -F -e 'Toggle numbers' -e 'PR title' >/dev/null && test -z "$(/usr/bin/git --git-dir="$behind_remote" for-each-ref 'refs/heads/dots/update-*')"; then pass "update asks to sync first when behind"; else fail "update asks to sync first when behind"; fi
 
+# sync's menu offers a PR only when up to date, and merging only when behind.
+remote=$TMP/menu-shape.git; new_remote "$remote"; menu_home=$TMP/home-menu-shape; mkdir -p "$menu_home"; expect_ok run_dots "$menu_home" init "$remote" main
+printf local >"$menu_home/.config/example/settings"
+menu_out=$(run_sync "$menu_home" '' 2>&1)
+if printf '%s' "$menu_out" | grep -F '3. Create a PR' >/dev/null && ! printf '%s' "$menu_out" | grep -F '4. Merge' >/dev/null; then pass "sync offers a PR when up to date"; else fail "sync offers a PR when up to date"; fi
+remote_edit "$remote" "printf remote > \"\$1/.config/example/settings\"" || exit 1
+menu_out=$(run_sync "$menu_home" $'3\n' 2>&1)
+if printf '%s' "$menu_out" | grep -F '4. Merge' >/dev/null && ! printf '%s' "$menu_out" | grep -F '3. Create a PR' >/dev/null && printf '%s' "$menu_out" | grep -F 'choose 4 to merge' >/dev/null && test "$(cat "$menu_home/.config/example/settings")" = local; then pass "sync offers merging, not a PR, when behind"; else fail "sync offers merging, not a PR, when behind"; fi
+
 # Confirmed ticks are saved before publishing, so a failed PR creation keeps them.
 remote=$TMP/update-fail.git; fail_home=$TMP/home-update-fail; mkdir -p "$fail_home"
 run_derived_default_init "$fail_home" "$remote" $'y\n' >/dev/null 2>&1 || exit 1

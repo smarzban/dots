@@ -1365,14 +1365,17 @@ sync_command() {
   say "Local approved changes are not pushed by sync:"
   say "  1. Use repository version, replace local files"
   say "  2. Keep local files, make no changes"
-  say "  3. Create a PR from local changes"
-  test "$base" = "$remote" || say "  4. Merge remote into local only"
+  # A PR needs an up-to-date Mac, so option 3 only appears with nothing to merge,
+  # and option 4 only when there is.
+  if test "$base" = "$remote"; then say "  3. Create a PR from local changes"; else say "  4. Merge remote into local only"; fi
   printf 'Choose [1-4]: ' >&2
   IFS= read -r choice || fail "sync choice cancelled"
   case $choice in
     1) apply_workspace_result "$remote_workspace" "${remote}^{tree}" "$remote" "$base" "$branch" "$temp" || fail "could not apply repository configuration"; say "repository configuration applied locally" ;;
     2) say "local files kept, no changes made" ;;
-    3) update_command ;;
+    3)
+      test "$base" = "$remote" || fail "the repository has changes to bring in first: choose 4 to merge them into your local files, then run dots update"
+      update_command ;;
     4)
       test "$base" != "$remote" || fail "there are no remote changes to merge"
       workspace=$DOTS_DATA/conflict-workspace
