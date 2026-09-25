@@ -1417,6 +1417,9 @@ update_command() {
   branch=$(current_branch)
   base=$(head_revision) || fail "cannot resolve current revision"
   remote=$(fetch_validated_remote "$temp" "$branch") || fail "incoming repository data is unsafe or unavailable"
+  # A PR built on an older revision would list merged files as new and can conflict
+  # with what is already in the repository.
+  test "$base" = "$remote" || fail "the repository has changes this Mac has not synced yet (for example a merged update PR). Run dots sync first, then dots update"
   origin=$(git_repo remote get-url origin 2>/dev/null || true)
   case $origin in
     https://github.com/*/*.git) repo_name=${origin#https://github.com/}; repo_name=${repo_name%.git} ;;

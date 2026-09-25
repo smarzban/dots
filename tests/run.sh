@@ -602,6 +602,13 @@ pages_out=$(run_update "$pages_home" "$pages_remote" $'\n' 2>&1 | tr -d '\r')
 pages_order=$(printf '%s\n' "$pages_out" | awk '/^(new files|shared files|previously ignored):$/ { printf "%s|", $0 }')
 if test "$pages_order" = 'shared files:|previously ignored:|'; then pass "update skips the new page when nothing is new"; else fail "update skips the new page when nothing is new ($pages_order)"; fi
 
+# update refuses to run while this Mac is behind the repository, before any checklist.
+behind_remote=$TMP/update-behind.git; behind_home=$TMP/home-update-behind; mkdir -p "$behind_home"
+run_derived_default_init "$behind_home" "$behind_remote" $'y\n' >/dev/null 2>&1 || exit 1
+remote_edit "$behind_remote" "printf '%s\\n' '.zshrc' > \"\$1/.config/dots/manifest\"; printf shell > \"\$1/.zshrc\"" || exit 1
+behind_out=$(run_update "$behind_home" "$behind_remote" $'1\ny\nTitle\n' 2>&1)
+if printf '%s' "$behind_out" | grep -F 'Run dots sync first' >/dev/null && ! printf '%s' "$behind_out" | grep -F -e 'Toggle numbers' -e 'PR title' >/dev/null && test -z "$(/usr/bin/git --git-dir="$behind_remote" for-each-ref 'refs/heads/dots/update-*')"; then pass "update asks to sync first when behind"; else fail "update asks to sync first when behind"; fi
+
 # Confirmed ticks are saved before publishing, so a failed PR creation keeps them.
 remote=$TMP/update-fail.git; fail_home=$TMP/home-update-fail; mkdir -p "$fail_home"
 run_derived_default_init "$fail_home" "$remote" $'y\n' >/dev/null 2>&1 || exit 1
