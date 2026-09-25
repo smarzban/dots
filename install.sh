@@ -30,3 +30,21 @@ test -n "$expected" && test "$expected" = "$actual" || { printf '%s\n' 'dots ins
 mkdir -p "$DESTINATION"
 install -m 755 "$temp/dots" "$DESTINATION/dots"
 printf 'Installed dots to %s/dots\n' "$DESTINATION"
+
+# The shell only finds commands in PATH folders, and a fresh Mac does not list
+# ~/.local/bin, so say how to run dots rather than leave "command not found".
+case $DESTINATION in
+  "$HOME"/*) shown="\$HOME/${DESTINATION#"$HOME"/}" ;;
+  *) shown=$DESTINATION ;;
+esac
+case ":$PATH:" in
+  *":$DESTINATION:"*|*":$DESTINATION/:"*)
+    found=$(command -v dots 2>/dev/null || true)
+    if test -n "$found" && test "$found" != "$DESTINATION/dots"; then
+      printf 'Note: %s comes first on your PATH, so "dots" runs that copy. Remove it, or run %s/dots.\n' "$found" "$DESTINATION"
+    fi ;;
+  *)
+    printf '%s is not on your PATH, so the dots command will not be found. Either:\n' "$DESTINATION"
+    printf '  run it by full path:  %s/dots init\n' "$DESTINATION"
+    printf '  or add it to PATH:    echo '"'"'export PATH="%s:$PATH"'"'"' >> ~/.zprofile && exec zsh\n' "$shown" ;;
+esac

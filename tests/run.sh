@@ -388,6 +388,10 @@ merged_ref=$(/usr/bin/git --git-dir="$remote" for-each-ref --format='%(refname)'
 /usr/bin/git --git-dir="$remote" update-ref refs/heads/main "$merged_ref"
 merge_out=$(run_sync "$update_home" '' 2>&1)
 if ! printf '%s' "$merge_out" | grep -F 'New files in the repository' >/dev/null && grep -Fx 'use .zshrc' "$update_home/data/selection" >/dev/null && ! grep -F 'pending' "$update_home/data/selection" >/dev/null && grep -Fx .zshrc "$update_home/.config/dots/manifest" >/dev/null; then pass "merged pending files become used without asking"; else fail "merged pending files become used without asking"; fi
+# A changed shared file is marked in the checklist and listed before the PR title.
+printf 'shell 2\n' >"$update_home/.zshrc"
+changed_out=$(run_update "$update_home" "$remote" $'\n' 2>&1 | tr -d '\r')
+if printf '%s' "$changed_out" | grep -E '\[x\] \.zshrc  \(changed\)$' >/dev/null && printf '%s' "$changed_out" | grep -F 'Changes in this PR:' >/dev/null && printf '%s' "$changed_out" | grep -E '^  changed +\.zshrc$' >/dev/null; then pass "update shows changed shared files"; else fail "update shows changed shared files"; fi
 
 # ── Per-Mac file selection ─────────────────────────────────
 # Checklist rows list home-folder files first, sorted, then other directories.
@@ -791,6 +795,10 @@ if "$package_repo/scripts/package.sh" v0.0.0-test >/dev/null 2>&1 && test -x "$p
 # The installer verifies release checksums before copying a binary.
 assets=$TMP/release-assets; destination=$TMP/installed-bin; mkdir -p "$assets"; printf '#!/bin/sh\necho dots\n' >"$assets/dots"; shasum -a 256 "$assets/dots" >"$assets/dots.sha256"
 if DOTS_RELEASE_BASE_URL="file://$assets" DOTS_BIN_DIR="$destination" "$ROOT/install.sh" >/dev/null 2>&1 && test -x "$destination/dots"; then pass "installer checksum success"; else fail "installer checksum success"; fi
+# The installer says how to run dots when its folder is not on PATH, and nothing extra when it is.
+off_path=$(DOTS_RELEASE_BASE_URL="file://$assets" DOTS_BIN_DIR="$TMP/off-path-bin" PATH=/usr/bin:/bin "$ROOT/install.sh" 2>&1)
+on_path=$(DOTS_RELEASE_BASE_URL="file://$assets" DOTS_BIN_DIR="$TMP/on-path-bin" PATH="$TMP/on-path-bin:/usr/bin:/bin" "$ROOT/install.sh" 2>&1)
+if printf '%s' "$off_path" | grep -F "$TMP/off-path-bin is not on your PATH" >/dev/null && printf '%s' "$off_path" | grep -F "$TMP/off-path-bin/dots init" >/dev/null && test "$(printf '%s\n' "$on_path" | wc -l | tr -d ' ')" = 1; then pass "installer explains PATH"; else fail "installer explains PATH"; fi
 printf tampered >"$assets/dots"
 if ! DOTS_RELEASE_BASE_URL="file://$assets" DOTS_BIN_DIR="$TMP/unsafe-bin" "$ROOT/install.sh" >/dev/null 2>&1 && test ! -e "$TMP/unsafe-bin/dots"; then pass "installer checksum refusal"; else fail "installer checksum refusal"; fi
 

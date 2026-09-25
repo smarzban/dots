@@ -30,7 +30,7 @@ gh auth login
 curl -fsSL https://github.com/smarzban/dots/releases/latest/download/install.sh | sh
 ```
 
-The installer verifies the release checksum and puts `dots` in `~/.local/bin`. Make sure that directory is on your `PATH`.
+The installer verifies the release checksum and puts `dots` in `~/.local/bin`. A fresh Mac doesn't have that folder on its `PATH`; the installer then prints the full-path command to run first and the line to add it to `PATH`.
 
 To pin a version or choose another directory, set `DOTS_VERSION` or `DOTS_BIN_DIR`:
 
@@ -130,7 +130,7 @@ dots update
 | `select` | Changes which repository files this Mac uses. Newly chosen files are brought in; a differing local copy is backed up first, after you confirm. Unchosen files stay on disk but stop syncing. |
 | `status` | Shows the branch, how far this Mac is ahead or behind, how many repository files this Mac uses, and which of them changed locally. |
 | `sync` | Fetches, checks, and applies the repository configuration to the files this Mac uses. It only pushes if you choose to create a PR from local changes. |
-| `update` | Opens a pull request with local changes, newly ticked files, and unticked files to remove from the repository. Its checklist shows new files first, then shared files, then previously ignored ones; unticked new files move to previously ignored. If the repository has changes this Mac hasn't synced, it asks you to run `dots sync` first. Never changes local files. |
+| `update` | Opens a pull request with local changes, newly ticked files, and unticked files to remove from the repository. Its checklist shows new files first, then shared files (marked "changed" when edited locally), then previously ignored ones, and it lists every change before asking for the PR title; unticked new files move to previously ignored. If the repository has changes this Mac hasn't synced, it asks you to run `dots sync` first. Never changes local files. |
 
 In checklists, use Up/Down to move, Left/Right to change folder page, Space to toggle, `a` or `n` to tick all or none on the page, Enter to confirm, and `q` to cancel. Without a full terminal, or with `DOTS_PLAIN_PROMPTS=1`, `dots` shows a numbered list instead: type numbers such as `1,3-5` to toggle them.
 

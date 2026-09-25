@@ -774,13 +774,16 @@ print_candidates() {
 }
 
 # ── Checklist ───────────────────────────────────────────────
-# Rows are "group<TAB>path" lines; manifest paths never contain whitespace. The chosen file holds the initial ticks and is
+# Rows are "group<TAB>path[<TAB>note]" lines; manifest paths never contain whitespace. The chosen file holds the initial ticks and is
 # rewritten with the final ticks. Returns 1 when the user cancels.
 # Append one checklist page named $2 holding the paths in $1 (home files first).
+# Paths listed in the optional file $4 get the note "changed" after their name.
 labelled_rows() {
   test -s "$1" || return 0
   build_rows "$1" "$3.page"
-  cut -f 2- "$3.page" | awk -v label="$2" '{ print label "\t" $0 }' >>"$3"
+  cut -f 2 "$3.page" | awk -F '\t' -v label="$2" -v notes="${4:-/dev/null}" '
+    BEGIN { while ((getline line < notes) > 0) changed[line] = 1 }
+    { print label "\t" $0 (($0 in changed) ? "\tchanged" : "") }' >>"$3"
   rm -f "$3.page"
 }
 
@@ -840,18 +843,18 @@ checklist_plain() {
   number=0
   cl_groups=$(cut -f 1 "$cl_rows" | uniq | wc -l | tr -d ' ')
   cl_last=
-  while IFS=$TAB read -r cl_group path; do
+  while IFS=$TAB read -r cl_group path cl_note; do
     if test "$cl_groups" -gt 1 && test "$cl_group" != "$cl_last"; then printf '%s:\n' "$cl_group"; cl_last=$cl_group; fi
     number=$((number + 1))
     if path_in_list "$path" "$cl_chosen"; then mark='[x]'; else mark='[ ]'; fi
-    printf '%3d  %s %s\n' "$number" "$mark" "$path"
+    printf '%3d  %s %s%s\n' "$number" "$mark" "$path" "${cl_note:+  ($cl_note)}"
   done <"$cl_rows"
   printf 'Toggle numbers (for example 1,3-5), Enter to keep as shown: ' >&2
   IFS= read -r numbers || return 1
   test -n "$numbers" || return 0
   expand_numbers "$numbers" "$number" "$cl_chosen.numbers" || fail "selection must be numbers, commas, and ranges within the list"
   while IFS= read -r number; do
-    path=$(sed -n "${number}p" "$cl_rows" | cut -f 2-)
+    path=$(sed -n "${number}p" "$cl_rows" | cut -f 2)
     list_toggle "$path" "$cl_chosen"
   done <"$cl_chosen.numbers"
   rm -f "$cl_chosen.numbers"
@@ -900,7 +903,7 @@ checklist_draw() {
     $1 == group {
       row++
       if (row < top || shown >= height) next
-      line = (row == cursor ? "> " : "  ") (($2 in chosen) ? "[x] " : "[ ] ") $2
+      line = (row == cursor ? "> " : "  ") (($2 in chosen) ? "[x] " : "[ ] ") $2 (($3 != "") ? "  (" $3 ")" : "")
       body = body substr(line, 1, width) "\033[K\n"
       shown++
     }
@@ -1495,8 +1498,15 @@ update_command() {
   # One page each, in this order, skipping empty ones: files never offered before,
   # files this Mac shares, and files unticked before.
   : >"$temp/rows"
+  # Shared files whose content or executable bit differs from the last sync.
+  set --
+  while IFS= read -r path; do set -- "$@" "$path"; done <"$temp/shared"
+  : >"$temp/changed"
+  if test $# -gt 0; then
+    git_repo diff --name-only -z HEAD -- "$@" 2>/dev/null | tr '\0' '\n' >"$temp/changed" || : >"$temp/changed"
+  fi
   labelled_rows "$temp/fresh-candidates" "new files" "$temp/rows"
-  labelled_rows "$temp/shared" "shared files" "$temp/rows"
+  labelled_rows "$temp/shared" "shared files" "$temp/rows" "$temp/changed"
   labelled_rows "$temp/ignored-candidates" "previously ignored" "$temp/rows"
   if test -s "$temp/rows"; then
     checklist "$temp/rows" "$temp/chosen" "Tick files to share from this Mac. Unticked shared files leave the repository for every Mac; unticked new files move to previously ignored." || fail "update cancelled, nothing was changed"
@@ -1545,6 +1555,12 @@ update_command() {
   configure_sandbox_identity "$update_workspace" || fail "Git author identity is required for an update PR"
   prepare_local_sandbox "$update_workspace" "$temp/head-paths" "$temp/proposed-paths" "$temp/update-paths" "$temp/proposed-manifest" "$temp/proposed-unused" || fail "could not prepare local update"
   "$GIT" -C "$update_workspace" diff --cached --quiet && { say "no local changes or candidates to update"; return; }
+  say "Changes in this PR:"
+  "$GIT" -C "$update_workspace" diff --cached --name-status -z --no-renames | while IFS= read -r -d '' us_status && IFS= read -r -d '' us_path; do
+    case $us_status in A) us_word=added ;; D) us_word=removed ;; *) us_word=changed ;; esac
+    valid_manifest_path "$us_path" || us_path='(a file with an unusual name)'
+    printf '  %-8s %s\n' "$us_word" "$us_path"
+  done
   printf 'PR title: ' >&2
   IFS= read -r title || fail "PR title cancelled"
   test -n "$title" || fail "PR title is required"
