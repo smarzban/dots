@@ -266,6 +266,11 @@ printf '{}' >"$disc/.config/vendored/settings.json"; printf '{}' >"$disc/.projec
 printf '{}' >"$disc/.cache/z.json"; printf 'h' >"$disc/.config/gh/hosts.yml"; printf h >"$disc/.zsh_history"; printf s >"$disc/.DS_Store"; printf '{}' >"$disc/.claude.json"
 # A symlinked parent must not expose files from outside HOME.
 printf outside >"$outside/config.toml"; ln -s "$outside" "$disc/.grok"
+# A tab-padded name cannot smuggle in the excluded file it strips down to, UTF-16
+# text (NUL bytes) is not text, and case folding stays ASCII in any locale.
+printf x >"$disc/.netrc	"
+printf '\377\376a\000b\000' >"$disc/.unknowntool/utf16.json"
+mkdir -p "$disc/.config/PRIVATE"; printf '{}' >"$disc/.config/PRIVATE/settings.json"
 # A newline inside a filename must not forge another path: the piece after it names a
 # real file that is never suggested (not hidden), so reading line by line would leak it.
 printf private >"$disc/forged-notes"; printf x >"$disc/.config/newtool/a
@@ -276,6 +281,8 @@ listed() { printf '%s\n' "$discovery" | grep -E "^ *[0-9]+  $1\$" >/dev/null; }
 if listed .gitconfig && listed .zshrc && ! printf '%s' "$discovery" | grep -F '\n' >/dev/null; then pass "discovery renders one candidate per line"; else fail "discovery renders one candidate per line"; fi
 if listed .zprofile && listed .vimrc && listed .claude/settings.json && listed .pi/agent/settings.json && listed .config/newtool/anything && listed .unknowntool/settings.yaml && listed .unknowntool/sub/prefs.toml; then pass "generic discovery finds dotfiles and unknown tools"; else fail "generic discovery finds dotfiles and unknown tools"; fi
 if ! printf '%s' "$discovery" | grep -F -e too-deep.json -e data.bin -e huge.json -e binary.json -e models_cache.json -e /cache/ -e node_modules -e vendored -e .pi/agent/agents/helper.md >/dev/null; then pass "generic discovery skips deep, binary, large, cache, and vendored files"; else fail "generic discovery skips deep, binary, large, cache, and vendored files"; fi
+turkish=$(LC_ALL=tr_TR.UTF-8 run_dots "$disc" init --discover 2>&1)
+if ! printf '%s' "$turkish" | grep -F -e .config/PRIVATE/ -e utf16.json >/dev/null; then pass "discovery excludes upper-case names and refuses UTF-16"; else fail "discovery excludes upper-case names and refuses UTF-16"; fi
 if ! printf '%s' "$discovery" | grep -F -e .ssh/ -e .docker/config.json -e .netrc -e .npmrc -e .cache/ -e .config/gh/ -e .zsh_history -e .DS_Store -e .claude.json -e dev.env.tmpl -e .config/dots/manifest -e .aws/ -e private.json -e mcp.json -e .config/mcp/ -e .config/vendored/ -e .project/ >/dev/null; then pass "discovery never suggests credentials or machine state"; else fail "discovery never suggests credentials or machine state"; fi
 # A rules file adds what the scan misses and drops what it should not suggest.
 mkdir -p "$disc/.config/dots"

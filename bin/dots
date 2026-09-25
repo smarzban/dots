@@ -570,7 +570,9 @@ DISCOVER_MAX_BYTES=65536
 # hold credentials, caches, or machine-local state wherever they appear; gitleaks
 # still scans every chosen file before a push.
 filter_candidate_names() {
-  awk -F '\t' -v rules="$DISCOVER_RULES" '
+  # The C locale keeps tolower() to ASCII (in a Turkish locale "I" would fold to a
+  # dotless i and slip past "private"), as the tr it replaced did.
+  LC_ALL=C awk -F '\t' -v rules="$DISCOVER_RULES" '
     function excluded(path,    l, b) {
       if (path == rules) return 0
       if (index(path, ".config/dots/") == 1) return 1
@@ -599,19 +601,20 @@ filter_candidate_names() {
     { print }' "$1"
 }
 
-# Keep small text files only (1 byte to DISCOVER_MAX_BYTES, not binary); large or
-# binary files are data, not configuration. Batched: one stat and one file call,
-# joined by name, so a file that vanishes meanwhile is simply dropped.
+# Keep small text files only (1 byte to DISCOVER_MAX_BYTES, no NUL bytes); large or
+# binary files are data, not configuration. Batched: one stat call for sizes and one
+# grep call listing files that contain a NUL (in the C locale, [^\x01-\xff] matches
+# only that byte), joined by name, so a file that vanishes meanwhile is dropped.
 keep_small_text_files() {
   : >"$2"
   test -s "$1" || return 0
   (cd "$DOTS_HOME" && tr '\n' '\0' <"$1" | xargs -0 stat -f "%z$TAB%N" 2>/dev/null) >"$2.sizes"
-  (cd "$DOTS_HOME" && tr '\n' '\0' <"$1" | xargs -0 file -b --mime-encoding -- 2>/dev/null | paste -d "$TAB" - "$1") >"$2.types"
+  (cd "$DOTS_HOME" && tr '\n' '\0' <"$1" | LC_ALL=C xargs -0 grep -l -a -e "$(printf '[^\001-\377]')" -- 2>/dev/null) >"$2.nul"
   awk -F '\t' -v max="$DISCOVER_MAX_BYTES" '
     FILENAME == ARGV[1] { if ($1 ~ /^[0-9]+$/) size[substr($0, length($1) + 2)] = $1 + 0; next }
-    FILENAME == ARGV[2] { type[substr($0, length($1) + 2)] = $1; next }
-    ($0 in size) && size[$0] > 0 && size[$0] <= max && ($0 in type) && type[$0] != "binary" && type[$0] !~ /cannot|error/' "$2.sizes" "$2.types" "$1" >"$2"
-  rm -f "$2.sizes" "$2.types"
+    FILENAME == ARGV[2] { nul[$0] = 1; next }
+    ($0 in size) && size[$0] > 0 && size[$0] <= max && !($0 in nul)' "$2.sizes" "$2.nul" "$1" >"$2"
+  rm -f "$2.sizes" "$2.nul"
 }
 
 path_matches_list() {
@@ -695,7 +698,9 @@ check_candidates() {
 raw_candidates() {
   while IFS= read -r -d '' rc_file; do
     rc_path=${rc_file#"$DOTS_HOME"/}
-    case $rc_path in *"$NL"*) continue ;; esac
+    # A tab would be stripped by the later tab-separated read, so the name checked
+    # here and the file used there could differ. Valid paths never contain one.
+    case $rc_path in *"$NL"*|*"$TAB"*) continue ;; esac
     if test -n "${2:-}"; then
       # shellcheck disable=SC2254 # rule patterns are globs on purpose
       case $rc_path in $2) ;; *) continue ;; esac
@@ -1454,6 +1459,8 @@ update_command() {
   gh_view=$!
   open_update_prs "$repo_name" >"$temp/open-prs" &
   gh_prs=$!
+  # Any early failure stops them rather than leaving them running.
+  trap 'kill "$gh_view" "$gh_prs" 2>/dev/null; rm -rf "$temp"' EXIT HUP INT TERM
   validate_current_state "$temp" || fail "repository tree or live manifest is unsafe"
   branch=$(current_branch)
   base=$(head_revision) || fail "cannot resolve current revision"
@@ -1467,6 +1474,7 @@ update_command() {
   fi
   # One update PR at a time: a second one would conflict on the manifest.
   wait "$gh_prs" || fail "could not check for open update PRs"
+  trap 'rm -rf "$temp"' EXIT HUP INT TERM
   report_open_update_prs "$(cat "$temp/open-prs")"
   collect_candidates "$temp/live-manifest" "$temp/candidates" || fail "could not collect candidates"
   # Ticked rows are shared from this Mac; new candidates start unticked unless an
