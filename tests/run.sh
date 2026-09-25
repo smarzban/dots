@@ -323,11 +323,8 @@ printf '%s\n' '.config/example/settings' >"$home/.config/dots/manifest"
 # Sync never stages unrelated files or creates history from local edits.
 printf local >"$home/.config/example/settings"; printf unrelated >"$home/not-approved"
 before=$(/usr/bin/git --git-dir="$home/data/repo.git" rev-parse HEAD)
-if run_sync "$home" $'2\n' >/dev/null 2>&1 && test "$before" = "$(/usr/bin/git --git-dir="$home/data/repo.git" rev-parse HEAD)" && test "$(cat "$home/.config/example/settings")" = local && ! /usr/bin/git --git-dir="$home/data/repo.git" ls-tree -r --name-only HEAD | grep -F not-approved >/dev/null; then pass "sync keeps local changes"; else fail "sync keeps local changes"; fi
-
-# Choosing the repository version discards approved local changes without history.
-printf cancelled >"$home/.config/example/settings"
-if run_sync "$home" $'1\n' >/dev/null 2>&1 && test "$before" = "$(/usr/bin/git --git-dir="$home/data/repo.git" rev-parse HEAD)"; then pass "sync repository override"; else fail "sync repository override"; fi
+keep_out=$(run_sync "$home" '' 2>&1)
+if test "$before" = "$(/usr/bin/git --git-dir="$home/data/repo.git" rev-parse HEAD)" && test "$(cat "$home/.config/example/settings")" = local && ! /usr/bin/git --git-dir="$home/data/repo.git" ls-tree -r --name-only HEAD | grep -F not-approved >/dev/null && printf '%s' "$keep_out" | grep -F 'edited here, not in the repository yet' >/dev/null && printf '%s' "$keep_out" | grep -F 'run dots update' >/dev/null && ! printf '%s' "$keep_out" | grep -F 'Choose' >/dev/null; then pass "sync keeps local edits without asking"; else fail "sync keeps local edits without asking"; fi
 
 # Mocked scanner failure blocks known secret-shaped local and incoming candidates without exposing a finding.
 printf DOTS_TEST_SECRET >"$home/.config/example/settings"
@@ -358,14 +355,26 @@ remote_edit "$remote" "printf '%s\\n' '.config/example/settings' '.gitleaks.toml
 home4=$TMP/home-scanner-config; mkdir -p "$home4"
 if expect_fail run_dots "$home4" init "$remote" main && test ! -e "$home4/.config/example/settings"; then pass "scanner config refused"; else fail "scanner config refused"; fi
 
-# A local-only merge conflict stays in a private workspace, never in live files.
-remote=$TMP/conflict.git; new_remote "$remote"; b=$TMP/home-b; mkdir -p "$b"; expect_ok run_dots "$b" init "$remote" main
-printf two >"$b/.config/example/settings"
+# A file changed both here and in the repository is asked about. Cancelling changes nothing.
+remote=$TMP/clash.git; new_remote "$remote"
+clash_home() { h=$TMP/home-clash-$1; mkdir -p "$h"; expect_ok run_dots "$h" init "$remote" main; printf two >"$h/.config/example/settings"; }
+clash_home cancel; clash_home take; clash_home keep
 remote_edit "$remote" "printf one > \"\$1/.config/example/settings\"" || exit 1
-if run_sync "$b" $'4\n' >/dev/null 2>&1 && test "$(cat "$b/.config/example/settings")" = two && test -d "$b/data/conflict-workspace/.git"; then pass "conflict workspace preservation"; else fail "conflict workspace preservation"; fi
-workspace=$b/data/conflict-workspace
-/usr/bin/git -C "$workspace" checkout --theirs -- .config/example/settings && /usr/bin/git -C "$workspace" add -- .config/example/settings && /usr/bin/git -C "$workspace" commit -qm resolve || exit 1
-if expect_ok run_dots "$b" sync --continue && test "$(cat "$b/.config/example/settings")" = one && test ! -e "$workspace"; then pass "conflict workspace continuation"; else fail "conflict workspace continuation"; fi
+clash_remote=$(/usr/bin/git --git-dir="$remote" rev-parse main)
+cancel_before=$(/usr/bin/git --git-dir="$TMP/home-clash-cancel/data/repo.git" rev-parse HEAD)
+cancel_out=$(run_sync "$TMP/home-clash-cancel" '' 2>&1)
+if printf '%s' "$cancel_out" | grep -F '.config/example/settings: changed both here and in the repository' >/dev/null && test "$(cat "$TMP/home-clash-cancel/.config/example/settings")" = two && test "$(/usr/bin/git --git-dir="$TMP/home-clash-cancel/data/repo.git" rev-parse HEAD)" = "$cancel_before"; then pass "clash: cancelling changes nothing"; else fail "clash: cancelling changes nothing"; fi
+# 1 takes the repository's version and backs yours up.
+if run_sync "$TMP/home-clash-take" $'1\n' >/dev/null 2>&1 && test "$(cat "$TMP/home-clash-take/.config/example/settings")" = one && test "$(cat "$(find "$TMP/home-clash-take/data/backups" -path '*sync-*/.config/example/settings' -type f | head -1)")" = two && test "$(/usr/bin/git --git-dir="$TMP/home-clash-take/data/repo.git" rev-parse HEAD)" = "$clash_remote"; then pass "clash: use the repository's version backs yours up"; else fail "clash: use the repository's version backs yours up"; fi
+# 2 keeps yours as an edit on top of the latest revision, ready for update.
+keep_sync=$(run_sync "$TMP/home-clash-keep" $'2\n' 2>&1)
+keep_status=$(run_dots "$TMP/home-clash-keep" status 2>&1)
+if test "$(cat "$TMP/home-clash-keep/.config/example/settings")" = two && test "$(/usr/bin/git --git-dir="$TMP/home-clash-keep/data/repo.git" rev-parse HEAD)" = "$clash_remote" && printf '%s' "$keep_status" | grep -Fx 'this Mac: up to date' >/dev/null && printf '%s\n' "$keep_status" | grep -A1 -F 'edited here, not in the repository yet' | grep -F '.config/example/settings' >/dev/null && printf '%s' "$keep_sync" | grep -F 'run dots update' >/dev/null; then pass "clash: keep yours stays up to date with your edit"; else fail "clash: keep yours stays up to date with your edit"; fi
+# A leftover merge folder from an older version is refused, and --continue explains the change.
+mkdir -p "$TMP/home-clash-keep/data/conflict-workspace"
+if ! run_sync "$TMP/home-clash-keep" '' 2>&1 | grep -F 'unfinished merge from an older dots version' >/dev/null; then fail "old merge folder is refused"; else pass "old merge folder is refused"; fi
+rmdir "$TMP/home-clash-keep/data/conflict-workspace"
+if ! (run_dots "$TMP/home-clash-keep" sync --continue) >"$TMP/continue.out" 2>&1 && grep -F 'merging was removed' "$TMP/continue.out" >/dev/null; then pass "sync --continue explains it was removed"; else fail "sync --continue explains it was removed"; fi
 
 # Two clean homes can apply an allowlisted remote change without pushing.
 remote=$TMP/two-machine.git; new_remote "$remote"; one=$TMP/home-one; two=$TMP/home-two; mkdir -p "$one" "$two"; expect_ok run_dots "$one" init "$remote" main; expect_ok run_dots "$two" init "$remote" main
@@ -422,7 +431,7 @@ pick_home=$TMP/home-select-pick; mkdir -p "$pick_home"
 run_dots_pty "$pick_home" $'1\n' init "$remote" main >/dev/null 2>&1
 if test ! -e "$pick_home/.zshrc" && test -f "$pick_home/.config/example/settings" && grep -Fx 'skip .zshrc' "$pick_home/data/selection" >/dev/null; then pass "init brings only the chosen files"; else fail "init brings only the chosen files"; fi
 status=$(run_dots "$pick_home" status 2>&1)
-if printf '%s\n' "$status" | grep -Fx 'files used on this Mac: 1 of 2' >/dev/null && printf '%s\n' "$status" | grep -Fx 'tracked configuration changes: none' >/dev/null; then pass "status ignores files this Mac does not use"; else fail "status ignores files this Mac does not use"; fi
+if printf '%s\n' "$status" | grep -Fx 'files used on this Mac: 1 of 2' >/dev/null && printf '%s\n' "$status" | grep -Fx 'edits here: none' >/dev/null; then pass "status ignores files this Mac does not use"; else fail "status ignores files this Mac does not use"; fi
 remote_edit "$remote" "printf 'repo shell 2\\n' > \"\$1/.zshrc\"" || exit 1
 if run_sync "$pick_home" '' >/dev/null 2>&1 && test ! -e "$pick_home/.zshrc" && test "$(/usr/bin/git --git-dir="$pick_home/data/repo.git" rev-parse HEAD)" = "$(/usr/bin/git --git-dir="$remote" rev-parse main)"; then pass "sync skips files this Mac does not use"; else fail "sync skips files this Mac does not use"; fi
 printf 'mine\n' >"$pick_home/.zshrc"
@@ -598,21 +607,23 @@ done
 remote=$TMP/hand-both.git; new_remote "$remote"; both_home=$TMP/home-hand-both; mkdir -p "$both_home"; expect_ok run_dots "$both_home" init "$remote" main
 printf 'mine\n' >"$both_home/.zshrc"; printf '.zshrc\n' >>"$both_home/.config/dots/manifest"
 remote_edit "$remote" "printf '%s\\n' '.config/example/settings' '.zshrc' > \"\$1/.config/dots/manifest\"; printf 'theirs\\n' > \"\$1/.zshrc\"" || exit 1
-if run_sync "$both_home" $'y\n1\n' >/dev/null 2>&1 && test "$(cat "$both_home/.zshrc")" = theirs && test "$(cat "$(find "$both_home/data/backups" -path '*/.zshrc' -type f | head -1)")" = mine && grep -Fx 'use .zshrc' "$both_home/data/selection" >/dev/null; then pass "hand-added path also shared remotely is backed up"; else fail "hand-added path also shared remotely is backed up"; fi
-# Declining it keeps the local copy, even when a conflict is continued later.
+if run_sync "$both_home" $'1\n' >/dev/null 2>&1 && test "$(cat "$both_home/.zshrc")" = theirs && test "$(cat "$(find "$both_home/data/backups" -path '*/.zshrc' -type f | head -1)")" = mine && grep -Fx 'use .zshrc' "$both_home/data/selection" >/dev/null; then pass "hand-added path also shared remotely is backed up"; else fail "hand-added path also shared remotely is backed up"; fi
+# Keeping it keeps the local copy as an edit, while other files still catch up.
 remote=$TMP/hand-decline.git; new_remote "$remote"; hd_home=$TMP/home-hand-decline; mkdir -p "$hd_home"; expect_ok run_dots "$hd_home" init "$remote" main
 printf 'mine\n' >"$hd_home/.zshrc"; printf '.zshrc\n' >>"$hd_home/.config/dots/manifest"; printf two >"$hd_home/.config/example/settings"
 remote_edit "$remote" "printf '%s\\n' '.config/example/settings' '.zshrc' > \"\$1/.config/dots/manifest\"; printf 'theirs\\n' > \"\$1/.zshrc\"; printf one > \"\$1/.config/example/settings\"" || exit 1
-run_sync "$hd_home" $'n\n4\n' >/dev/null 2>&1
-hd_workspace=$hd_home/data/conflict-workspace
-if test -d "$hd_workspace/.git" && /usr/bin/git -C "$hd_workspace" checkout --theirs -- .config/example/settings && /usr/bin/git -C "$hd_workspace" add -- .config/example/settings && /usr/bin/git -C "$hd_workspace" commit -qm resolve && (run_dots "$hd_home" sync --continue) >/dev/null 2>&1 && test "$(cat "$hd_home/.zshrc")" = mine && grep -Fx 'skip .zshrc' "$hd_home/data/selection" >/dev/null; then pass "declined hand-added path stays local after sync --continue"; else fail "declined hand-added path stays local after sync --continue"; fi
-# A hand-added path stays used across a conflict and sync --continue.
+run_sync "$hd_home" $'1\n2\n' >/dev/null 2>&1
+if test "$(cat "$hd_home/.zshrc")" = mine && test "$(cat "$hd_home/.config/example/settings")" = one && grep -Fx 'use .zshrc' "$hd_home/data/selection" >/dev/null && test "$(/usr/bin/git --git-dir="$hd_home/data/repo.git" rev-parse HEAD)" = "$(/usr/bin/git --git-dir="$remote" rev-parse main)"; then pass "clash choices apply per file"; else fail "clash choices apply per file"; fi
+# A hand-added path survives catching up: the manifest keeps its line, the file stays.
 remote=$TMP/hand-conflict.git; new_remote "$remote"; hc_home=$TMP/home-hand-conflict; mkdir -p "$hc_home"; expect_ok run_dots "$hc_home" init "$remote" main
-printf 'ext\n' >"$hc_home/.handext.ts"; printf '.handext.ts\n' >>"$hc_home/.config/dots/manifest"; printf two >"$hc_home/.config/example/settings"
+printf 'ext\n' >"$hc_home/.handext.ts"; printf '.handext.ts\n' >>"$hc_home/.config/dots/manifest"
 remote_edit "$remote" "printf one > \"\$1/.config/example/settings\"" || exit 1
-run_sync "$hc_home" $'4\n' >/dev/null 2>&1
-hc_workspace=$hc_home/data/conflict-workspace
-if test -d "$hc_workspace/.git" && /usr/bin/git -C "$hc_workspace" checkout --theirs -- .config/example/settings && /usr/bin/git -C "$hc_workspace" add -- .config/example/settings && /usr/bin/git -C "$hc_workspace" commit -qm resolve && (run_dots "$hc_home" sync --continue) >/dev/null 2>&1 && grep -Fx 'use .handext.ts' "$hc_home/data/selection" >/dev/null && test "$(cat "$hc_home/.handext.ts")" = ext; then pass "hand-added path survives sync --continue"; else fail "hand-added path survives sync --continue"; fi
+run_sync "$hc_home" '' >/dev/null 2>&1
+if test "$(cat "$hc_home/.config/example/settings")" = one && grep -Fx .handext.ts "$hc_home/.config/dots/manifest" >/dev/null && test "$(cat "$hc_home/.handext.ts")" = ext && run_dots "$hc_home" status 2>&1 | grep -Fx '  .handext.ts' >/dev/null; then pass "hand-added path survives catching up"; else fail "hand-added path survives catching up"; fi
+# Both sides adding manifest lines are merged: the repository's lines plus the ones added here.
+remote_edit "$remote" "printf '%s\\n' '.config/example/settings' '.config/example/other' > \"\$1/.config/dots/manifest\"; printf other > \"\$1/.config/example/other\"" || exit 1
+run_sync "$hc_home" $'\n' >/dev/null 2>&1
+if grep -Fx .handext.ts "$hc_home/.config/dots/manifest" >/dev/null && grep -Fx .config/example/other "$hc_home/.config/dots/manifest" >/dev/null && test "$(cat "$hc_home/.config/example/other")" = other; then pass "manifest edits on both sides are merged"; else fail "manifest edits on both sides are merged"; fi
 
 # After this Mac's own update is merged, its local changes are already in the repository:
 # sync fast-forwards without asking, and changes that differ still bring up the menu.
@@ -620,15 +631,17 @@ remote=$TMP/own-merged.git; new_remote "$remote"; om_home=$TMP/home-own-merged; 
 printf 'shell\n' >"$om_home/.zshrc"; printf '.zshrc\n' >>"$om_home/.config/dots/manifest"
 remote_edit "$remote" "printf '%s\\n' '.config/example/settings' '.zshrc' > \"\$1/.config/dots/manifest\"; printf 'shell\\n' > \"\$1/.zshrc\"" || exit 1
 om_out=$(run_sync "$om_home" '' 2>&1)
-if printf '%s' "$om_out" | grep -F 'already in the repository' >/dev/null && ! printf '%s' "$om_out" | grep -F 'Choose [1-4]' >/dev/null && run_dots "$om_home" status 2>&1 | grep -F 'ahead 0, behind 0' >/dev/null && run_dots "$om_home" status 2>&1 | grep -Fx 'tracked configuration changes: none' >/dev/null && test ! -e "$om_home/data/backups"; then pass "sync skips the menu for changes already merged"; else fail "sync skips the menu for changes already merged"; fi
+om_status=$(run_dots "$om_home" status 2>&1)
+if ! printf '%s' "$om_out" | grep -F -e 'Choose [1-2]' -e 'edited here' >/dev/null && printf '%s' "$om_status" | grep -Fx 'this Mac: up to date' >/dev/null && printf '%s' "$om_status" | grep -Fx 'edits here: none' >/dev/null && test ! -e "$om_home/data/backups"; then pass "sync skips the menu for changes already merged"; else fail "sync skips the menu for changes already merged"; fi
 # A mode-only change (chmod +x) is a real local change, not already merged.
 chmod +x "$om_home/.zshrc"
 remote_edit "$remote" "printf again > \"\$1/.config/example/settings\"" || exit 1
-if run_sync "$om_home" '' 2>&1 | grep -F 'Choose [1-4]' >/dev/null && test -x "$om_home/.zshrc"; then pass "sync asks about a mode-only local change"; else fail "sync asks about a mode-only local change"; fi
+mode_out=$(run_sync "$om_home" '' 2>&1)
+if ! printf '%s' "$mode_out" | grep -F 'Choose [1-2]' >/dev/null && test -x "$om_home/.zshrc" && run_dots "$om_home" status 2>&1 | grep -Fx '  .zshrc' >/dev/null; then pass "sync keeps a mode-only local change as an edit"; else fail "sync keeps a mode-only local change as an edit"; fi
 chmod -x "$om_home/.zshrc"
 printf 'edited again\n' >"$om_home/.zshrc"
 remote_edit "$remote" "printf changed > \"\$1/.config/example/settings\"" || exit 1
-if run_sync "$om_home" '' 2>&1 | grep -F 'Choose [1-4]' >/dev/null && test "$(cat "$om_home/.zshrc")" = 'edited again'; then pass "sync still asks about changes not in the repository"; else fail "sync still asks about changes not in the repository"; fi
+if ! run_sync "$om_home" '' 2>&1 | grep -F 'Choose [1-2]' >/dev/null && test "$(cat "$om_home/.zshrc")" = 'edited again' && test "$(cat "$om_home/.config/example/settings")" = changed; then pass "sync keeps edits the repository did not touch"; else fail "sync keeps edits the repository did not touch"; fi
 
 # update pages: new files first, then shared files, then previously ignored; empty pages are skipped.
 pages_remote=$TMP/update-pages.git; pages_home=$TMP/home-update-pages; mkdir -p "$pages_home"
@@ -642,30 +655,47 @@ pages_out=$(run_update "$pages_home" "$pages_remote" $'\n' 2>&1 | tr -d '\r')
 pages_order=$(printf '%s\n' "$pages_out" | awk '/^(edits to send|new files|shared files|previously ignored) \(.*\):$/ { h = $0; sub(/ \(.*/, "", h); printf "%s:|", h }')
 if test "$pages_order" = 'shared files:|previously ignored:|'; then pass "update skips the new page when nothing is new"; else fail "update skips the new page when nothing is new ($pages_order)"; fi
 
-# update refuses to run while this Mac is behind the repository, before any checklist.
+# update catches up first when nothing clashes, and says so; new files are left for sync.
 behind_remote=$TMP/update-behind.git; behind_home=$TMP/home-update-behind; mkdir -p "$behind_home"
 run_derived_default_init "$behind_home" "$behind_remote" $'y\n' >/dev/null 2>&1 || exit 1
 remote_edit "$behind_remote" "printf '%s\\n' '.zshrc' > \"\$1/.config/dots/manifest\"; printf shell > \"\$1/.zshrc\"" || exit 1
-behind_out=$(run_update "$behind_home" "$behind_remote" $'1\ny\nTitle\n' 2>&1)
-if printf '%s' "$behind_out" | grep -F 'Run dots sync first' >/dev/null && ! printf '%s' "$behind_out" | grep -F -e 'Toggle numbers' -e 'PR title' >/dev/null && test -z "$(/usr/bin/git --git-dir="$behind_remote" for-each-ref 'refs/heads/dots/update-*')"; then pass "update asks to sync first when behind"; else fail "update asks to sync first when behind"; fi
+behind_out=$(run_update "$behind_home" "$behind_remote" $'\n' 2>&1)
+if printf '%s' "$behind_out" | grep -F 'run dots sync to choose whether to use them' >/dev/null && test "$(/usr/bin/git --git-dir="$behind_home/data/repo.git" rev-parse HEAD)" = "$(/usr/bin/git --git-dir="$behind_remote" rev-parse main)" && test -z "$(/usr/bin/git --git-dir="$behind_remote" for-each-ref 'refs/heads/dots/update-*')"; then pass "update catches up before its checklist"; else fail "update catches up before its checklist"; fi
+# The owner's sequence: send one edit, keep another local, merge the PR, update again.
+seq_remote=$TMP/update-sequence.git; seq_home=$TMP/home-update-sequence; mkdir -p "$seq_home"
+run_derived_default_init "$seq_home" "$seq_remote" $'y\n' >/dev/null 2>&1 || exit 1
+remote_edit "$seq_remote" "printf '%s\\n' '.gitconfig' '.zshrc' > \"\$1/.config/dots/manifest\"; printf git > \"\$1/.gitconfig\"; printf shell > \"\$1/.zshrc\"" || exit 1
+run_sync "$seq_home" $'\n' >/dev/null 2>&1
+printf 'git 2' >"$seq_home/.gitconfig"; printf 'shell 2' >"$seq_home/.zshrc"
+run_update "$seq_home" "$seq_remote" $'1\nSend shell\n' >/dev/null 2>&1
+seq_ref=$(/usr/bin/git --git-dir="$seq_remote" for-each-ref --format='%(refname)' 'refs/heads/dots/update-*' | head -1)
+test -n "$seq_ref" && /usr/bin/git --git-dir="$seq_remote" update-ref refs/heads/main "$seq_ref" && /usr/bin/git --git-dir="$seq_remote" update-ref -d "$seq_ref"
+seq_status=$(run_dots "$seq_home" status 2>&1)
+seq_out=$(run_update "$seq_home" "$seq_remote" $'\n' 2>&1 | tr -d '\r')
+if printf '%s\n' "$seq_status" | grep -A1 -F 'edited here' | grep -Fx '  .gitconfig' >/dev/null && ! printf '%s\n' "$seq_status" | grep -Fx '  .zshrc' >/dev/null && ! printf '%s' "$seq_out" | grep -F -e 'sync first' -e 'Choose [1-2]' >/dev/null && printf '%s' "$seq_out" | grep -F '.gitconfig  (changed)' >/dev/null && ! printf '%s' "$seq_out" | grep -F '.zshrc  (changed)' >/dev/null && test "$(cat "$seq_home/.gitconfig")" = 'git 2'; then pass "update after merging part of your edits just works"; else fail "update after merging part of your edits just works"; fi
+# With a file changed on both sides, update stops and names it, changing nothing.
+uc_remote=$TMP/update-clash.git; uc_home=$TMP/home-update-clash; mkdir -p "$uc_home"
+run_derived_default_init "$uc_home" "$uc_remote" $'y\n' >/dev/null 2>&1 || exit 1
+remote_edit "$uc_remote" "printf '%s\\n' '.zshrc' > \"\$1/.config/dots/manifest\"; printf base > \"\$1/.zshrc\"" || exit 1
+run_sync "$uc_home" $'\n' >/dev/null 2>&1
+printf mine >"$uc_home/.zshrc"
+remote_edit "$uc_remote" "printf theirs > \"\$1/.zshrc\"" || exit 1
+uc_before=$(/usr/bin/git --git-dir="$uc_home/data/repo.git" rev-parse HEAD)
+uc_out=$(run_update "$uc_home" "$uc_remote" $'\n' 2>&1)
+if printf '%s' "$uc_out" | grep -F 'changed both here and in the repository' >/dev/null && printf '%s' "$uc_out" | tr -d '\r' | grep -Fx '  .zshrc' >/dev/null && ! printf '%s' "$uc_out" | grep -F 'Toggle numbers' >/dev/null && test "$(cat "$uc_home/.zshrc")" = mine && test "$(/usr/bin/git --git-dir="$uc_home/data/repo.git" rev-parse HEAD)" = "$uc_before"; then pass "update stops on a clash"; else fail "update stops on a clash"; fi
 
-# sync's menu offers a PR only when up to date, and merging only when behind.
+# With nothing new anywhere, sync just says so.
 remote=$TMP/menu-shape.git; new_remote "$remote"; menu_home=$TMP/home-menu-shape; mkdir -p "$menu_home"; expect_ok run_dots "$menu_home" init "$remote" main
-printf local >"$menu_home/.config/example/settings"
-menu_out=$(run_sync "$menu_home" '' 2>&1)
-if printf '%s' "$menu_out" | grep -F '3. Create a PR' >/dev/null && ! printf '%s' "$menu_out" | grep -F '4. Merge' >/dev/null; then pass "sync offers a PR when up to date"; else fail "sync offers a PR when up to date"; fi
-remote_edit "$remote" "printf remote > \"\$1/.config/example/settings\"" || exit 1
-menu_out=$(run_sync "$menu_home" $'3\n' 2>&1)
-if printf '%s' "$menu_out" | grep -F '4. Merge' >/dev/null && ! printf '%s' "$menu_out" | grep -F '3. Create a PR' >/dev/null && printf '%s' "$menu_out" | grep -F 'choose 4 to merge' >/dev/null && test "$(cat "$menu_home/.config/example/settings")" = local; then pass "sync offers merging, not a PR, when behind"; else fail "sync offers merging, not a PR, when behind"; fi
+if run_sync "$menu_home" '' 2>&1 | tr -d '\r' | grep -Fx 'this Mac is up to date' >/dev/null; then pass "sync reports up to date"; else fail "sync reports up to date"; fi
 
 # Paths resolve against HOME whatever the current folder, including a folder inside HOME.
 remote=$TMP/any-folder.git; new_remote "$remote"; af_home=$TMP/home-any-folder; mkdir -p "$af_home/projects/sub"; expect_ok run_dots "$af_home" init "$remote" main
 printf edited >"$af_home/.config/example/settings"
 af_status=$( (cd "$af_home/projects/sub" && HOME=$af_home DOTS_DATA_DIR=$af_home/data DOTS_GITLEAKS=$MOCK "$DOTS" status) 2>&1)
-if printf '%s' "$af_status" | grep -F ' M .config/example/settings' >/dev/null; then pass "status sees changes from a folder inside HOME"; else fail "status sees changes from a folder inside HOME"; fi
+if printf '%s\n' "$af_status" | grep -A1 -F 'edited here' | grep -Fx '  .config/example/settings' >/dev/null; then pass "status sees changes from a folder inside HOME"; else fail "status sees changes from a folder inside HOME"; fi
 remote_edit "$remote" "printf remote > \"\$1/.config/example/settings\"" || exit 1
 af_sync=$( (cd "$af_home/projects/sub" && run_sync "$af_home" '') 2>&1)
-if printf '%s' "$af_sync" | grep -F 'Choose [1-4]' >/dev/null && test "$(cat "$af_home/.config/example/settings")" = edited; then pass "sync sees local changes from a folder inside HOME"; else fail "sync sees local changes from a folder inside HOME"; fi
+if printf '%s' "$af_sync" | grep -F 'changed both here and in the repository' >/dev/null && test "$(cat "$af_home/.config/example/settings")" = edited; then pass "sync sees local changes from a folder inside HOME"; else fail "sync sees local changes from a folder inside HOME"; fi
 # init and select check files out into HOME, not into the current folder.
 af2_home=$TMP/home-any-folder-init; mkdir -p "$af2_home/sub"
 (cd "$af2_home/sub" && HOME=$af2_home DOTS_DATA_DIR=$af2_home/data DOTS_GITLEAKS=$MOCK "$DOTS" init "$remote" main) >/dev/null 2>&1
@@ -692,14 +722,14 @@ run_update "$edit_home" "$edit_remote" $'1\ny\nShare shell\n' >/dev/null 2>&1
 edit_ref=$(/usr/bin/git --git-dir="$edit_remote" for-each-ref --format='%(refname)' 'refs/heads/dots/update-*' | head -1)
 test -n "$edit_ref" && /usr/bin/git --git-dir="$edit_remote" update-ref refs/heads/main "$edit_ref"
 printf 'v2\n' >"$edit_home/.zshrc"
-if run_sync "$edit_home" $'n\n' >/dev/null 2>&1 && test "$(cat "$edit_home/.zshrc")" = v2 && grep -Fx 'skip .zshrc' "$edit_home/data/selection" >/dev/null; then pass "edited own file is confirmed, not a stuck sync"; else fail "edited own file is confirmed, not a stuck sync"; fi
+if run_sync "$edit_home" $'2\n' >/dev/null 2>&1 && test "$(cat "$edit_home/.zshrc")" = v2 && grep -Fx 'use .zshrc' "$edit_home/data/selection" >/dev/null && test "$(/usr/bin/git --git-dir="$edit_home/data/repo.git" rev-parse HEAD)" = "$(/usr/bin/git --git-dir="$edit_remote" rev-parse main)"; then pass "edited own file is asked about, not a stuck sync"; else fail "edited own file is asked about, not a stuck sync"; fi
 
 # A pending file that reaches the manifest by a manual edit is confirmed and backed up, not a stuck sync.
 remote=$TMP/pending-manual.git; new_remote "$remote"; manual_home=$TMP/home-pending-manual; mkdir -p "$manual_home"; expect_ok run_dots "$manual_home" init "$remote" main
 remote_edit "$remote" "printf '%s\\n' '.config/example/settings' '.zshrc' > \"\$1/.config/dots/manifest\"; printf 'theirs\\n' > \"\$1/.zshrc\"" || exit 1
 printf 'pending .zshrc\n' >>"$manual_home/data/selection"
 printf '%s\n' '.config/example/settings' '.zshrc' >"$manual_home/.config/dots/manifest"; printf 'mine\n' >"$manual_home/.zshrc"
-if run_sync "$manual_home" $'y\n1\n' >/dev/null 2>&1 && test "$(cat "$manual_home/.zshrc")" = theirs && test "$(cat "$(find "$manual_home/data/backups" -path '*/.zshrc' -type f | head -1)")" = mine; then pass "manually listed pending file is confirmed and backed up"; else fail "manually listed pending file is confirmed and backed up"; fi
+if run_sync "$manual_home" $'1\n' >/dev/null 2>&1 && test "$(cat "$manual_home/.zshrc")" = theirs && test "$(cat "$(find "$manual_home/data/backups" -path '*/.zshrc' -type f | head -1)")" = mine; then pass "manually listed pending file is confirmed and backed up"; else fail "manually listed pending file is confirmed and backed up"; fi
 
 # Update: unticking a shared file removes it from the repository only; files this Mac skips keep their repository version.
 remote=$TMP/update-remove.git; new_remote "$remote"
@@ -718,27 +748,27 @@ else
   fail "update removes unticked files and keeps skipped ones"
 fi
 
-# Accepting a new repository file whose local copy differs asks first; yes backs it up, no leaves it unused.
+# Accepting a new repository file whose local copy differs asks: 1 backs yours up, 2 keeps it as an edit.
 remote=$TMP/sync-differing.git; new_remote "$remote"
 yes_home=$TMP/home-sync-differing-yes; no_home=$TMP/home-sync-differing-no; mkdir -p "$yes_home" "$no_home"
 expect_ok run_dots "$yes_home" init "$remote" main; expect_ok run_dots "$no_home" init "$remote" main
 printf 'mine\n' >"$yes_home/.zshrc"; printf 'mine\n' >"$no_home/.zshrc"
 remote_edit "$remote" "printf '%s\\n' '.config/example/settings' '.zshrc' > \"\$1/.config/dots/manifest\"; printf 'theirs\\n' > \"\$1/.zshrc\"" || exit 1
-if run_sync "$yes_home" $'\ny\n' >/dev/null 2>&1 && test "$(cat "$yes_home/.zshrc")" = theirs && test "$(cat "$(find "$yes_home/data/backups" -path '*sync-*/.zshrc' -type f | head -1)")" = mine; then pass "sync backs up a differing local copy after confirmation"; else fail "sync backs up a differing local copy after confirmation"; fi
-if run_sync "$no_home" $'\nn\n' >/dev/null 2>&1 && test "$(cat "$no_home/.zshrc")" = mine && grep -Fx 'skip .zshrc' "$no_home/data/selection" >/dev/null; then pass "sync leaves a differing local copy when declined"; else fail "sync leaves a differing local copy when declined"; fi
-# Keeping local changes does not save choices about new files; they are offered again.
-remote_edit "$remote" "printf '%s\\n' '.config/example/settings' '.zshrc' '.config/example/later' > \"\$1/.config/dots/manifest\"; printf later > \"\$1/.config/example/later\"" || exit 1
+if run_sync "$yes_home" $'\n1\n' >/dev/null 2>&1 && test "$(cat "$yes_home/.zshrc")" = theirs && test "$(cat "$(find "$yes_home/data/backups" -path '*sync-*/.zshrc' -type f | head -1)")" = mine; then pass "sync backs up a differing local copy after confirmation"; else fail "sync backs up a differing local copy after confirmation"; fi
+if run_sync "$no_home" $'\n2\n' >/dev/null 2>&1 && test "$(cat "$no_home/.zshrc")" = mine && grep -Fx 'use .zshrc' "$no_home/data/selection" >/dev/null; then pass "sync keeps a differing local copy when chosen"; else fail "sync keeps a differing local copy when chosen"; fi
+# A cancelled sync does not save choices about new files; they are offered again.
+remote_edit "$remote" "printf '%s\\n' '.config/example/settings' '.zshrc' '.config/example/later' > \"\$1/.config/dots/manifest\"; printf later > \"\$1/.config/example/later\"; printf theirs > \"\$1/.config/example/settings\"" || exit 1
 printf 'dirty\n' >"$yes_home/.config/example/settings"
-run_sync "$yes_home" $'\n2\n' >/dev/null 2>&1
-if ! grep -F '.config/example/later' "$yes_home/data/selection" >/dev/null && run_sync "$yes_home" $'\n2\n' 2>&1 | grep -F 'New files in the repository' >/dev/null; then pass "kept local changes leave new files unanswered"; else fail "kept local changes leave new files unanswered"; fi
-# A local-only merge keeps the repository version of files this Mac does not use.
+run_sync "$yes_home" $'\n' >/dev/null 2>&1
+if ! grep -F '.config/example/later' "$yes_home/data/selection" >/dev/null && run_sync "$yes_home" $'\n' 2>&1 | grep -F 'New files in the repository' >/dev/null; then pass "cancelled sync leaves new files unanswered"; else fail "cancelled sync leaves new files unanswered"; fi
+# Catching up leaves files this Mac does not use alone, while keeping edits.
 remote=$TMP/merge-unused.git; new_remote "$remote"
 remote_edit "$remote" "printf '%s\\n' '.config/example/settings' '.zshrc' > \"\$1/.config/dots/manifest\"; printf 'shell\\n' > \"\$1/.zshrc\"" || exit 1
 merge_home=$TMP/home-merge-unused; mkdir -p "$merge_home"
 run_dots_pty "$merge_home" $'1\n' init "$remote" main >/dev/null 2>&1
 printf 'local\n' >"$merge_home/.config/example/settings"
 remote_edit "$remote" "printf 'shell 2\\n' > \"\$1/.zshrc\"" || exit 1
-if run_sync "$merge_home" $'4\n' >/dev/null 2>&1 && test ! -e "$merge_home/.zshrc" && test "$(cat "$merge_home/.config/example/settings")" = local && test "$(/usr/bin/git --git-dir="$merge_home/data/repo.git" show HEAD:.zshrc)" = 'shell 2'; then pass "local merge keeps files this Mac does not use"; else fail "local merge keeps files this Mac does not use"; fi
+if run_sync "$merge_home" '' >/dev/null 2>&1 && test ! -e "$merge_home/.zshrc" && test "$(cat "$merge_home/.config/example/settings")" = local && test "$(/usr/bin/git --git-dir="$merge_home/data/repo.git" show HEAD:.zshrc)" = 'shell 2'; then pass "catching up leaves files this Mac does not use"; else fail "catching up leaves files this Mac does not use"; fi
 # select can stop using a file: later repository changes leave the local copy alone.
 remote=$TMP/select-stop.git; new_remote "$remote"; stop_home=$TMP/home-select-stop; mkdir -p "$stop_home"; expect_ok run_dots "$stop_home" init "$remote" main
 if run_dots_pty "$stop_home" $'1\n' select >/dev/null 2>&1 && grep -Fx 'skip .config/example/settings' "$stop_home/data/selection" >/dev/null; then pass "select stops using a file"; else fail "select stops using a file"; fi
@@ -786,7 +816,7 @@ if expect_fail run_dots "$reserved_home" init "$remote" main; then pass "reposit
 remote=$TMP/status-divergence.git; new_remote "$remote"; status_home=$TMP/home-status-divergence; mkdir -p "$status_home"; expect_ok run_dots "$status_home" init "$remote" main
 remote_edit "$remote" "printf remote > \"\$1/.config/example/settings\"" || exit 1
 status=$(run_dots "$status_home" status 2>&1)
-if printf '%s\n' "$status" | grep -Fx 'initialized: yes' >/dev/null && printf '%s\n' "$status" | grep -Fx 'divergence: ahead 0, behind 1' >/dev/null; then pass "status divergence"; else fail "status divergence"; fi
+if printf '%s\n' "$status" | grep -Fx 'this Mac: 1 repository update(s) not synced yet (run dots sync)' >/dev/null && printf '%s\n' "$status" | grep -A1 -F 'changed in the repository, not here yet' | grep -Fx '  .config/example/settings' >/dev/null; then pass "status shows repository changes"; else fail "status shows repository changes"; fi
 
 # An incoming file this Mac already chose (for example shared by its own update, then
 # edited again) cannot overwrite a differing live file.

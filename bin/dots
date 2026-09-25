@@ -41,7 +41,6 @@ Usage:
   dots init [remote] [branch]  connect this Mac to your dotfiles repository (once per Mac)
     --backup-existing          back up differing local files, then use the repository's
     --discover                 only list the files dots would suggest
-  dots sync --continue         finish a merge that stopped on a conflict
 EOF
 }
 
@@ -432,51 +431,6 @@ validate_current_state() {
   append_unique_list "$temp/live-paths" "$temp/all-paths"
 }
 
-# "x" when a file is executable, "-" otherwise; Git tracks only this part of the mode.
-exec_bit() { if test -x "$1"; then printf x; else printf -- -; fi; }
-
-# True when every path that differs locally from HEAD (content or executable bit)
-# matches the remote workspace exactly, or is absent in both.
-changes_already_in_remote() {
-  while IFS= read -r path; do
-    live=$DOTS_HOME/$path
-    if git_repo cat-file -e "HEAD:$path" 2>/dev/null; then
-      case $(git_repo ls-tree HEAD -- "$path" | cut -d ' ' -f 1) in 100755) head_bit=x ;; *) head_bit=- ;; esac
-      if test -f "$live" && test ! -L "$live" && test "$(exec_bit "$live")" = "$head_bit" && git_repo cat-file blob "HEAD:$path" | cmp -s - "$live"; then continue; fi
-    else
-      test -e "$live" || test -L "$live" || continue
-    fi
-    if test -e "$2/$path"; then
-      test -f "$live" && test ! -L "$live" && test "$(exec_bit "$live")" = "$(exec_bit "$2/$path")" && cmp -s "$2/$path" "$live" || return 1
-    else
-      test ! -e "$live" && test ! -L "$live" || return 1
-    fi
-  done <"$1"
-  return 0
-}
-
-show_changes() {
-  paths=$1
-  changes=$2
-  # Construct one argv entry per approved path, never a broad pathspec.
-  : >"$changes"
-  set --
-  while IFS= read -r path; do set -- "$@" "$path"; done <"$paths"
-  git_repo status --porcelain --untracked-files=all -- "$@" >"$changes" || return 2
-  test -s "$changes"
-}
-
-show_change_summary() {
-  paths=$1
-  changes=$2
-  say "Approved changes (content is intentionally not printed):"
-  cat "$changes"
-  # Untracked files are represented by status above. Git's name-status covers tracked diffs.
-  set --
-  while IFS= read -r path; do set -- "$@" "$path"; done <"$paths"
-  git_repo diff --name-status -- "$@" || return 1
-}
-
 stage_approved_paths() {
   old=$1
   new=$2
@@ -517,11 +471,23 @@ github_repository_from_gh() {
 
 enable_gh_git_credentials() {
   # We ignore a managed ~/.gitconfig, but gh's credential helper is still needed
-  # for the account-derived HTTPS remote. Git 2.18+ supports this env interface.
-  GIT_CONFIG_COUNT=1
+  # for the account-derived HTTPS remote. The empty value first clears helpers from
+  # the system config (the macOS Keychain helper fails when the Keychain will not
+  # answer a background process), so only gh is asked. Git 2.18+ supports this.
+  GIT_CONFIG_COUNT=2
   GIT_CONFIG_KEY_0=credential.helper
-  GIT_CONFIG_VALUE_0='!gh auth git-credential'
-  export GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+  GIT_CONFIG_VALUE_0=
+  GIT_CONFIG_KEY_1=credential.helper
+  GIT_CONFIG_VALUE_1='!gh auth git-credential'
+  export GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 GIT_CONFIG_KEY_1 GIT_CONFIG_VALUE_1
+}
+
+# Fetch the tracked branch from origin, with gh's credentials for a GitHub origin.
+fetch_origin() {
+  case $(git_repo remote get-url origin 2>/dev/null) in
+    https://github.com/*) command -v gh >/dev/null 2>&1 && enable_gh_git_credentials ;;
+  esac
+  git_repo fetch --no-tags origin "refs/heads/$1:refs/remotes/origin/$1" >/dev/null 2>&1
 }
 
 # A newly created remote needs one safe, versioned object before init can validate it.
@@ -1022,11 +988,6 @@ configure_sandbox_identity() {
   test -z "$email" || "$GIT" -C "$sandbox" config user.email "$email" || return 1
 }
 
-configure_merge_identity() {
-  "$GIT" -C "$1" config user.name "dots temporary merge" || return 1
-  "$GIT" -C "$1" config user.email "dots@local.invalid"
-}
-
 prepare_local_sandbox() {
   sandbox=$1
   live_paths=$3
@@ -1058,48 +1019,12 @@ prepare_local_sandbox() {
   "$GIT" -C "$sandbox" add -A -- "$@"
 }
 
-copy_sandbox_paths_to_home() {
-  sandbox=$1
-  paths=$2
-  while IFS= read -r path; do
-    safe_live_path "$path" || return 1
-    test -f "$sandbox/$path" && test ! -L "$sandbox/$path" || return 1
-    mkdir -p "$DOTS_HOME/$(dirname "$path")" || return 1
-    cp -p "$sandbox/$path" "$DOTS_HOME/$path" || return 1
-  done <"$paths"
-}
-
 advance_to_remote_revision() {
   branch=$1
   remote=$2
   git_repo update-ref "refs/heads/$branch" "$remote" || return 1
   git_repo symbolic-ref HEAD "refs/heads/$branch" || return 1
   git_repo read-tree "$remote"
-}
-
-# Decide how incoming files reach HOME. Files already managed here were covered by
-# the local-change check. A new or newly chosen file may replace a live file only
-# when identical, or, when the user just chose it, after a backup.
-plan_apply() {
-  gitdir=$1
-  base=$2
-  temp=$3
-  git_dir "$gitdir" ls-tree -r --name-only "$base" >"$temp/base-names" || return 1
-  : >"$temp/backup-paths"
-  while IFS= read -r path; do
-    test "$path" = "$MANIFEST" && continue
-    safe_live_path "$path" || return 1
-    if path_in_list "$path" "$temp/base-names" && ! path_in_list "$path" "$temp/newly-used"; then continue; fi
-    test -e "$DOTS_HOME/$path" || test -L "$DOTS_HOME/$path" || continue
-    test -f "$DOTS_HOME/$path" && test ! -L "$DOTS_HOME/$path" || return 1
-    # Compare against the workspace copy, which is exactly what will be written.
-    incoming=${gitdir%/.git}/$path
-    test -f "$incoming" && test ! -L "$incoming" || return 1
-    cmp -s "$incoming" "$DOTS_HOME/$path" && continue
-    path_in_list "$path" "$temp/newly-used" || return 1
-    printf '%s\n' "$path" >>"$temp/backup-paths"
-  done <"$temp/apply-paths"
-  return 0
 }
 
 init_command() {
@@ -1226,6 +1151,177 @@ init_command() {
   say "initialized $branch at $revision"
 }
 
+# ── Catching up ─────────────────────────────────────────────
+# Each file is compared three ways: on this Mac, at the revision this Mac last synced
+# (base), and in the repository (remote). A state is "<mode> <blob>", or "-" when the
+# file is absent; only Git's mode (executable bit) and content count.
+
+# $1 path list, $2 output of "state<TAB>path" lines for this Mac's files.
+live_states() {
+  : >"$2.present" && : >"$2.modes" || return 1
+  while IFS= read -r ls_path; do
+    ls_file=$DOTS_HOME/$ls_path
+    if test -L "$ls_file"; then return 1
+    elif test -f "$ls_file"; then
+      printf '%s\n' "$ls_path" >>"$2.present"
+      if test -x "$ls_file"; then printf '100755\n'; else printf '100644\n'; fi >>"$2.modes"
+    elif test -e "$ls_file"; then return 1
+    fi
+  done <"$1"
+  : >"$2.blobs"
+  if test -s "$2.present"; then git_repo hash-object --no-filters --stdin-paths <"$2.present" >"$2.blobs" || return 1; fi
+  test "$(list_count "$2.present")" = "$(list_count "$2.blobs")" || return 1
+  paste -d ' ' "$2.modes" "$2.blobs" | paste -d "$TAB" - "$2.present" >"$2.known"
+  awk -F '\t' 'FILENAME == ARGV[1] { state[$2] = $1; next } { print (($0 in state) ? state[$0] : "-") "\t" $0 }' "$2.known" "$1" >"$2"
+  rm -f "$2.present" "$2.modes" "$2.blobs" "$2.known"
+}
+
+# $1 revision, $2 output of "state<TAB>path" lines for every file in it.
+tree_states() {
+  git_repo ls-tree -r "$1" >"$2.raw" || return 1
+  awk -F '\t' '{ split($1, meta, " "); print meta[1] " " meta[3] "\t" $2 }' "$2.raw" >"$2"
+  rm -f "$2.raw"
+}
+
+# classify base remote paths dir: writes dir/{same,incoming,local,clash} path lists,
+# dir/live (this Mac's states, for re-checking later), and dir/states
+# ("live<TAB>base<TAB>remote<TAB>path").
+classify_paths() {
+  mkdir -p "$4" || return 1
+  live_states "$3" "$4/live" || return 1
+  tree_states "$1" "$4/base" || return 1
+  tree_states "$2" "$4/remote" || return 1
+  awk -F '\t' -v dir="$4" '
+    FILENAME == ARGV[1] { b[$2] = $1; next }
+    FILENAME == ARGV[2] { r[$2] = $1; next }
+    {
+      l = $1; p = $2
+      bs = (p in b) ? b[p] : "-"; rs = (p in r) ? r[p] : "-"
+      if (l == rs) c = "same"; else if (l == bs) c = "incoming"; else if (rs == bs) c = "local"; else c = "clash"
+      print p > (dir "/" c)
+      print l "\t" bs "\t" rs "\t" p > (dir "/states")
+    }' "$4/base" "$4/remote" "$4/live" || return 1
+  for cp_kind in same incoming local clash states; do test -f "$4/$cp_kind" || : >"$4/$cp_kind"; done
+}
+
+# The manifest is merged rather than asked about: the repository's lines, minus the
+# ones removed here, plus the ones added here. $1 base list, $2 live list,
+# $3 remote manifest file, $4 output.
+merge_manifest() {
+  list_minus "$1" "$2" "$4.removed" && list_minus "$2" "$1" "$4.added" || return 1
+  awk 'FILENAME == ARGV[1] { removed[$0] = 1; next } !($0 in removed) { print }' "$4.removed" "$3" >"$4" || return 1
+  awk 'FILENAME == ARGV[1] { seen[$0] = 1; next } !($0 in seen)' "$4" "$4.added" >>"$4" || return 1
+  rm -f "$4.removed" "$4.added"
+}
+
+clash_reason() {
+  case $1 in -) printf '%s' "deleted here, changed in the repository"; return ;; esac
+  case $2 in -) printf '%s' "your copy differs from the one in the repository"; return ;; esac
+  printf '%s' "changed both here and in the repository"
+}
+
+# catch_up temp base remote branch ask|refuse
+# Brings this Mac to the remote revision: files not edited here take the repository's
+# version, edits the repository did not touch are kept, and files changed on both
+# sides are asked about one by one (or, with "refuse", reported). Uses temp lists
+# use, skip, pending, remote-manifest, head-manifest, live-manifest; writes the
+# selection. Leaves temp/cu/{brought,kept-edits} for the summary.
+catch_up() {
+  cu=$1/cu
+  list_intersect "$1/remote-manifest" "$1/use" "$1/cu-used"
+  validate_live_paths "$1/cu-used" || fail "a file this Mac uses has an unsafe path on disk; nothing was changed"
+  list_with_manifest "$1/cu-used" "$1/cu-paths"
+  classify_paths "$2" "$3" "$1/cu-paths" "$cu" || fail "could not compare files with the repository; nothing was changed"
+  # The manifest is merged, never asked about.
+  manifest_merge=false
+  if path_in_list "$MANIFEST" "$cu/clash"; then
+    manifest_merge=true
+    printf '%s\n' "$MANIFEST" >"$1/cu-manifest-only"
+    list_minus "$cu/clash" "$1/cu-manifest-only" "$cu/clash.next" && mv -f "$cu/clash.next" "$cu/clash"
+  fi
+  : >"$cu/take" && : >"$cu/keep"
+  if test -s "$cu/clash"; then
+    if test "$5" = refuse; then
+      say "These files changed both here and in the repository:" >&2
+      sed 's/^/  /' "$cu/clash" >&2
+      fail "run dots sync to choose which version to keep, then dots update"
+    fi
+    say "Some files changed both here and in the repository since this Mac last synced."
+    # Answers come from the terminal on fd 4; the loop itself reads the file list.
+    exec 4<&0
+    while IFS= read -r cu_path; do
+      cu_state=$(awk -F '\t' -v p="$cu_path" '$4 == p { print $1 "\t" $2; exit }' "$cu/states")
+      say ""
+      say "$cu_path: $(clash_reason "${cu_state%%"$TAB"*}" "${cu_state#*"$TAB"}")"
+      say "  1. Use the repository's version (yours is backed up first)"
+      say "  2. Keep yours (send it with dots update if it should replace the repository's)"
+      while :; do
+        printf 'Choose [1-2]: ' >&2
+        IFS= read -r cu_choice <&4 || fail "sync cancelled, nothing was changed"
+        case $cu_choice in
+          1) printf '%s\n' "$cu_path" >>"$cu/take"; break ;;
+          2) printf '%s\n' "$cu_path" >>"$cu/keep"; break ;;
+          *) say "type 1 or 2" ;;
+        esac
+      done
+    done <"$cu/clash"
+    exec 4<&-
+  fi
+  # What will be written, and what is backed up first.
+  cat "$cu/incoming" "$cu/take" >"$cu/write"
+  : >"$cu/backup"
+  while IFS= read -r cu_path; do
+    test -e "$DOTS_HOME/$cu_path" && printf '%s\n' "$cu_path" >>"$cu/backup"
+  done <"$cu/take"
+  if test "$manifest_merge" = true; then
+    git_repo cat-file blob "$3:$MANIFEST" >"$1/cu-remote-manifest" || fail "could not read the repository manifest"
+    merge_manifest "$1/head-manifest" "$1/live-manifest" "$1/cu-remote-manifest" "$1/cu-merged-manifest" || fail "could not merge the manifest"
+    validate_manifest_file "$1/cu-merged-manifest" "$1/cu-merged-list" || fail "the merged manifest is unsafe; nothing was changed"
+    printf '%s\n' "$MANIFEST" >>"$cu/backup"
+  fi
+  if test -s "$cu/backup"; then backup_live_files "$cu/backup" sync || fail "could not back up local files; nothing was changed"; fi
+  # Re-checked just before writing, so an edit made meanwhile is never overwritten.
+  cat "$cu/write" >"$cu/recheck"
+  test "$manifest_merge" = false || printf '%s\n' "$MANIFEST" >>"$cu/recheck"
+  if test -s "$cu/recheck"; then
+    live_states "$cu/recheck" "$cu/recheck-now" || fail "a local file changed during sync; nothing was changed, run dots sync again"
+    awk -F '\t' 'FILENAME == ARGV[1] { was[$2] = $1; next } was[$2] != $1 { bad = 1 } END { exit bad }' "$cu/live" "$cu/recheck-now" ||
+      fail "a local file changed during sync; nothing was changed, run dots sync again${BACKUP_DIR:+ (backup: $BACKUP_DIR)}"
+  fi
+  mkdir -p "$1/cu-files" || return 1
+  while IFS= read -r cu_path; do
+    safe_live_path "$cu_path" || fail "unsafe path while writing $cu_path"
+    mkdir -p "$1/cu-files/$(dirname "$cu_path")" "$DOTS_HOME/$(dirname "$cu_path")" || return 1
+    git_repo cat-file blob "$3:$cu_path" >"$1/cu-files/$cu_path" || return 1
+    case $(awk -F '\t' -v p="$cu_path" '$4 == p { print $3; exit }' "$cu/states") in
+      100755*) chmod 755 "$1/cu-files/$cu_path" ;;
+      *) chmod 644 "$1/cu-files/$cu_path" ;;
+    esac
+    cp -p "$1/cu-files/$cu_path" "$DOTS_HOME/$cu_path" || return 1
+  done <"$cu/write"
+  if test "$manifest_merge" = true; then cp "$1/cu-merged-manifest" "$DOTS_HOME/$MANIFEST" || return 1; fi
+  advance_to_remote_revision "$4" "$3" || return 1
+  write_selection "$1/use" "$1/skip" "$1/remote-manifest" "$1/pending" || return 1
+  grep -v -x -F -- "$MANIFEST" "$cu/write" >"$cu/brought" || : >"$cu/brought"
+  cat "$cu/local" "$cu/keep" | grep -v -x -F -- "$MANIFEST" >"$cu/kept-edits" || : >"$cu/kept-edits"
+}
+
+# Print what catching up did, and edits that are still only on this Mac.
+report_catch_up() {
+  test ! -s "$1/cu/brought" || { say "brought in from the repository:"; sed 's/^/  /' "$1/cu/brought"; }
+  list_intersect "$1/head-manifest" "$1/use" "$1/cu-was-used"
+  list_minus "$1/cu-was-used" "$1/remote-manifest" "$1/cu-dropped"
+  test ! -s "$1/cu-dropped" || { say "no longer shared by the repository (kept on this Mac):"; sed 's/^/  /' "$1/cu-dropped"; }
+}
+
+report_local_edits() {
+  if test -s "$1"; then
+    say "edited here, not in the repository yet:"
+    sed 's/^/  /' "$1"
+    say "run dots update to send them"
+  fi
+}
+
 status_command() {
   test $# -eq 0 || { usage >&2; exit 2; }
   require_dependencies
@@ -1234,98 +1330,54 @@ status_command() {
   validate_current_state "$temp" || fail "repository tree or live manifest is unsafe"
   branch=$(current_branch)
   head=$(head_revision) || fail "cannot resolve current revision"
-  git_repo fetch --no-tags origin "refs/heads/$branch:refs/remotes/origin/$branch" >/dev/null 2>&1 || fail "could not fetch remote status"
+  fetch_origin "$branch" || fail "could not reach the repository (check your network and gh auth status)"
   remote=$(git_repo rev-parse "refs/remotes/origin/$branch" 2>/dev/null) || fail "remote branch is unavailable"
-  counts=$(git_repo rev-list --left-right --count "$head...$remote" 2>/dev/null) || fail "cannot compute divergence"
-  set -- $counts
-  say "initialized: yes"
+  validate_tree "$REPO" "$remote" "$temp/remote-manifest" "$temp" || fail "the repository has unsafe changes; dots sync will refuse them"
+  behind=$(git_repo rev-list --count "$head..$remote" 2>/dev/null) || fail "cannot compare with the repository"
   say "branch: $branch"
-  say "revision: $head"
-  say "divergence: ahead $1, behind $2"
+  if test "$behind" -eq 0; then say "this Mac: up to date"; else say "this Mac: $behind repository update(s) not synced yet (run dots sync)"; fi
   say "files used on this Mac: $(list_count "$temp/selected-manifest") of $(list_count "$temp/manifest-union")"
-  if show_changes "$temp/selected-paths" "$temp/changes"; then
-    say "tracked configuration changes:"
-    cat "$temp/changes"
-  else
-    result=$?
-    test "$result" -eq 1 || fail "could not inspect approved configuration changes"
-    say "tracked configuration changes: none"
-  fi
+  # Files this Mac uses here or in the repository, compared three ways.
+  list_intersect "$temp/remote-manifest" "$temp/use" "$temp/remote-used"
+  list_union "$temp/selected-manifest" "$temp/remote-used" "$temp/status-used"
+  list_with_manifest "$temp/status-used" "$temp/status-paths"
+  classify_paths "$head" "$remote" "$temp/status-paths" "$temp/st" || fail "could not compare files with the repository"
+  if test -s "$temp/st/local"; then say "edited here, not in the repository yet:"; sed 's/^/  /' "$temp/st/local"; else say "edits here: none"; fi
+  test ! -s "$temp/st/incoming" || { say "changed in the repository, not here yet:"; sed 's/^/  /' "$temp/st/incoming"; }
+  test ! -s "$temp/st/clash" || { say "changed both here and in the repository (dots sync will ask):"; sed 's/^/  /' "$temp/st/clash"; }
+  list_minus "$temp/remote-manifest" "$temp/use" "$temp/st-unseen-all"
+  list_minus "$temp/st-unseen-all" "$temp/skip" "$temp/st-unseen"
+  test ! -s "$temp/st-unseen" || { say "new in the repository (dots sync will ask whether to use them here):"; sed 's/^/  /' "$temp/st-unseen"; }
 }
 
 fetch_validated_remote() {
   temp=$1
   branch=$2
-  git_repo fetch --no-tags origin "refs/heads/$branch:refs/remotes/origin/$branch" >/dev/null 2>&1 || return 1
+  fetch_origin "$branch" || return 1
   remote=$(git_repo rev-parse "refs/remotes/origin/$branch" 2>/dev/null) || return 1
   validate_tree "$REPO" "$remote" "$temp/remote-manifest" "$temp" || return 1
   scan_git_revision "$REPO" "$remote" || return 1
   printf '%s\n' "$remote"
 }
 
-apply_workspace_result() {
-  workspace=$1
-  tree=$2
-  remote=$3
-  base=$4
-  branch=$5
-  temp=$6
-  validate_tree "$workspace/.git" "$tree" "$temp/result-manifest" "$temp" || return 1
-  scan_directory "$workspace" || return 1
-  if test ! -f "$temp/use"; then
-    load_selection "$temp" "$temp/result-manifest" || return 1
-    # sync --continue: restore choices made about new files before the conflict.
-    if test -f "$workspace/.git/dots-newly-used"; then
-      cat "$workspace/.git/dots-newly-used" >>"$temp/newly-used" || return 1
-      cat "$workspace/.git/dots-newly-used" >>"$temp/use"
-      cat "$workspace/.git/dots-newly-skipped" >>"$temp/skip" 2>/dev/null
-    fi
-    # Paths added to the manifest by hand before the conflict are still used here;
-    # their resolved content may differ from the live copy, which is backed up.
-    if test -f "$workspace/.git/dots-hand-added"; then
-      cat "$workspace/.git/dots-hand-added" >>"$temp/use" || return 1
-      cat "$workspace/.git/dots-hand-added" >>"$temp/newly-used" || return 1
-    fi
-  fi
-  # Only files this Mac uses are written to HOME.
-  list_intersect "$temp/result-manifest" "$temp/use" "$temp/apply-manifest"
-  list_with_manifest "$temp/apply-manifest" "$temp/apply-paths"
-  plan_apply "$workspace/.git" "$base" "$temp" || return 1
-  if test -s "$temp/backup-paths"; then backup_live_files "$temp/backup-paths" sync || return 1; fi
-  copy_sandbox_paths_to_home "$workspace" "$temp/apply-paths" || return 1
-  advance_to_remote_revision "$branch" "$remote" || return 1
-  write_selection "$temp/use" "$temp/skip" "$temp/result-manifest" "$temp/pending"
-}
-
-sync_continue_command() {
-  test $# -eq 1 && test "$1" = --continue || { usage >&2; exit 2; }
-  require_dependencies
-  ensure_initialized
-  workspace=$DOTS_DATA/conflict-workspace
-  test -d "$workspace/.git" || fail "no pending conflict workspace"
-  "$GIT" -C "$workspace" diff --name-only --diff-filter=U | grep . >/dev/null 2>&1 && fail "resolve all conflicts in $workspace before continuing"
-  test -z "$("$GIT" -C "$workspace" status --porcelain)" || fail "commit the conflict resolution in $workspace before continuing"
-  remote=$("$GIT" -C "$workspace" config --get dots.remoteRevision 2>/dev/null || true)
-  base=$("$GIT" -C "$workspace" config --get dots.baseRevision 2>/dev/null || true)
-  test -n "$remote" && test -n "$base" || fail "conflict workspace metadata is unsafe"
-  temp=$(mktemp_dir); trap 'rm -rf "$temp"' EXIT HUP INT TERM
-  branch=$(current_branch)
-  tree=$("$GIT" -C "$workspace" rev-parse 'HEAD^{tree}' 2>/dev/null) || fail "could not read resolved workspace"
-  apply_workspace_result "$workspace" "$tree" "$remote" "$base" "$branch" "$temp" || fail "resolved workspace is unsafe"
-  rm -rf "$workspace"
-  say "resolved merge applied locally, no remote changes were pushed"
+# An unfinished merge from dots 0.2.2 or earlier; merging was removed.
+refuse_old_conflict_workspace() {
+  test ! -e "$DOTS_DATA/conflict-workspace" ||
+    fail "an unfinished merge from an older dots version is in $DOTS_DATA/conflict-workspace. Copy anything you need from it, delete the folder, then run dots sync again"
 }
 
 sync_command() {
-  if test "${1:-}" = --continue; then sync_continue_command "$@"; return; fi
+  if test "${1:-}" = --continue; then
+    fail "merging was removed: run dots sync, which asks about each file changed both here and in the repository"
+  fi
   test $# -eq 0 || { usage >&2; exit 2; }
   require_dependencies
   ensure_initialized
   test -t 0 && test -t 1 || fail "sync requires an interactive terminal"
+  refuse_old_conflict_workspace
   temp=$(mktemp_dir); trap 'rm -rf "$temp"' EXIT HUP INT TERM
   validate_current_state "$temp" || fail "repository tree or live manifest is unsafe"
   git_repo diff --cached --quiet || fail "repository index has staged changes; resolve or unstage them before sync"
-  git_repo diff --name-only --diff-filter=U | grep . >/dev/null 2>&1 && fail "repository index has conflicts; resolve them before sync"
   scan_live_candidates "$temp/selected-paths" "$temp" || scan_fail $? "nothing was changed. Remove the secret from the local file, then run dots sync again"
   branch=$(current_branch)
   base=$(head_revision) || fail "cannot resolve current revision"
@@ -1333,12 +1385,8 @@ sync_command() {
   git_repo merge-base --is-ancestor "$base" "$remote" || test "$base" = "$remote" || fail "remote history is not a safe fast-forward"
   # This Mac's own merged update PRs: its pending files are used here, not offered.
   pending_arrived "$temp" "$temp/remote-manifest"
-  # A path added to the manifest by hand here that another Mac also shared is newly
-  # used too, so a differing local copy is confirmed and backed up, not a collision.
-  list_intersect "$temp/hand-added" "$temp/remote-manifest" "$temp/hand-arrived"
-  cat "$temp/hand-arrived" >>"$temp/newly-used"
   # Files another Mac added that this Mac has not been asked about yet. The choice is
-  # saved only when the repository configuration is applied.
+  # saved only when the Mac catches up.
   list_minus "$temp/remote-manifest" "$temp/use" "$temp/unseen-used"
   list_minus "$temp/unseen-used" "$temp/skip" "$temp/unseen"
   if test -s "$temp/unseen"; then
@@ -1346,95 +1394,13 @@ sync_command() {
     cp "$temp/unseen" "$temp/unseen-chosen"
     checklist "$temp/unseen-rows" "$temp/unseen-chosen" "New files in the repository: choose which to use on this Mac" || fail "sync cancelled, nothing was changed"
     list_minus "$temp/unseen" "$temp/unseen-chosen" "$temp/newly-skipped"
-    # Appended, so this Mac's own merged files already marked newly used are kept.
-    cat "$temp/unseen-chosen" >>"$temp/newly-used"
+    cat "$temp/unseen-chosen" >>"$temp/use"
+    cat "$temp/newly-skipped" >>"$temp/skip"
   fi
-  test -f "$temp/newly-skipped" || : >"$temp/newly-skipped"
-  has_local=false
-  if show_changes "$temp/selected-paths" "$temp/changes"; then has_local=true; else result=$?; test "$result" -eq 1 || fail "could not inspect approved configuration changes"; fi
-  remote_workspace=$temp/remote-workspace
-  "$GIT" clone --quiet --no-checkout -- "$REPO" "$remote_workspace" || fail "could not prepare remote workspace"
-  "$GIT" -C "$remote_workspace" checkout --quiet "$remote" || fail "could not prepare remote revision"
-  # Local changes the repository already has (for example this Mac's own merged
-  # update PR) leave nothing to decide, so sync just brings the Mac up to date.
-  already_merged=false
-  if test "$has_local" = true && changes_already_in_remote "$temp/selected-paths" "$remote_workspace"; then
-    has_local=false
-    already_merged=true
-    say "local changes are already in the repository"
-  fi
-  test "$has_local" = false || show_change_summary "$temp/selected-paths" "$temp/changes"
-  # A newly accepted file that differs from a local copy replaces it only after
-  # confirmation and a backup. Declining leaves it unused here for now.
-  : >"$temp/differing"
-  while IFS= read -r path; do
-    test -f "$DOTS_HOME/$path" && test ! -L "$DOTS_HOME/$path" || continue
-    cmp -s "$remote_workspace/$path" "$DOTS_HOME/$path" || printf '%s\n' "$path" >>"$temp/differing"
-  done <"$temp/newly-used"
-  if test -s "$temp/differing"; then
-    say "These local files differ from the repository version:"
-    sed 's/^/  /' "$temp/differing"
-    printf 'Back them up and use the repository version? [y/N] ' >&2
-    IFS= read -r answer || fail "sync cancelled, nothing was changed"
-    case $answer in
-      y|Y|yes|YES) ;;
-      *)
-        list_minus "$temp/newly-used" "$temp/differing" "$temp/newly-used.next" && mv -f "$temp/newly-used.next" "$temp/newly-used"
-        list_minus "$temp/use" "$temp/differing" "$temp/use.next" && mv -f "$temp/use.next" "$temp/use"
-        # Declined files keep their repository version in a local merge (option 4).
-        cat "$temp/differing" >>"$temp/unselected"
-        cat "$temp/differing" >>"$temp/newly-skipped"
-        say "left unused on this Mac; bring them in later with: dots select" ;;
-    esac
-  fi
-  cat "$temp/newly-used" >>"$temp/use"
-  cat "$temp/newly-skipped" >>"$temp/skip"
-  if test "$has_local" = false; then
-    # Checked again just before writing, in case a file was edited meanwhile.
-    if test "$already_merged" = true && ! changes_already_in_remote "$temp/selected-paths" "$remote_workspace"; then fail "a local file changed during sync; nothing was changed, run dots sync again"; fi
-    apply_workspace_result "$remote_workspace" "${remote}^{tree}" "$remote" "$base" "$branch" "$temp" || fail "could not apply remote configuration"
-    say "sync complete, repository configuration applied locally"
-    return
-  fi
-  say "Local approved changes are not pushed by sync:"
-  say "  1. Use repository version, replace local files"
-  say "  2. Keep local files, make no changes"
-  # A PR needs an up-to-date Mac, so option 3 only appears with nothing to merge,
-  # and option 4 only when there is.
-  if test "$base" = "$remote"; then say "  3. Create a PR from local changes"; else say "  4. Merge remote into local only"; fi
-  printf 'Choose [1-4]: ' >&2
-  IFS= read -r choice || fail "sync choice cancelled"
-  case $choice in
-    1) apply_workspace_result "$remote_workspace" "${remote}^{tree}" "$remote" "$base" "$branch" "$temp" || fail "could not apply repository configuration"; say "repository configuration applied locally" ;;
-    2) say "local files kept, no changes made" ;;
-    3)
-      test "$base" = "$remote" || fail "the repository has changes to bring in first: choose 4 to merge them into your local files, then run dots update"
-      update_command ;;
-    4)
-      test "$base" != "$remote" || fail "there are no remote changes to merge"
-      workspace=$DOTS_DATA/conflict-workspace
-      test ! -e "$workspace" || fail "a conflict workspace already exists: $workspace"
-      "$GIT" clone --quiet --no-checkout -- "$REPO" "$workspace" || fail "could not create conflict workspace"
-      "$GIT" -C "$workspace" checkout --quiet "$base" || fail "could not prepare conflict workspace"
-      configure_merge_identity "$workspace" || fail "could not configure temporary merge workspace"
-      # Choices about new repository files apply when the merge is continued.
-      cp "$temp/newly-used" "$workspace/.git/dots-newly-used" && cp "$temp/newly-skipped" "$workspace/.git/dots-newly-skipped" && list_minus "$temp/hand-added" "$temp/newly-skipped" "$workspace/.git/dots-hand-added" || fail "could not prepare conflict workspace"
-      prepare_local_sandbox "$workspace" "$temp/head-paths" "$temp/live-paths" "$temp/all-paths" "$DOTS_HOME/$MANIFEST" "$temp/unselected" || fail "could not prepare local merge candidate"
-      "$GIT" -C "$workspace" commit --quiet -m "dots local changes" || fail "could not prepare local merge candidate"
-      "$GIT" -C "$workspace" config dots.remoteRevision "$remote"
-      "$GIT" -C "$workspace" config dots.baseRevision "$base"
-      if ! GIT_MERGE_AUTOEDIT=no "$GIT" -C "$workspace" merge --no-commit --no-ff "$remote" >/dev/null 2>&1; then
-        say "merge conflict workspace: $workspace"
-        "$GIT" -C "$workspace" diff --name-only --diff-filter=U
-        say "resolve and commit there, then run: dots sync --continue"
-        return
-      fi
-      tree=$("$GIT" -C "$workspace" write-tree 2>/dev/null) || fail "could not prepare merged configuration"
-      apply_workspace_result "$workspace" "$tree" "$remote" "$base" "$branch" "$temp" || fail "merged configuration is unsafe"
-      rm -rf "$workspace"
-      say "merged remote configuration into local files only" ;;
-    *) fail "invalid sync choice" ;;
-  esac
+  catch_up "$temp" "$base" "$remote" "$branch" ask
+  report_catch_up "$temp"
+  if test "$base" = "$remote" && ! test -s "$temp/cu/brought"; then say "this Mac is up to date"; else say "this Mac is now up to date"; fi
+  report_local_edits "$temp/cu/kept-edits"
 }
 
 OPEN_UPDATE_PRS_JQ='.[] | select(.headRefName | startswith("dots/update-")) | .url'
@@ -1478,9 +1444,6 @@ update_command() {
   branch=$(current_branch)
   base=$(head_revision) || fail "cannot resolve current revision"
   remote=$(fetch_validated_remote "$temp" "$branch") || fail "incoming repository data is unsafe or unavailable"
-  # A PR built on an older revision would list merged files as new and can conflict
-  # with what is already in the repository.
-  test "$base" = "$remote" || fail "the repository has changes this Mac has not synced yet (for example a merged update PR). Run dots sync first, then dots update"
   if ! wait "$gh_view"; then
     "$GH" auth status </dev/null >/dev/null 2>&1 || fail "GitHub CLI is not authenticated"
     fail "origin is not an accessible GitHub repository"
@@ -1489,6 +1452,22 @@ update_command() {
   wait "$gh_prs" || fail "could not check for open update PRs"
   trap 'rm -rf "$temp"' EXIT HUP INT TERM
   report_open_update_prs "$(cat "$temp/open-prs")"
+  # A PR is built on the latest revision, so catch up first (as sync would, without
+  # questions), then look at this Mac again.
+  if test "$base" != "$remote"; then
+    refuse_old_conflict_workspace
+    git_repo diff --cached --quiet || fail "repository index has staged changes; resolve or unstage them first"
+    git_repo merge-base --is-ancestor "$base" "$remote" || fail "remote history is not a safe fast-forward"
+    pending_arrived "$temp" "$temp/remote-manifest"
+    catch_up "$temp" "$base" "$remote" "$branch" refuse
+    report_catch_up "$temp"
+    list_minus "$temp/remote-manifest" "$temp/use" "$temp/unseen-used"
+    list_minus "$temp/unseen-used" "$temp/skip" "$temp/unseen"
+    test ! -s "$temp/unseen" || say "new files in the repository: run dots sync to choose whether to use them here"
+    validate_current_state "$temp" || fail "repository tree or live manifest is unsafe"
+    base=$(head_revision) || fail "cannot resolve current revision"
+    test "$base" = "$remote" || fail "could not catch up with the repository"
+  fi
   collect_candidates "$temp/live-manifest" "$temp/candidates" || fail "could not collect candidates"
   # Ticked rows are shared from this Mac; new candidates start unticked unless an
   # earlier update already chose them (pending). Candidates left unticked before are

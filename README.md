@@ -90,10 +90,10 @@ dots init --backup-existing
 ## Commands
 
 **`dots status`**
-Shows whether this Mac is up to date with the repository and which of your files you've edited here. Changes nothing.
+Shows whether this Mac is up to date, which files you've edited here and not sent yet, and which files changed in the repository and aren't here yet. Changes nothing.
 
 **`dots sync`**
-Brings this Mac up to date with the repository. Run it after merging a PR, or whenever another Mac shared something. If you've edited files here, it asks what to do first (see [When sync finds your edits](#when-sync-finds-your-edits)).
+Brings this Mac up to date with the repository. Run it whenever another Mac shared something. Your edits are kept, and it only asks about a file when the repository changed that same file too (see [When a file changed on both sides](#when-a-file-changed-on-both-sides)).
 
 **`dots update`**
 Sends your changes to the repository as a pull request: edits to files you already share, new files you want to start sharing, and files you want to stop sharing. Nothing reaches the repository until you merge the PR on GitHub, and your files on this Mac are never changed. See [The update checklist](#the-update-checklist).
@@ -110,9 +110,6 @@ Like `init`, for a Mac that already has its own versions of your dotfiles: diffe
 **`dots init --discover`**
 Lists the files `dots` would suggest sharing. Changes nothing.
 
-**`dots sync --continue`**
-Finishes a merge that stopped on a conflict (see below).
-
 ### The update checklist
 
 `dots update` shows up to four pages, in this order, skipping empty ones. Your edits are always on the first page.
@@ -124,20 +121,29 @@ Finishes a merge that stopped on a conflict (see below).
 | Shared files | Files you share and haven't changed | Keep sharing. Untick to stop sharing it on every Mac (the file stays on disk). |
 | Previously ignored | New files you left unticked before | Start sharing this file. |
 
-After you confirm, `dots` lists exactly what the PR contains and asks for a title. If the repository has changes this Mac hasn't synced yet, it asks you to run `dots sync` first.
+After you confirm, `dots` lists exactly what the PR contains and asks for a title. If the repository has changes this Mac doesn't have yet (for example your last PR, just merged), `update` brings them in first, as `sync` would. If a file changed on both sides, it stops and asks you to run `dots sync`.
 
 Keys: Up/Down move, Left/Right change page, Space ticks, `a`/`n` tick all or none on the page, Enter confirms, `q` cancels. Without a full terminal, or with `DOTS_PLAIN_PROMPTS=1`, you get a numbered list instead: type numbers such as `1,3-5` to toggle them.
 
-### When sync finds your edits
+### When a file changed on both sides
 
-1. **Use the repository version:** replace your edited files with the repository's.
-2. **Keep mine:** change nothing.
-3. **Create a PR:** send your edits, as `dots update` would (shown when this Mac is up to date).
-4. **Merge:** combine the repository's changes with yours, on this Mac only (shown when the repository has something new).
+`sync` handles each file on its own:
 
-If a merge conflicts, `dots` leaves your files untouched and prints the path of a private folder holding the merge. Fix the conflicted lines there, commit with Git, then run `dots sync --continue`.
+| You edited it here | The repository changed it | What happens |
+|---|---|---|
+| no | yes | You get the repository's version. |
+| yes | no | Your edit is kept. `sync` reminds you to send it with `dots update`. |
+| yes | yes, to the same thing | Nothing to do (for example your own PR, merged). |
+| yes | yes, differently | `sync` asks about that file. |
 
-When another Mac starts sharing a new file, `sync` asks whether to use it here, and asks again before replacing a different local copy (which it backs up first).
+When it asks, you choose per file:
+
+1. **Use the repository's version.** Yours is backed up to `~/.local/share/dots/backups/` first.
+2. **Keep yours.** This Mac still catches up with everything else, and your version stays as an edit. Send it with `dots update` if it should replace the repository's, or keep it on this Mac.
+
+Your list of shared files (the manifest) is never asked about: lines added on either side are combined.
+
+When another Mac starts sharing a new file, `sync` asks whether to use it here. If you already have a different copy, it asks about it as above.
 
 ## Which files are suggested
 
