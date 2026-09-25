@@ -685,7 +685,7 @@ check_candidates() {
     path_matches_list "$cc_path" "$DC_EXCLUDES" && continue
     # A symlinked parent (for example ~/.claude -> elsewhere) would publish files from outside HOME.
     safe_live_path "$cc_path" || continue
-    test -f "$DOTS_HOME/$cc_path" && test ! -L "$DOTS_HOME/$cc_path" || continue
+    test -f "$DOTS_HOME/$cc_path" && test ! -L "$DOTS_HOME/$cc_path" && test -r "$DOTS_HOME/$cc_path" || continue
     is_reserved_path "$cc_path" && continue
     test "$cc_kind" = included || ! inside_git_checkout "$cc_path" || continue
     printf '%s\n' "$cc_path"
@@ -1426,8 +1426,9 @@ sync_command() {
   esac
 }
 
+OPEN_UPDATE_PRS_JQ='.[] | select(.headRefName | startswith("dots/update-")) | .url'
 open_update_prs() {
-  "$GH" pr list --repo "$1" --state open --json headRefName,url --jq '.[] | select(.headRefName | startswith("dots/update-")) | .url' </dev/null 2>/dev/null
+  "$GH" pr list --repo "$1" --state open --json headRefName,url --jq "$OPEN_UPDATE_PRS_JQ" </dev/null 2>/dev/null
 }
 
 report_open_update_prs() {
@@ -1457,7 +1458,8 @@ update_command() {
   # validated; their results are required before anything is shown or written.
   "$GH" repo view "$repo_name" --json nameWithOwner </dev/null >/dev/null 2>&1 &
   gh_view=$!
-  open_update_prs "$repo_name" >"$temp/open-prs" &
+  # Started directly rather than through a function, so each job's PID is gh itself.
+  "$GH" pr list --repo "$repo_name" --state open --json headRefName,url --jq "$OPEN_UPDATE_PRS_JQ" </dev/null >"$temp/open-prs" 2>/dev/null &
   gh_prs=$!
   # Any early failure stops them rather than leaving them running.
   trap 'kill "$gh_view" "$gh_prs" 2>/dev/null; rm -rf "$temp"' EXIT HUP INT TERM

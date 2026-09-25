@@ -271,6 +271,7 @@ printf outside >"$outside/config.toml"; ln -s "$outside" "$disc/.grok"
 printf x >"$disc/.netrc	"
 printf '\377\376a\000b\000' >"$disc/.unknowntool/utf16.json"
 mkdir -p "$disc/.config/PRIVATE"; printf '{}' >"$disc/.config/PRIVATE/settings.json"
+printf '{}' >"$disc/.unknowntool/unreadable.json"; chmod 000 "$disc/.unknowntool/unreadable.json"
 # A newline inside a filename must not forge another path: the piece after it names a
 # real file that is never suggested (not hidden), so reading line by line would leak it.
 printf private >"$disc/forged-notes"; printf x >"$disc/.config/newtool/a
@@ -282,7 +283,7 @@ if listed .gitconfig && listed .zshrc && ! printf '%s' "$discovery" | grep -F '\
 if listed .zprofile && listed .vimrc && listed .claude/settings.json && listed .pi/agent/settings.json && listed .config/newtool/anything && listed .unknowntool/settings.yaml && listed .unknowntool/sub/prefs.toml; then pass "generic discovery finds dotfiles and unknown tools"; else fail "generic discovery finds dotfiles and unknown tools"; fi
 if ! printf '%s' "$discovery" | grep -F -e too-deep.json -e data.bin -e huge.json -e binary.json -e models_cache.json -e /cache/ -e node_modules -e vendored -e .pi/agent/agents/helper.md >/dev/null; then pass "generic discovery skips deep, binary, large, cache, and vendored files"; else fail "generic discovery skips deep, binary, large, cache, and vendored files"; fi
 turkish=$(LC_ALL=tr_TR.UTF-8 run_dots "$disc" init --discover 2>&1)
-if ! printf '%s' "$turkish" | grep -F -e .config/PRIVATE/ -e utf16.json >/dev/null; then pass "discovery excludes upper-case names and refuses UTF-16"; else fail "discovery excludes upper-case names and refuses UTF-16"; fi
+if ! printf '%s' "$turkish" | grep -F -e .config/PRIVATE/ -e utf16.json -e unreadable.json >/dev/null; then pass "discovery excludes upper-case names, UTF-16, and unreadable files"; else fail "discovery excludes upper-case names, UTF-16, and unreadable files"; fi
 if ! printf '%s' "$discovery" | grep -F -e .ssh/ -e .docker/config.json -e .netrc -e .npmrc -e .cache/ -e .config/gh/ -e .zsh_history -e .DS_Store -e .claude.json -e dev.env.tmpl -e .config/dots/manifest -e .aws/ -e private.json -e mcp.json -e .config/mcp/ -e .config/vendored/ -e .project/ >/dev/null; then pass "discovery never suggests credentials or machine state"; else fail "discovery never suggests credentials or machine state"; fi
 # A rules file adds what the scan misses and drops what it should not suggest.
 mkdir -p "$disc/.config/dots"
