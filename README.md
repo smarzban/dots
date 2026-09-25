@@ -206,3 +206,7 @@ To publish a release, tag the commit, build the assets, and upload `dist/dots`, 
 git tag -a v0.1.0 -m "dots v0.1.0"
 scripts/package.sh v0.1.0
 ```
+
+## License
+
+[MIT](LICENSE)
