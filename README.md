@@ -59,7 +59,7 @@ curl -fsSL https://github.com/smarzban/dots/releases/latest/download/install.sh 
    git --git-dir="$HOME/.local/share/dots/repo.git" config user.email "you@example.com"
    ```
 
-4. Pick the files to share. `dots update` opens a checklist of candidate files grouped by folder (see [Which files are suggested](#which-files-are-suggested)). Tick the ones you want, confirm, and give the PR a title. The checklist has up to three pages: new files, files you already share, and files you unticked before (empty pages are skipped), so later runs start with what is new:
+4. Pick the files to share. `dots update` opens a checklist of candidate files (see [Which files are suggested](#which-files-are-suggested)). Tick the ones you want, confirm, and give the PR a title. The checklist has up to three pages: new files, files you already share, and files you unticked before (empty pages are skipped), so later runs start with what is new:
 
    ```sh
    dots update
