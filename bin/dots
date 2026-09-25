@@ -22,6 +22,8 @@ DEFAULT_GITHUB_REPO=${DOTS_DEFAULT_GITHUB_REPO:-}
 DEFAULT_GITHUB_REPO_NAME=${DOTS_DEFAULT_GITHUB_REPO_NAME:-dotfiles}
 MANIFEST=.config/dots/manifest
 TAB=$(printf '\t')
+NL='
+'
 # Machine-local choice of which repository files this Mac uses. Never synced.
 SELECTION=$DOTS_DATA/selection
 
@@ -65,7 +67,9 @@ valid_manifest_path() {
   test -n "$line" || return 1
   # v1 paths are printable ASCII. This avoids ambiguous Unicode whitespace and
   # platform-dependent normalization, as well as unsafe Git pathspec characters.
-  printf '%s' "$line" | LC_ALL=C grep '[^ -~]' >/dev/null && return 1
+  # Byte-wise in the C locale, so any non-ASCII byte or control character matches.
+  local LC_ALL=C
+  case $line in *[!\ -~]*) return 1 ;; esac
   case $line in
     '#'*|:*|*'\\'*|.gitleaks.toml|/*|./*|*/|*'//'*|*'..'*|*'?'*|*'*'*|*'['*|*']'*|*'{'*|*'}'*) return 1 ;;
   esac
@@ -144,7 +148,11 @@ manifest_from_revision() {
   validate_manifest_file "$tmp" "$out"
 }
 
-path_in_list() { grep -F -x -- "$1" "$2" >/dev/null 2>&1; }
+# Exact whole-line membership. grep -F would read a newline in $1 as two patterns.
+path_in_list() {
+  case $1 in *"$NL"*) return 1 ;; esac
+  grep -F -x -- "$1" "$2" >/dev/null 2>&1
+}
 
 # Check the entire candidate tree. Git path output is NUL-delimited, and failures
 # intentionally do not repeat an untrusted filename or file body.
@@ -156,22 +164,26 @@ validate_tree() {
   manifest_from_revision "$gitdir" "$rev" "$list" "$temp/manifest" || return 1
   entry_file=$temp/tree
   git_dir "$gitdir" ls-tree -r -z "$rev" >"$entry_file" || return 1
+  # Every entry must be a regular file named exactly by the manifest (or be the
+  # manifest). A name with a newline can never match, so it is refused outright.
+  : >"$temp/tree-paths"
   while IFS= read -r -d '' entry; do
     meta=${entry%%$'\t'*}
     path=${entry#*$'\t'}
     mode=${meta%% *}
-    test "$path" = "$MANIFEST" && {
-      test "$mode" = 100644 -o "$mode" = 100755 || return 1
-      continue
-    }
     test "$mode" = 100644 -o "$mode" = 100755 || return 1
-    path_in_list "$path" "$list" || return 1
+    case $path in *"$NL"*) return 1 ;; esac
+    printf '%s\n' "$path" >>"$temp/tree-paths"
   done <"$entry_file"
+  { cat "$list"; printf '%s\n' "$MANIFEST"; } >"$temp/tree-allowed"
+  list_minus "$temp/tree-paths" "$temp/tree-allowed" "$temp/tree-extra"
+  test ! -s "$temp/tree-extra" || return 1
   # A candidate manifest cannot approve nonexistent paths, which would otherwise
   # make the later path-limited checkout fail after repository metadata is moved.
+  list_minus "$list" "$temp/tree-paths" "$temp/tree-missing"
+  test ! -s "$temp/tree-missing" || return 1
   while IFS= read -r path; do
     is_reserved_path "$path" && return 1
-    git_dir "$gitdir" cat-file -e "$rev:$path" 2>/dev/null || return 1
   done <"$list"
   return 0
 }
@@ -264,11 +276,8 @@ scan_directory() {
 }
 
 append_unique_list() {
-  source=$1
-  target=$2
-  while IFS= read -r path; do
-    path_in_list "$path" "$target" || printf '%s\n' "$path" >>"$target"
-  done <"$source"
+  awk 'FILENAME == ARGV[1] { seen[$0] = 1; next } !($0 in seen) { seen[$0] = 1; print }' "$2" "$1" >"$2.append" &&
+    cat "$2.append" >>"$2" && rm -f "$2.append"
 }
 
 list_with_manifest() {
@@ -302,15 +311,12 @@ head_revision() { git_repo rev-parse HEAD 2>/dev/null; }
 # ── Path lists ──────────────────────────────────────────────
 # Lists are newline-delimited files of validated manifest paths.
 list_union() { cat "$1" "$2" | LC_ALL=C sort -u >"$3"; }
+# List operations keep $1's order and match whole lines exactly, one process each.
 list_intersect() {
-  : >"$3"
-  while IFS= read -r path; do path_in_list "$path" "$2" && printf '%s\n' "$path" >>"$3"; done <"$1"
-  return 0
+  awk 'FILENAME == ARGV[1] { seen[$0] = 1; next } ($0 in seen)' "$2" "$1" >"$3"
 }
 list_minus() {
-  : >"$3"
-  while IFS= read -r path; do path_in_list "$path" "$2" || printf '%s\n' "$path" >>"$3"; done <"$1"
-  return 0
+  awk 'FILENAME == ARGV[1] { seen[$0] = 1; next } !($0 in seen)' "$2" "$1" >"$3"
 }
 list_count() { wc -l <"$1" | tr -d ' '; }
 
@@ -557,48 +563,55 @@ create_default_github_repository() {
 DISCOVER_RULES=.config/dots/discover
 DISCOVER_MAX_BYTES=65536
 
-# Names that hold credentials, caches, or machine-local state, wherever they appear.
-# Matching is case-insensitive. gitleaks still scans every chosen file before a push.
-candidate_is_excluded() {
-  case $1 in
-    "$DISCOVER_RULES") return 1 ;;
-    .config/dots/*) return 0 ;;
-  esac
-  ce_lower=$(printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]')
-  case "/$ce_lower" in
-    # Folders of credentials or keys, and files known to hold them.
-    /.ssh/*|/.gnupg/*|/.kube/*|/.aws/*|/.azure/*|/.config/gh/*|/.config/hub|/.config/op/*|/.config/gcloud/*|/.config/pass/*|/.config/chezmoi/*|/.config/configstore/*|/.docker/config.json) return 0 ;;
-    # Caches, logs, transcripts, and other machine-local state.
-    */.git/*|*/.system/*|*/logs/*|*/log/*|*-logs/*|*_logs/*|*/tmp/*|*/temp/*|*/runtime/*|*/sessions/*|*/state/*|*/history/*|*/projects/*|*/node_modules/*|*/backups/*|*/.trash/*) return 0 ;;
-    # Private content that tools keep next to their settings.
-    */memories/*|*/memory/*|*/attachments/*|*/transcripts/*) return 0 ;;
-    # MCP server configurations usually carry API keys in their environment blocks.
-    *auth*|*credential*|*token*|*secret*|*private*|*password*|*passwd*|*mcp*|*history*|*session*|*state*|*backup*|*cache*|*telemetry*|*analytics*) return 0 ;;
-  esac
-  case ${ce_lower##*/} in
-    .netrc|.npmrc|.pypirc|.pgpass|.my.cnf|.git-credentials|.env|.env.*|*.env|*.env.*|*.pem|*.key|*.p12|*.pfx|*.crt|*.keychain*|id_*|*.db|*.db-*|*.sqlite*|*.lock|*.log|*.pid|*.bak|*.old|*.swp|*~) return 0 ;;
-    .ds_store|.cfusertextencoding|.localized|.zcompdump*|.viminfo|.lesshst|.wget-hsts|.xauthority) return 0 ;;
-    # Application state files that live beside configuration and hold account details.
-    .claude.json) return 0 ;;
-  esac
-  return 1
+# Name filters for discovery, applied to "kind<TAB>path" lines in one pass. Kind is
+# "any", "config" (only names that look like hand-edited configuration count, used
+# inside ~/.<name> folders), or "included" (named by an include rule). Everything
+# is matched case-insensitively except the configuration-name test. Drops names that
+# hold credentials, caches, or machine-local state wherever they appear; gitleaks
+# still scans every chosen file before a push.
+filter_candidate_names() {
+  awk -F '\t' -v rules="$DISCOVER_RULES" '
+    function excluded(path,    l, b) {
+      if (path == rules) return 0
+      if (index(path, ".config/dots/") == 1) return 1
+      l = "/" tolower(path)
+      b = l; sub(/.*\//, "", b)
+      # Folders of credentials or keys, and files known to hold them.
+      if (l ~ /^\/\.(ssh|gnupg|kube|aws|azure)\// || l ~ /^\/\.config\/(gh|op|gcloud|pass|chezmoi|configstore)\// || l == "/.config/hub" || l == "/.docker/config.json") return 1
+      # Caches, logs, transcripts, private content, and other machine-local state.
+      if (l ~ /\/(\.git|\.system|logs|log|tmp|temp|runtime|sessions|state|history|projects|node_modules|backups|\.trash|memories|memory|attachments|transcripts)\// || l ~ /[-_]logs\//) return 1
+      # MCP server configurations usually carry API keys in their environment blocks.
+      if (l ~ /auth|credential|token|secret|private|password|passwd|mcp|history|session|state|backup|cache|telemetry|analytics/) return 1
+      if (b ~ /^\.(netrc|npmrc|pypirc|pgpass|my\.cnf|git-credentials|env)$/ || b ~ /^\.env\./ || b ~ /\.env$/ || b ~ /\.env\./) return 1
+      if (b ~ /\.(pem|key|p12|pfx|crt|db|lock|log|pid|bak|old|swp)$/ || b ~ /\.keychain|\.db-|\.sqlite|~$|^id_/) return 1
+      if (b ~ /^\.(ds_store|cfusertextencoding|localized|viminfo|lesshst|wget-hsts|xauthority)$/ || b ~ /^\.zcompdump/) return 1
+      # Application state that lives beside configuration and holds account details.
+      if (b == ".claude.json") return 1
+      return 0
+    }
+    function config_like(path,    b) {
+      b = path; sub(/.*\//, "", b)
+      return b ~ /\.(json|jsonc|json5|toml|yaml|yml|conf|cfg|ini|md|sh|bash|zsh|fish|lua|vim|rules)$/ || b ~ /rc$/ || b == "config"
+    }
+    { kind = $1; path = substr($0, length($1) + 2) }
+    excluded(path) { next }
+    kind == "config" && !config_like(path) { next }
+    { print }' "$1"
 }
 
-# Inside ~/.<name> folders only names that look like hand-edited configuration count.
-config_like_name() {
-  case ${1##*/} in
-    *.json|*.jsonc|*.json5|*.toml|*.yaml|*.yml|*.conf|*.cfg|*.ini|*.md|*.sh|*.bash|*.zsh|*.fish|*.lua|*.vim|*.rules|*rc|config) return 0 ;;
-  esac
-  return 1
-}
-
-# Small text files only: large or binary files are data, not configuration.
-small_text_file() {
-  st_size=$(wc -c <"$1" 2>/dev/null | tr -d ' ')
-  case $st_size in ''|*[!0-9]*) return 1 ;; esac
-  test "$st_size" -gt 0 && test "$st_size" -le "$DISCOVER_MAX_BYTES" || return 1
-  st_text=$(LC_ALL=C tr -d '\000' <"$1" | wc -c | tr -d ' ')
-  test "$st_text" = "$st_size"
+# Keep small text files only (1 byte to DISCOVER_MAX_BYTES, not binary); large or
+# binary files are data, not configuration. Batched: one stat and one file call,
+# joined by name, so a file that vanishes meanwhile is simply dropped.
+keep_small_text_files() {
+  : >"$2"
+  test -s "$1" || return 0
+  (cd "$DOTS_HOME" && tr '\n' '\0' <"$1" | xargs -0 stat -f "%z$TAB%N" 2>/dev/null) >"$2.sizes"
+  (cd "$DOTS_HOME" && tr '\n' '\0' <"$1" | xargs -0 file -b --mime-encoding -- 2>/dev/null | paste -d "$TAB" - "$1") >"$2.types"
+  awk -F '\t' -v max="$DISCOVER_MAX_BYTES" '
+    FILENAME == ARGV[1] { if ($1 ~ /^[0-9]+$/) size[substr($0, length($1) + 2)] = $1 + 0; next }
+    FILENAME == ARGV[2] { type[substr($0, length($1) + 2)] = $1; next }
+    ($0 in size) && size[$0] > 0 && size[$0] <= max && ($0 in type) && type[$0] != "binary" && type[$0] !~ /cannot|error/' "$2.sizes" "$2.types" "$1" >"$2"
+  rm -f "$2.sizes" "$2.types"
 }
 
 path_matches_list() {
@@ -614,7 +627,8 @@ path_matches_list() {
 # include walk starts (".*/x" would otherwise mean the whole home folder).
 valid_rule_pattern() {
   test -n "$1" || return 1
-  printf '%s' "$1" | LC_ALL=C grep '[^!-~]' >/dev/null && return 1
+  local LC_ALL=C
+  case $1 in *[!!-~]*) return 1 ;; esac
   case $1 in .*) ;; *) return 1 ;; esac
   case $1 in *'..'*|*'\\'*|*'//'*|*/) return 1 ;; esac
   case $1 in */*) case ${1%%/*} in *[*?[]*) return 1 ;; esac ;; esac
@@ -658,25 +672,36 @@ load_discover_rules() {
   return 0
 }
 
-# add_candidate path [config-names|included]; appends to $DC_OUT unless approved or
-# filtered. "included" marks a path named by an include rule, which may be inside a
-# Git checkout; every other filter still applies.
-add_candidate() {
-  ac_path=$1
-  # Every source is a hidden path in HOME; anything else is a forged or stray name.
-  case $ac_path in .*) ;; *) return 0 ;; esac
-  valid_manifest_path "$ac_path" || return 0
-  candidate_is_excluded "$ac_path" && return 0
-  test "${2:-}" != config-names || config_like_name "$ac_path" || return 0
-  path_matches_list "$ac_path" "$DC_EXCLUDES" && return 0
-  # A symlinked parent (for example ~/.claude -> elsewhere) would publish files from outside HOME.
-  safe_live_path "$ac_path" || return 0
-  test -f "$DOTS_HOME/$ac_path" && test ! -L "$DOTS_HOME/$ac_path" || return 0
-  test "${2:-}" = included || ! inside_git_checkout "$ac_path" || return 0
-  is_reserved_path "$ac_path" && return 0
-  path_in_list "$ac_path" "$DC_APPROVED" && return 0
-  small_text_file "$DOTS_HOME/$ac_path" || return 0
-  printf '%s\n' "$ac_path" >>"$DC_OUT"
+# Checks that need the file system but no processes: a safe hidden manifest path,
+# not dropped by an exclude rule, a regular file with no symlinked parent, outside
+# the data directory, and outside Git checkouts unless an include rule named it.
+check_candidates() {
+  while IFS=$TAB read -r cc_kind cc_path; do
+    case $cc_path in .*) ;; *) continue ;; esac
+    valid_manifest_path "$cc_path" || continue
+    path_matches_list "$cc_path" "$DC_EXCLUDES" && continue
+    # A symlinked parent (for example ~/.claude -> elsewhere) would publish files from outside HOME.
+    safe_live_path "$cc_path" || continue
+    test -f "$DOTS_HOME/$cc_path" && test ! -L "$DOTS_HOME/$cc_path" || continue
+    is_reserved_path "$cc_path" && continue
+    test "$cc_kind" = included || ! inside_git_checkout "$cc_path" || continue
+    printf '%s\n' "$cc_path"
+  done <"$1"
+}
+
+# Read NUL-delimited absolute paths and print "kind<TAB>relative path" lines, so a
+# newline inside a filename cannot forge another path. An optional pattern keeps
+# only matching paths.
+raw_candidates() {
+  while IFS= read -r -d '' rc_file; do
+    rc_path=${rc_file#"$DOTS_HOME"/}
+    case $rc_path in *"$NL"*) continue ;; esac
+    if test -n "${2:-}"; then
+      # shellcheck disable=SC2254 # rule patterns are globs on purpose
+      case $rc_path in $2) ;; *) continue ;; esac
+    fi
+    printf '%s\t%s\n' "$1" "$rc_path"
+  done
 }
 
 # Print files under a HOME-relative folder ("" for HOME itself), NUL-delimited so a
@@ -701,40 +726,33 @@ collect_candidates() {
   DC_OUT=$2
   DC_INCLUDES=$2.includes
   DC_EXCLUDES=$2.excludes
-  : >"$DC_OUT" || return 1
+  : >"$DC_OUT" && : >"$2.raw" || return 1
   load_discover_rules "$DC_INCLUDES" "$DC_EXCLUDES" || return 1
-  # Dotfiles directly in HOME.
-  walk_files '' 1 | while IFS= read -r -d '' dc_file; do
-    dc_path=${dc_file#"$DOTS_HOME"/}
-    case $dc_path in .*) add_candidate "$dc_path" ;; esac
-  done
-  # Everything under ~/.config.
-  walk_files .config | while IFS= read -r -d '' dc_file; do
-    add_candidate "${dc_file#"$DOTS_HOME"/}"
-  done
-  # Config-like files up to two levels inside every other ~/.<name> folder.
-  find "$DOTS_HOME" -mindepth 1 -maxdepth 1 -type d -name '.*' -print0 2>/dev/null | while IFS= read -r -d '' dc_dir; do
-    dc_dir=${dc_dir#"$DOTS_HOME"/}
-    case $dc_dir in .config|.local|.cache|.Trash|.npm|.cups|.git) continue ;; esac
-    valid_manifest_path "$dc_dir" || continue
-    is_reserved_path "$dc_dir" && continue
-    walk_files "$dc_dir" 2 | while IFS= read -r -d '' dc_file; do
-      add_candidate "${dc_file#"$DOTS_HOME"/}" config-names
+  {
+    # Dotfiles directly in HOME, and everything under ~/.config.
+    walk_files '' 1 | raw_candidates any
+    walk_files .config | raw_candidates any
+    # Config-like files up to two levels inside every other ~/.<name> folder.
+    find "$DOTS_HOME" -mindepth 1 -maxdepth 1 -type d -name '.*' -print0 2>/dev/null | while IFS= read -r -d '' dc_dir; do
+      dc_dir=${dc_dir#"$DOTS_HOME"/}
+      case $dc_dir in .config|.local|.cache|.Trash|.npm|.cups|.git) continue ;; esac
+      valid_manifest_path "$dc_dir" || continue
+      is_reserved_path "$dc_dir" && continue
+      walk_files "$dc_dir" 2 | raw_candidates config
     done
-  done
-  # Rule includes: walk from the pattern's fixed leading folder, then match.
-  while IFS= read -r dc_pattern; do
-    dc_fixed=${dc_pattern%%[*?[]*}
-    if test "$dc_fixed" = "$dc_pattern"; then add_candidate "$dc_pattern" included; continue; fi
-    case $dc_fixed in */*) dc_base=${dc_fixed%/*}; dc_depth= ;; *) dc_base=; dc_depth=1 ;; esac
-    walk_files "$dc_base" "$dc_depth" | while IFS= read -r -d '' dc_file; do
-      dc_path=${dc_file#"$DOTS_HOME"/}
-      # shellcheck disable=SC2254 # rule patterns are globs on purpose
-      case $dc_path in $dc_pattern) add_candidate "$dc_path" included ;; esac
-    done
-  done <"$DC_INCLUDES"
-  rm -f "$DC_INCLUDES" "$DC_EXCLUDES"
-  sort -u "$DC_OUT" -o "$DC_OUT"
+    # Rule includes: walk from the pattern's fixed leading folder, then match.
+    while IFS= read -r dc_pattern; do
+      dc_fixed=${dc_pattern%%[*?[]*}
+      if test "$dc_fixed" = "$dc_pattern"; then printf 'included\t%s\n' "$dc_pattern"; continue; fi
+      case $dc_fixed in */*) dc_base=${dc_fixed%/*}; dc_depth= ;; *) dc_base=; dc_depth=1 ;; esac
+      walk_files "$dc_base" "$dc_depth" | raw_candidates included "$dc_pattern"
+    done <"$DC_INCLUDES"
+  } >"$2.raw" || return 1
+  filter_candidate_names "$2.raw" >"$2.named" || return 1
+  check_candidates "$2.named" | LC_ALL=C sort -u >"$2.checked" || return 1
+  list_minus "$2.checked" "$DC_APPROVED" "$2.unapproved" || return 1
+  keep_small_text_files "$2.unapproved" "$DC_OUT" || return 1
+  rm -f "$DC_INCLUDES" "$DC_EXCLUDES" "$2.raw" "$2.named" "$2.checked" "$2.unapproved"
 }
 
 print_candidates() {
@@ -1403,9 +1421,17 @@ sync_command() {
   esac
 }
 
+open_update_prs() {
+  "$GH" pr list --repo "$1" --state open --json headRefName,url --jq '.[] | select(.headRefName | startswith("dots/update-")) | .url' </dev/null 2>/dev/null
+}
+
+report_open_update_prs() {
+  test -z "$1" || fail "an earlier update PR is still open: $(printf '%s\n' "$1" | head -1). Merge or close it, run dots sync, then try again"
+}
+
 refuse_open_update_pr() {
-  open_prs=$("$GH" pr list --repo "$1" --state open --json headRefName,url --jq '.[] | select(.headRefName | startswith("dots/update-")) | .url' 2>/dev/null) || fail "could not check for open update PRs"
-  test -z "$open_prs" || fail "an earlier update PR is still open: $(printf '%s\n' "$open_prs" | head -1). Merge or close it, run dots sync, then try again"
+  open_prs=$(open_update_prs "$1") || fail "could not check for open update PRs"
+  report_open_update_prs "$open_prs"
 }
 
 update_command() {
@@ -1414,15 +1440,7 @@ update_command() {
   require_tool "$GH"
   ensure_initialized
   test -t 0 && test -t 1 || fail "update requires an interactive terminal"
-  "$GH" auth status >/dev/null 2>&1 || fail "GitHub CLI is not authenticated"
   temp=$(mktemp_dir); trap 'rm -rf "$temp"' EXIT HUP INT TERM
-  validate_current_state "$temp" || fail "repository tree or live manifest is unsafe"
-  branch=$(current_branch)
-  base=$(head_revision) || fail "cannot resolve current revision"
-  remote=$(fetch_validated_remote "$temp" "$branch") || fail "incoming repository data is unsafe or unavailable"
-  # A PR built on an older revision would list merged files as new and can conflict
-  # with what is already in the repository.
-  test "$base" = "$remote" || fail "the repository has changes this Mac has not synced yet (for example a merged update PR). Run dots sync first, then dots update"
   origin=$(git_repo remote get-url origin 2>/dev/null || true)
   case $origin in
     https://github.com/*/*.git) repo_name=${origin#https://github.com/}; repo_name=${repo_name%.git} ;;
@@ -1430,9 +1448,26 @@ update_command() {
     *) fail "update PRs require a GitHub origin remote" ;;
   esac
   safe_github_component "${repo_name%%/*}" && safe_github_component "${repo_name##*/}" || fail "origin is not an accessible GitHub repository"
-  "$GH" repo view "$repo_name" --json nameWithOwner >/dev/null 2>&1 || fail "origin is not an accessible GitHub repository"
+  # The GitHub checks run in the background while the repository is fetched and
+  # validated; their results are required before anything is shown or written.
+  "$GH" repo view "$repo_name" --json nameWithOwner </dev/null >/dev/null 2>&1 &
+  gh_view=$!
+  open_update_prs "$repo_name" >"$temp/open-prs" &
+  gh_prs=$!
+  validate_current_state "$temp" || fail "repository tree or live manifest is unsafe"
+  branch=$(current_branch)
+  base=$(head_revision) || fail "cannot resolve current revision"
+  remote=$(fetch_validated_remote "$temp" "$branch") || fail "incoming repository data is unsafe or unavailable"
+  # A PR built on an older revision would list merged files as new and can conflict
+  # with what is already in the repository.
+  test "$base" = "$remote" || fail "the repository has changes this Mac has not synced yet (for example a merged update PR). Run dots sync first, then dots update"
+  if ! wait "$gh_view"; then
+    "$GH" auth status </dev/null >/dev/null 2>&1 || fail "GitHub CLI is not authenticated"
+    fail "origin is not an accessible GitHub repository"
+  fi
   # One update PR at a time: a second one would conflict on the manifest.
-  refuse_open_update_pr "$repo_name"
+  wait "$gh_prs" || fail "could not check for open update PRs"
+  report_open_update_prs "$(cat "$temp/open-prs")"
   collect_candidates "$temp/live-manifest" "$temp/candidates" || fail "could not collect candidates"
   # Ticked rows are shared from this Mac; new candidates start unticked unless an
   # earlier update already chose them (pending). Candidates left unticked before are

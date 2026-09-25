@@ -82,9 +82,9 @@ make_mock_gh() {
   cat >"$MOCK_GH" <<'EOF'
 #!/bin/sh
 case "$1:$2" in
-  auth:status) exit 0 ;;
+  auth:status) test "${DOTS_TEST_GH_UNAUTH:-0}" = 0 ;;
   api:user) printf '%s\n' example ;;
-  repo:view) if [ "${DOTS_TEST_GH_PUBLIC:-0}" = 1 ]; then printf '%s\n' false; elif [ "${DOTS_TEST_GH_REPO_EXISTS:-0}" = 1 ]; then printf '%s\n' true; else exit 1; fi ;;
+  repo:view) if [ "${DOTS_TEST_GH_UNAUTH:-0}" = 1 ]; then exit 1; elif [ "${DOTS_TEST_GH_PUBLIC:-0}" = 1 ]; then printf '%s\n' false; elif [ "${DOTS_TEST_GH_REPO_EXISTS:-0}" = 1 ]; then printf '%s\n' true; else exit 1; fi ;;
   repo:create) printf '%s\n' "$*" >>"$DOTS_TEST_GH_LOG"; /usr/bin/git init -q --bare "$DOTS_TEST_GH_REMOTE" ;;
   pr:create) printf '%s\n' "$*" >>"$DOTS_TEST_GH_LOG"; test "${DOTS_TEST_GH_PR_FAIL:-0}" = 0 ;;
   pr:list)
@@ -338,6 +338,12 @@ unset DOTS_TEST_GITLEAKS_FAIL
 remote=$TMP/unapproved.git; new_remote "$remote"; home3=$TMP/home-unapproved; mkdir -p "$home3"; expect_ok run_dots "$home3" init "$remote" main
 remote_edit "$remote" "printf bad > \"\$1/.unapproved\"" || exit 1
 if ! run_sync "$home3" '' >/dev/null 2>&1 && test ! -e "$home3/.unapproved"; then pass "incoming unapproved content"; else fail "incoming unapproved content"; fi
+# A tree entry whose name holds a newline cannot pass as the approved path after it.
+remote=$TMP/newline-entry.git; new_remote "$remote"
+remote_edit "$remote" "printf '%s\\n' '.config/example/settings' '.zshrc' > \"\$1/.config/dots/manifest\"; printf shell > \"\$1/.zshrc\"; printf smuggled > \"\$1/junk
+.zshrc\"" || exit 1
+nl_home=$TMP/home-newline-entry; mkdir -p "$nl_home"
+if expect_fail run_dots "$nl_home" init "$remote" main && test ! -e "$nl_home/.zshrc"; then pass "newline tree entry refused"; else fail "newline tree entry refused"; fi
 # A repository-supplied gitleaks policy cannot weaken the scanner.
 remote=$TMP/scanner-config.git; new_remote "$remote"
 remote_edit "$remote" "printf '%s\\n' '.config/example/settings' '.gitleaks.toml' > \"\$1/.config/dots/manifest\"; printf 'allowlist = [\"DOTS_TEST_SECRET\"]\\n' > \"\$1/.gitleaks.toml\"; printf DOTS_TEST_SECRET > \"\$1/.config/example/settings\"" || exit 1
@@ -533,6 +539,9 @@ run_derived_default_init "$secret_home" "$secret_remote" $'y\n' >/dev/null 2>&1 
 printf 'key = "DOTS_TEST_SECRET"\n' >"$secret_home/.newtool/config.toml"
 secret_out=$(DOTS_TEST_GITLEAKS_FAIL=1 run_update "$secret_home" "$secret_remote" $'1\ny\nShare new tool\n' 2>&1)
 if printf '%s' "$secret_out" | grep -F '.newtool/config.toml, line 1 (generic-api-key)' >/dev/null && printf '%s' "$secret_out" | grep -F 'nothing was pushed' >/dev/null && ! printf '%s' "$secret_out" | grep -F 'key = ' >/dev/null && ! printf '%s' "$secret_out" | grep -F DOTS_TEST_SECRET >/dev/null && test -z "$(/usr/bin/git --git-dir="$secret_remote" for-each-ref 'refs/heads/dots/update-*')" && ! grep -F 'pr create' "$TMP/gh-update.log" >/dev/null; then pass "update scans newly discovered files before pushing"; else fail "update scans newly discovered files before pushing"; fi
+# Without GitHub authentication, update says so, before any checklist.
+unauth_out=$(DOTS_TEST_GH_UNAUTH=1 run_update "$secret_home" "$secret_remote" $'1\ny\nTitle\n' 2>&1)
+if printf '%s' "$unauth_out" | grep -F 'GitHub CLI is not authenticated' >/dev/null && ! printf '%s' "$unauth_out" | grep -F 'Toggle numbers' >/dev/null; then pass "update reports missing GitHub authentication"; else fail "update reports missing GitHub authentication"; fi
 # A scanner failure is not reported as a secret.
 error_out=$(DOTS_TEST_GITLEAKS_ERROR=1 run_update "$secret_home" "$secret_remote" $'\ny\nShare new tool\n' 2>&1)
 if printf '%s' "$error_out" | grep -F 'could not complete the scan' >/dev/null && ! printf '%s' "$error_out" | grep -F -e 'Remove the secret' -e 'looks like a secret' >/dev/null; then pass "scanner failure is not reported as a secret"; else fail "scanner failure is not reported as a secret"; fi
