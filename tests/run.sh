@@ -799,6 +799,11 @@ if DOTS_RELEASE_BASE_URL="file://$assets" DOTS_BIN_DIR="$destination" "$ROOT/ins
 off_path=$(DOTS_RELEASE_BASE_URL="file://$assets" DOTS_BIN_DIR="$TMP/off-path-bin" PATH=/usr/bin:/bin "$ROOT/install.sh" 2>&1)
 on_path=$(DOTS_RELEASE_BASE_URL="file://$assets" DOTS_BIN_DIR="$TMP/on-path-bin" PATH="$TMP/on-path-bin:/usr/bin:/bin" "$ROOT/install.sh" 2>&1)
 if printf '%s' "$off_path" | grep -F "$TMP/off-path-bin is not on your PATH" >/dev/null && printf '%s' "$off_path" | grep -F "$TMP/off-path-bin/dots init" >/dev/null && test "$(printf '%s\n' "$on_path" | wc -l | tr -d ' ')" = 1; then pass "installer explains PATH"; else fail "installer explains PATH"; fi
+slash_path=$(DOTS_RELEASE_BASE_URL="file://$assets" DOTS_BIN_DIR="$TMP/on-path-bin/" PATH="$TMP/on-path-bin/:/usr/bin:/bin" "$ROOT/install.sh" 2>&1)
+mkdir -p "$TMP/shadow-bin"; cp "$DOTS" "$TMP/shadow-bin/dots"
+shadow=$(DOTS_RELEASE_BASE_URL="file://$assets" DOTS_BIN_DIR="$TMP/on-path-bin" PATH="$TMP/shadow-bin:$TMP/on-path-bin:/usr/bin:/bin" "$ROOT/install.sh" 2>&1)
+quoted=$(DOTS_RELEASE_BASE_URL="file://$assets" DOTS_BIN_DIR="$TMP/it's here" PATH=/usr/bin:/bin "$ROOT/install.sh" 2>&1)
+if test "$(printf '%s\n' "$slash_path" | wc -l | tr -d ' ')" = 1 && printf '%s' "$shadow" | grep -F "$TMP/shadow-bin/dots comes first" >/dev/null && printf '%s' "$quoted" | grep -F 'add that folder to PATH' >/dev/null && ! printf '%s' "$quoted" | grep -F 'echo ' >/dev/null; then pass "installer handles trailing slashes, shadowing, and unusual names"; else fail "installer handles trailing slashes, shadowing, and unusual names"; fi
 printf tampered >"$assets/dots"
 if ! DOTS_RELEASE_BASE_URL="file://$assets" DOTS_BIN_DIR="$TMP/unsafe-bin" "$ROOT/install.sh" >/dev/null 2>&1 && test ! -e "$TMP/unsafe-bin/dots"; then pass "installer checksum refusal"; else fail "installer checksum refusal"; fi
 

@@ -33,18 +33,47 @@ printf 'Installed dots to %s/dots\n' "$DESTINATION"
 
 # The shell only finds commands in PATH folders, and a fresh Mac does not list
 # ~/.local/bin, so say how to run dots rather than leave "command not found".
-case $DESTINATION in
-  "$HOME"/*) shown="\$HOME/${DESTINATION#"$HOME"/}" ;;
-  *) shown=$DESTINATION ;;
-esac
-case ":$PATH:" in
-  *":$DESTINATION:"*|*":$DESTINATION/:"*)
-    found=$(command -v dots 2>/dev/null || true)
-    if test -n "$found" && test "$found" != "$DESTINATION/dots"; then
-      printf 'Note: %s comes first on your PATH, so "dots" runs that copy. Remove it, or run %s/dots.\n' "$found" "$DESTINATION"
-    fi ;;
-  *)
-    printf '%s is not on your PATH, so the dots command will not be found. Either:\n' "$DESTINATION"
-    printf '  run it by full path:  %s/dots init\n' "$DESTINATION"
-    printf '  or add it to PATH:    echo '"'"'export PATH="%s:$PATH"'"'"' >> ~/.zprofile && exec zsh\n' "$shown" ;;
-esac
+# PATH entries are compared without trailing slashes, and an empty entry means the
+# current folder, as the shell treats it.
+strip_slashes() {
+  s_dir=$1
+  while test "${#s_dir}" -gt 1 && test "${s_dir%/}" != "$s_dir"; do s_dir=${s_dir%/}; done
+  printf '%s' "$s_dir"
+}
+destination=$(strip_slashes "$DESTINATION")
+on_path=false
+first_dots=
+old_ifs=$IFS
+IFS=:
+# No globbing while splitting, and a trailing ":" is one more empty entry.
+set -f
+path_entries=$PATH
+case $path_entries in *:) path_entries="$path_entries:." ;; esac
+for entry in $path_entries""; do
+  test -n "$entry" && test "$entry" != . || entry=$PWD
+  entry=$(strip_slashes "$entry")
+  test "$entry" = "$destination" && on_path=true
+  if test -z "$first_dots" && test -f "$entry/dots" && test -x "$entry/dots"; then first_dots=$entry; fi
+done
+IFS=$old_ifs
+set +f
+if test "$on_path" = true; then
+  if test -n "$first_dots" && test "$first_dots" != "$destination"; then
+    printf 'Note: %s/dots comes first on your PATH, so the dots command runs that copy. Remove it, or run the one just installed by its full path.\n' "$first_dots"
+  fi
+else
+  printf '%s is not on your PATH, so the dots command will not be found.\n' "$destination"
+  # Copy-paste commands only for plain folder names; anything else is described.
+  case $destination in
+    *[!A-Za-z0-9._/-]*)
+      printf 'Run dots by its full path, or add that folder to PATH in ~/.zprofile.\n' ;;
+    *)
+      case $destination in
+        "$HOME"/*) shown="\$HOME/${destination#"$HOME"/}" ;;
+        *) shown=$destination ;;
+      esac
+      printf 'Either:\n'
+      printf '  run it by full path:  %s/dots init\n' "$destination"
+      printf '  or add it to PATH:    echo '"'"'export PATH="%s:$PATH"'"'"' >> ~/.zprofile && exec zsh -l\n' "$shown" ;;
+  esac
+fi
