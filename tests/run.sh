@@ -392,6 +392,20 @@ if ! printf '%s' "$merge_out" | grep -F 'New files in the repository' >/dev/null
 printf 'shell 2\n' >"$update_home/.zshrc"
 changed_out=$(run_update "$update_home" "$remote" $'\n' 2>&1 | tr -d '\r')
 if printf '%s' "$changed_out" | grep -E '\[x\] \.zshrc  \(changed\)$' >/dev/null && printf '%s' "$changed_out" | grep -F 'Changes in this PR:' >/dev/null && printf '%s' "$changed_out" | grep -E '^  changed +\.zshrc$' >/dev/null; then pass "update shows changed shared files"; else fail "update shows changed shared files"; fi
+# Edits come first; unticking one leaves it out of the PR and keeps the local file.
+printf vim >"$update_home/.vimrc"
+first_out=$(run_update "$update_home" "$remote" '' 2>&1 | tr -d '\r')
+rm -f "$update_home/.vimrc"
+first_order=$(printf '%s\n' "$first_out" | awk '/^(edits to send|new files|shared files|previously ignored) \(.*\):$/ { h = $0; sub(/ \(.*/, "", h); printf "%s|", h }')
+if test "$first_order" = 'edits to send|new files|'; then pass "update lists edits first"; else fail "update lists edits first ($first_order)"; fi
+held_out=$(run_update "$update_home" "$remote" $'1\n' 2>&1 | tr -d '\r')
+if printf '%s' "$held_out" | grep -F 'nothing to send' >/dev/null && ! printf '%s' "$held_out" | grep -F 'PR title' >/dev/null && test "$(cat "$update_home/.zshrc")" = 'shell 2'; then pass "update can leave an edit out"; else fail "update can leave an edit out"; fi
+# A shared file deleted here is listed as an edit; sending it stops sharing the file.
+mv "$update_home/.zshrc" "$TMP/zshrc.kept"
+deleted_out=$(run_update "$update_home" "$remote" $'\ny\nStop sharing shell\n' 2>&1 | tr -d '\r')
+deleted_ref=$(/usr/bin/git --git-dir="$remote" for-each-ref --sort=-refname --format='%(refname)' 'refs/heads/dots/update-*' | head -1)
+if printf '%s' "$deleted_out" | grep -E '\[x\] \.zshrc  \(deleted here\)$' >/dev/null && printf '%s' "$deleted_out" | grep -F 'Stop sharing on every Mac' >/dev/null && ! /usr/bin/git --git-dir="$remote" show "$deleted_ref:.config/dots/manifest" | grep -Fx .zshrc >/dev/null && ! /usr/bin/git --git-dir="$remote" cat-file -e "$deleted_ref:.zshrc" 2>/dev/null; then pass "update sends a local deletion as stop sharing"; else fail "update sends a local deletion as stop sharing"; fi
+mv "$TMP/zshrc.kept" "$update_home/.zshrc"
 
 # ── Per-Mac file selection ─────────────────────────────────
 # Checklist rows list home-folder files first, sorted, then other directories.
@@ -617,10 +631,10 @@ run_derived_default_init "$pages_home" "$pages_remote" $'y\n' >/dev/null 2>&1 ||
 printf shell >"$pages_home/.zshrc"; printf '.zshrc\n' >>"$pages_home/.config/dots/manifest"
 printf vim >"$pages_home/.vimrc"; printf input >"$pages_home/.inputrc"; printf 'ignore .inputrc\n' >>"$pages_home/data/selection"
 pages_out=$(run_update "$pages_home" "$pages_remote" $'\n' 2>&1 | tr -d '\r')
-pages_order=$(printf '%s\n' "$pages_out" | awk '/^(new files|shared files|previously ignored):$/ { printf "%s|", $0 } /^ *[0-9]+  \[/ { row = $0; sub(/^ *[0-9]+  /, "", row); printf "%s|", row }')
+pages_order=$(printf '%s\n' "$pages_out" | awk '/^(edits to send|new files|shared files|previously ignored) \(.*\):$/ { h = $0; sub(/ \(.*/, "", h); printf "%s:|", h } /^ *[0-9]+  \[/ { row = $0; sub(/^ *[0-9]+  /, "", row); printf "%s|", row }')
 if test "$pages_order" = 'new files:|[ ] .vimrc|shared files:|[x] .zshrc|previously ignored:|[ ] .inputrc|'; then pass "update lists new, shared, then ignored files"; else fail "update lists new, shared, then ignored files ($pages_order)"; fi
 pages_out=$(run_update "$pages_home" "$pages_remote" $'\n' 2>&1 | tr -d '\r')
-pages_order=$(printf '%s\n' "$pages_out" | awk '/^(new files|shared files|previously ignored):$/ { printf "%s|", $0 }')
+pages_order=$(printf '%s\n' "$pages_out" | awk '/^(edits to send|new files|shared files|previously ignored) \(.*\):$/ { h = $0; sub(/ \(.*/, "", h); printf "%s:|", h }')
 if test "$pages_order" = 'shared files:|previously ignored:|'; then pass "update skips the new page when nothing is new"; else fail "update skips the new page when nothing is new ($pages_order)"; fi
 
 # update refuses to run while this Mac is behind the repository, before any checklist.

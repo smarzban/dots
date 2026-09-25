@@ -34,11 +34,14 @@ say() { printf '%s\n' "$*"; }
 fail() { printf 'dots: %s\n' "$*" >&2; exit 1; }
 usage() { cat <<'EOF'
 Usage:
-  dots init [--discover] [--backup-existing] [remote] [branch]
-  dots select
-  dots status
-  dots sync [--continue]
-  dots update
+  dots status                  show whether this Mac is up to date and what you edited here
+  dots sync                    bring this Mac up to date with the repository
+  dots update                  send your edits and shared-file changes as a pull request
+  dots select                  choose which repository files this Mac uses
+  dots init [remote] [branch]  connect this Mac to your dotfiles repository (once per Mac)
+    --backup-existing          back up differing local files, then use the repository's
+    --discover                 only list the files dots would suggest
+  dots sync --continue         finish a merge that stopped on a conflict
 EOF
 }
 
@@ -777,13 +780,13 @@ print_candidates() {
 # Rows are "group<TAB>path[<TAB>note]" lines; manifest paths never contain whitespace. The chosen file holds the initial ticks and is
 # rewritten with the final ticks. Returns 1 when the user cancels.
 # Append one checklist page named $2 holding the paths in $1 (home files first).
-# Paths listed in the optional file $4 get the note "changed" after their name.
+# The optional file $4 holds "path<TAB>note" lines; a note is shown after the name.
 labelled_rows() {
   test -s "$1" || return 0
   build_rows "$1" "$3.page"
-  cut -f 2 "$3.page" | awk -F '\t' -v label="$2" -v notes="${4:-/dev/null}" '
-    BEGIN { while ((getline line < notes) > 0) changed[line] = 1 }
-    { print label "\t" $0 (($0 in changed) ? "\tchanged" : "") }' >>"$3"
+  cut -f 2 "$3.page" | awk -v label="$2" -v notes="${4:-/dev/null}" '
+    BEGIN { while ((getline line < notes) > 0) { i = index(line, "\t"); if (i) note[substr(line, 1, i - 1)] = substr(line, i + 1) } }
+    { print label "\t" $0 (($0 in note) ? "\t" note[$0] : "") }' >>"$3"
   rm -f "$3.page"
 }
 
@@ -1495,37 +1498,54 @@ update_command() {
   list_minus "$temp/candidates" "$temp/ignore" "$temp/fresh-candidates"
   list_intersect "$temp/candidates" "$temp/pending" "$temp/pending-ticked"
   list_union "$temp/shared" "$temp/pending-ticked" "$temp/chosen"
-  # One page each, in this order, skipping empty ones: files never offered before,
-  # files this Mac shares, and files unticked before.
-  : >"$temp/rows"
-  # Shared files whose content or executable bit differs from the last sync.
+  # Shared files whose content or executable bit differs from the last sync, and
+  # which of those were deleted here.
   set --
   while IFS= read -r path; do set -- "$@" "$path"; done <"$temp/shared"
   : >"$temp/changed"
   if test $# -gt 0; then
     git_repo diff --name-only -z HEAD -- "$@" 2>/dev/null | tr '\0' '\n' >"$temp/changed" || : >"$temp/changed"
   fi
-  labelled_rows "$temp/fresh-candidates" "new files" "$temp/rows"
-  labelled_rows "$temp/shared" "shared files" "$temp/rows" "$temp/changed"
-  labelled_rows "$temp/ignored-candidates" "previously ignored" "$temp/rows"
+  : >"$temp/missing"
+  : >"$temp/notes"
+  while IFS= read -r path; do
+    if test -e "$DOTS_HOME/$path" || test -L "$DOTS_HOME/$path"; then
+      printf '%s\tchanged\n' "$path" >>"$temp/notes"
+    else
+      printf '%s\n' "$path" >>"$temp/missing"
+      printf '%s\tdeleted here\n' "$path" >>"$temp/notes"
+    fi
+  done <"$temp/changed"
+  list_minus "$temp/shared" "$temp/changed" "$temp/unchanged"
+  # One page each, in this order, skipping empty ones. Page names say what a tick
+  # means: edits to send, files to start sharing, files to keep sharing.
+  : >"$temp/rows"
+  labelled_rows "$temp/changed" "edits to send (untick to leave an edit out of this PR)" "$temp/rows" "$temp/notes"
+  labelled_rows "$temp/fresh-candidates" "new files (tick to start sharing)" "$temp/rows"
+  labelled_rows "$temp/unchanged" "shared files (untick to stop sharing on every Mac)" "$temp/rows"
+  labelled_rows "$temp/ignored-candidates" "previously ignored (tick to start sharing)" "$temp/rows"
   if test -s "$temp/rows"; then
-    checklist "$temp/rows" "$temp/chosen" "Tick files to share from this Mac. Unticked shared files leave the repository for every Mac; unticked new files move to previously ignored." || fail "update cancelled, nothing was changed"
+    checklist "$temp/rows" "$temp/chosen" "Choose what this update sends to the repository" || fail "update cancelled, nothing was changed"
   fi
   list_intersect "$temp/chosen" "$temp/candidates" "$temp/added"
-  list_minus "$temp/shared" "$temp/chosen" "$temp/removed"
+  # Unticked unchanged files stop being shared; a ticked deletion removes the file.
+  list_minus "$temp/unchanged" "$temp/chosen" "$temp/removed"
+  list_intersect "$temp/missing" "$temp/chosen" "$temp/deleted-sent"
+  cat "$temp/deleted-sent" >>"$temp/removed"
+  # Unticked edits keep the repository version in this PR; the local file is kept.
+  list_minus "$temp/changed" "$temp/chosen" "$temp/held"
   if test -s "$temp/added" || test -s "$temp/removed"; then
-    test ! -s "$temp/added" || { say "Add to the repository:"; sed 's/^/  /' "$temp/added"; }
-    test ! -s "$temp/removed" || { say "Remove from the repository for every Mac (local files are kept):"; sed 's/^/  /' "$temp/removed"; }
+    test ! -s "$temp/added" || { say "Start sharing:"; sed 's/^/  /' "$temp/added"; }
+    test ! -s "$temp/removed" || { say "Stop sharing on every Mac (files on this Mac are kept):"; sed 's/^/  /' "$temp/removed"; }
     printf 'Continue? [y/N] ' >&2
     IFS= read -r answer || fail "update cancelled"
     case $answer in
       y|Y|yes|YES) confirmed=true ;;
-      *) confirmed=false; : >"$temp/added"; : >"$temp/removed"; say "no file changes selected" ;;
+      *) confirmed=false; : >"$temp/added"; : >"$temp/removed"; say "no files added or removed" ;;
     esac
   else
     confirmed=true
   fi
-  # Remember the ticks right away, so a failed push or PR does not lose them.
   if test "$confirmed" = true; then
     # Pending entries not offered in this checklist (for example a file deleted since) are kept.
     list_minus "$temp/pending" "$temp/candidates" "$temp/pending-unoffered"
@@ -1540,8 +1560,9 @@ update_command() {
   validate_manifest_file "$temp/proposed-manifest" "$temp/proposed-list" || fail "proposed manifest is unsafe"
   # Only files this Mac uses are read from HOME; the rest keep their repository version.
   list_union "$temp/use" "$temp/added" "$temp/used-after"
-  list_intersect "$temp/proposed-list" "$temp/used-after" "$temp/proposed-used"
-  list_minus "$temp/proposed-list" "$temp/used-after" "$temp/proposed-unused"
+  list_intersect "$temp/proposed-list" "$temp/used-after" "$temp/proposed-used-all"
+  list_minus "$temp/proposed-used-all" "$temp/held" "$temp/proposed-used"
+  list_minus "$temp/proposed-list" "$temp/proposed-used" "$temp/proposed-unused"
   validate_live_paths "$temp/proposed-used" || fail "proposed manifest names an unsafe live path"
   list_with_manifest "$temp/proposed-list" "$temp/proposed-paths"
   list_with_manifest "$temp/proposed-used" "$temp/scan-paths"
@@ -1554,7 +1575,7 @@ update_command() {
   "$GIT" -C "$update_workspace" checkout --quiet "$base" || fail "could not prepare update base"
   configure_sandbox_identity "$update_workspace" || fail "Git author identity is required for an update PR"
   prepare_local_sandbox "$update_workspace" "$temp/head-paths" "$temp/proposed-paths" "$temp/update-paths" "$temp/proposed-manifest" "$temp/proposed-unused" || fail "could not prepare local update"
-  "$GIT" -C "$update_workspace" diff --cached --quiet && { say "no local changes or candidates to update"; return; }
+  "$GIT" -C "$update_workspace" diff --cached --quiet && { say "nothing to send"; return; }
   say "Changes in this PR:"
   "$GIT" -C "$update_workspace" diff --cached --name-status -z --no-renames | while IFS= read -r -d '' us_status && IFS= read -r -d '' us_path; do
     case $us_status in A) us_word=added ;; D) us_word=removed ;; *) us_word=changed ;; esac
