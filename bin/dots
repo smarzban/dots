@@ -11,7 +11,10 @@ GIT_CONFIG_GLOBAL=/dev/null
 export GIT_PAGER GIT_CONFIG_GLOBAL
 
 DOTS_HOME=${HOME:?HOME must be set}
+case $DOTS_HOME in /*) ;; *) printf 'dots: %s\n' "HOME must be an absolute path" >&2; exit 1 ;; esac
 DOTS_DATA=${DOTS_DATA_DIR:-"$DOTS_HOME/.local/share/dots"}
+# Git below runs from HOME, so a relative data folder is made absolute first.
+case $DOTS_DATA in /*) ;; *) DOTS_DATA=$PWD/$DOTS_DATA ;; esac
 REPO="$DOTS_DATA/repo.git"
 GIT=${DOTS_GIT:-/usr/bin/git}
 GITLEAKS=${DOTS_GITLEAKS:-gitleaks}
@@ -51,7 +54,9 @@ require_dependencies() {
   require_tool "$GITLEAKS"
 }
 
-git_repo() { "$GIT" --no-pager --git-dir="$REPO" --work-tree="$DOTS_HOME" "$@"; }
+# Runs from HOME: pathspecs are relative to the current folder when that folder is
+# inside the work tree, so from ~/projects a manifest path would name the wrong file.
+git_repo() { "$GIT" -C "$DOTS_HOME" --no-pager --git-dir="$REPO" --work-tree="$DOTS_HOME" "$@"; }
 git_dir() { "$GIT" --no-pager --git-dir="$1" "${@:2}"; }
 
 safe_branch() {

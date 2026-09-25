@@ -635,6 +635,19 @@ remote_edit "$remote" "printf remote > \"\$1/.config/example/settings\"" || exit
 menu_out=$(run_sync "$menu_home" $'3\n' 2>&1)
 if printf '%s' "$menu_out" | grep -F '4. Merge' >/dev/null && ! printf '%s' "$menu_out" | grep -F '3. Create a PR' >/dev/null && printf '%s' "$menu_out" | grep -F 'choose 4 to merge' >/dev/null && test "$(cat "$menu_home/.config/example/settings")" = local; then pass "sync offers merging, not a PR, when behind"; else fail "sync offers merging, not a PR, when behind"; fi
 
+# Paths resolve against HOME whatever the current folder, including a folder inside HOME.
+remote=$TMP/any-folder.git; new_remote "$remote"; af_home=$TMP/home-any-folder; mkdir -p "$af_home/projects/sub"; expect_ok run_dots "$af_home" init "$remote" main
+printf edited >"$af_home/.config/example/settings"
+af_status=$( (cd "$af_home/projects/sub" && HOME=$af_home DOTS_DATA_DIR=$af_home/data DOTS_GITLEAKS=$MOCK "$DOTS" status) 2>&1)
+if printf '%s' "$af_status" | grep -F ' M .config/example/settings' >/dev/null; then pass "status sees changes from a folder inside HOME"; else fail "status sees changes from a folder inside HOME"; fi
+remote_edit "$remote" "printf remote > \"\$1/.config/example/settings\"" || exit 1
+af_sync=$( (cd "$af_home/projects/sub" && run_sync "$af_home" '') 2>&1)
+if printf '%s' "$af_sync" | grep -F 'Choose [1-4]' >/dev/null && test "$(cat "$af_home/.config/example/settings")" = edited; then pass "sync sees local changes from a folder inside HOME"; else fail "sync sees local changes from a folder inside HOME"; fi
+# init and select check files out into HOME, not into the current folder.
+af2_home=$TMP/home-any-folder-init; mkdir -p "$af2_home/sub"
+(cd "$af2_home/sub" && HOME=$af2_home DOTS_DATA_DIR=$af2_home/data DOTS_GITLEAKS=$MOCK "$DOTS" init "$remote" main) >/dev/null 2>&1
+if test "$(cat "$af2_home/.config/example/settings" 2>/dev/null)" = remote && test ! -e "$af2_home/sub/.config"; then pass "init from a folder inside HOME writes to HOME"; else fail "init from a folder inside HOME writes to HOME"; fi
+
 # Confirmed ticks are saved before publishing, so a failed PR creation keeps them.
 remote=$TMP/update-fail.git; fail_home=$TMP/home-update-fail; mkdir -p "$fail_home"
 run_derived_default_init "$fail_home" "$remote" $'y\n' >/dev/null 2>&1 || exit 1
