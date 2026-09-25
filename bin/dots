@@ -748,6 +748,14 @@ print_candidates() {
 # ── Checklist ───────────────────────────────────────────────
 # Rows are "group<TAB>path" lines; manifest paths never contain whitespace. The chosen file holds the initial ticks and is
 # rewritten with the final ticks. Returns 1 when the user cancels.
+# Append one checklist page named $2 holding the paths in $1 (home files first).
+labelled_rows() {
+  test -s "$1" || return 0
+  build_rows "$1" "$3.page"
+  cut -f 2- "$3.page" | awk -v label="$2" '{ print label "\t" $0 }' >>"$3"
+  rm -f "$3.page"
+}
+
 build_rows() {
   # Home-folder files first, then one group per top-level directory.
   awk '{ i = index($0, "/"); if (i) print "1\t" substr($0, 1, i - 1) "\t" $0; else print "0\thome\t" $0 }' "$1" |
@@ -802,7 +810,10 @@ checklist_plain() {
   cl_chosen=$2
   say "$3"
   number=0
-  while IFS=$TAB read -r _group path; do
+  cl_groups=$(cut -f 1 "$cl_rows" | uniq | wc -l | tr -d ' ')
+  cl_last=
+  while IFS=$TAB read -r cl_group path; do
+    if test "$cl_groups" -gt 1 && test "$cl_group" != "$cl_last"; then printf '%s:\n' "$cl_group"; cl_last=$cl_group; fi
     number=$((number + 1))
     if path_in_list "$path" "$cl_chosen"; then mark='[x]'; else mark='[ ]'; fi
     printf '%3d  %s %s\n' "$number" "$mark" "$path"
@@ -1423,13 +1434,16 @@ update_command() {
   list_intersect "$temp/live-manifest" "$temp/use" "$temp/shared"
   list_intersect "$temp/candidates" "$temp/ignore" "$temp/ignored-candidates"
   list_minus "$temp/candidates" "$temp/ignore" "$temp/fresh-candidates"
-  list_union "$temp/shared" "$temp/fresh-candidates" "$temp/choices"
   list_intersect "$temp/candidates" "$temp/pending" "$temp/pending-ticked"
   list_union "$temp/shared" "$temp/pending-ticked" "$temp/chosen"
-  build_rows "$temp/choices" "$temp/rows"
-  LC_ALL=C sort "$temp/ignored-candidates" | awk '{ print "previously ignored\t" $0 }' >>"$temp/rows"
+  # One page each, in this order, skipping empty ones: files never offered before,
+  # files this Mac shares, and files unticked before.
+  : >"$temp/rows"
+  labelled_rows "$temp/fresh-candidates" "new files" "$temp/rows"
+  labelled_rows "$temp/shared" "shared files" "$temp/rows"
+  labelled_rows "$temp/ignored-candidates" "previously ignored" "$temp/rows"
   if test -s "$temp/rows"; then
-    checklist "$temp/rows" "$temp/chosen" "Files shared from this Mac. Unticked shared files leave the repository for every Mac; unticked new files are listed last next time." || fail "update cancelled, nothing was changed"
+    checklist "$temp/rows" "$temp/chosen" "Tick files to share from this Mac. Unticked shared files leave the repository for every Mac; unticked new files move to previously ignored." || fail "update cancelled, nothing was changed"
   fi
   list_intersect "$temp/chosen" "$temp/candidates" "$temp/added"
   list_minus "$temp/shared" "$temp/chosen" "$temp/removed"

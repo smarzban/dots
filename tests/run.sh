@@ -590,6 +590,18 @@ printf 'edited again\n' >"$om_home/.zshrc"
 remote_edit "$remote" "printf changed > \"\$1/.config/example/settings\"" || exit 1
 if run_sync "$om_home" '' 2>&1 | grep -F 'Choose [1-4]' >/dev/null && test "$(cat "$om_home/.zshrc")" = 'edited again'; then pass "sync still asks about changes not in the repository"; else fail "sync still asks about changes not in the repository"; fi
 
+# update pages: new files first, then shared files, then previously ignored; empty pages are skipped.
+pages_remote=$TMP/update-pages.git; pages_home=$TMP/home-update-pages; mkdir -p "$pages_home"
+run_derived_default_init "$pages_home" "$pages_remote" $'y\n' >/dev/null 2>&1 || exit 1
+printf shell >"$pages_home/.zshrc"; printf '.zshrc\n' >>"$pages_home/.config/dots/manifest"
+printf vim >"$pages_home/.vimrc"; printf input >"$pages_home/.inputrc"; printf 'ignore .inputrc\n' >>"$pages_home/data/selection"
+pages_out=$(run_update "$pages_home" "$pages_remote" $'\n' 2>&1 | tr -d '\r')
+pages_order=$(printf '%s\n' "$pages_out" | awk '/^(new files|shared files|previously ignored):$/ { printf "%s|", $0 } /^ *[0-9]+  \[/ { row = $0; sub(/^ *[0-9]+  /, "", row); printf "%s|", row }')
+if test "$pages_order" = 'new files:|[ ] .vimrc|shared files:|[x] .zshrc|previously ignored:|[ ] .inputrc|'; then pass "update lists new, shared, then ignored files"; else fail "update lists new, shared, then ignored files ($pages_order)"; fi
+pages_out=$(run_update "$pages_home" "$pages_remote" $'\n' 2>&1 | tr -d '\r')
+pages_order=$(printf '%s\n' "$pages_out" | awk '/^(new files|shared files|previously ignored):$/ { printf "%s|", $0 }')
+if test "$pages_order" = 'shared files:|previously ignored:|'; then pass "update skips the new page when nothing is new"; else fail "update skips the new page when nothing is new ($pages_order)"; fi
+
 # Confirmed ticks are saved before publishing, so a failed PR creation keeps them.
 remote=$TMP/update-fail.git; fail_home=$TMP/home-update-fail; mkdir -p "$fail_home"
 run_derived_default_init "$fail_home" "$remote" $'y\n' >/dev/null 2>&1 || exit 1
