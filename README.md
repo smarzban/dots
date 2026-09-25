@@ -96,7 +96,7 @@ Shows whether this Mac is up to date, which files you've edited here and not sen
 Brings this Mac up to date with the repository. Run it whenever another Mac shared something. Your edits are kept, and it only asks about a file when the repository changed that same file too (see [When a file changed on both sides](#when-a-file-changed-on-both-sides)).
 
 **`dots update`**
-Sends your changes to the repository as a pull request: edits to files you already share, new files you want to start sharing, and files you want to stop sharing. Nothing reaches the repository until you merge the PR on GitHub, and your files on this Mac are never changed. See [The update checklist](#the-update-checklist).
+Sends your changes to the repository as a pull request: edits to files you already share, new files you want to start sharing, and files you want to stop sharing. Nothing reaches the repository until you merge the PR on GitHub. Your files on this Mac only change if the repository has something new, which `update` brings in first, as `sync` would. See [The update checklist](#the-update-checklist).
 
 **`dots select`**
 Chooses which of the repository's files this Mac uses. Use it when a shared file doesn't belong on this Mac (a work setting on your personal Mac, say): untick it here, and this Mac stops syncing it while other Macs keep it. Tick it again later to bring it back. Only affects this Mac.

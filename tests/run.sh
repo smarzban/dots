@@ -112,6 +112,10 @@ if [ "$1" = -C ] && [ "${3:-}" = push ]; then
     exec /usr/bin/git -C "$2" push "$4" "$DOTS_TEST_GH_REMOTE" "$6"
   fi
 fi
+# Record which credential helpers a fetch would use.
+case " $* " in
+  *' fetch '*) printf '%s|%s|%s|%s\n' "${GIT_CONFIG_COUNT:-}" "${GIT_CONFIG_KEY_0:-}" "${GIT_CONFIG_VALUE_0-unset}" "${GIT_CONFIG_VALUE_1:-}" >>"$DOTS_TEST_GH_LOG.fetch" ;;
+esac
 exec /usr/bin/git "$@"
 EOF
   chmod 755 "$MOCK_GH" "$MOCK_GIT"
@@ -637,7 +641,7 @@ if ! printf '%s' "$om_out" | grep -F -e 'Choose [1-2]' -e 'edited here' >/dev/nu
 chmod +x "$om_home/.zshrc"
 remote_edit "$remote" "printf again > \"\$1/.config/example/settings\"" || exit 1
 mode_out=$(run_sync "$om_home" '' 2>&1)
-if ! printf '%s' "$mode_out" | grep -F 'Choose [1-2]' >/dev/null && test -x "$om_home/.zshrc" && run_dots "$om_home" status 2>&1 | grep -Fx '  .zshrc' >/dev/null; then pass "sync keeps a mode-only local change as an edit"; else fail "sync keeps a mode-only local change as an edit"; fi
+if ! printf '%s' "$mode_out" | grep -F 'Choose [1-2]' >/dev/null && test -x "$om_home/.zshrc" && test "$(/usr/bin/git --git-dir="$om_home/data/repo.git" rev-parse HEAD)" = "$(/usr/bin/git --git-dir="$remote" rev-parse main)" && run_dots "$om_home" status 2>&1 | grep -Fx '  .zshrc' >/dev/null; then pass "sync keeps a mode-only local change as an edit"; else fail "sync keeps a mode-only local change as an edit"; fi
 chmod -x "$om_home/.zshrc"
 printf 'edited again\n' >"$om_home/.zshrc"
 remote_edit "$remote" "printf changed > \"\$1/.config/example/settings\"" || exit 1
@@ -673,6 +677,20 @@ test -n "$seq_ref" && /usr/bin/git --git-dir="$seq_remote" update-ref refs/heads
 seq_status=$(run_dots "$seq_home" status 2>&1)
 seq_out=$(run_update "$seq_home" "$seq_remote" $'\n' 2>&1 | tr -d '\r')
 if printf '%s\n' "$seq_status" | grep -A1 -F 'edited here' | grep -Fx '  .gitconfig' >/dev/null && ! printf '%s\n' "$seq_status" | grep -Fx '  .zshrc' >/dev/null && ! printf '%s' "$seq_out" | grep -F -e 'sync first' -e 'Choose [1-2]' >/dev/null && printf '%s' "$seq_out" | grep -F '.gitconfig  (changed)' >/dev/null && ! printf '%s' "$seq_out" | grep -F '.zshrc  (changed)' >/dev/null && test "$(cat "$seq_home/.gitconfig")" = 'git 2'; then pass "update after merging part of your edits just works"; else fail "update after merging part of your edits just works"; fi
+# Fetches for a GitHub origin use only gh's credential helper, after clearing others.
+fetch_log=$TMP/gh-update.log.fetch
+if grep -Fx "2|credential.helper||!gh auth git-credential" "$fetch_log" >/dev/null 2>&1 && ! grep -v -Fx "2|credential.helper||!gh auth git-credential" "$fetch_log" >/dev/null; then pass "GitHub fetches use only gh credentials"; else fail "GitHub fetches use only gh credentials"; fi
+# After catching up, update looks at the new state: this Mac's own merged file is shared, not new.
+own_remote=$TMP/update-own.git; own_home=$TMP/home-update-own; mkdir -p "$own_home"
+run_derived_default_init "$own_home" "$own_remote" $'y\n' >/dev/null 2>&1 || exit 1
+printf shell >"$own_home/.zshrc"
+run_update "$own_home" "$own_remote" $'1\ny\nShare shell\n' >/dev/null 2>&1
+own_ref=$(/usr/bin/git --git-dir="$own_remote" for-each-ref --format='%(refname)' 'refs/heads/dots/update-*' | head -1)
+test -n "$own_ref" && /usr/bin/git --git-dir="$own_remote" update-ref refs/heads/main "$own_ref" && /usr/bin/git --git-dir="$own_remote" update-ref -d "$own_ref"
+printf vim >"$own_home/.vimrc"
+own_out=$(run_update "$own_home" "$own_remote" '' 2>&1 | tr -d '\r')
+own_order=$(printf '%s\n' "$own_out" | awk '/^(edits to send|new files|shared files|previously ignored) \(.*\):$/ { h = $0; sub(/ \(.*/, "", h); printf "%s:|", h } /^ *[0-9]+  \[/ { row = $0; sub(/^ *[0-9]+  /, "", row); printf "%s|", row }')
+if test "$own_order" = 'new files:|[ ] .vimrc|shared files:|[x] .zshrc|'; then pass "update checks the Mac again after catching up"; else fail "update checks the Mac again after catching up ($own_order)"; fi
 # With a file changed on both sides, update stops and names it, changing nothing.
 uc_remote=$TMP/update-clash.git; uc_home=$TMP/home-update-clash; mkdir -p "$uc_home"
 run_derived_default_init "$uc_home" "$uc_remote" $'y\n' >/dev/null 2>&1 || exit 1
@@ -684,6 +702,49 @@ uc_before=$(/usr/bin/git --git-dir="$uc_home/data/repo.git" rev-parse HEAD)
 uc_out=$(run_update "$uc_home" "$uc_remote" $'\n' 2>&1)
 if printf '%s' "$uc_out" | grep -F 'changed both here and in the repository' >/dev/null && printf '%s' "$uc_out" | tr -d '\r' | grep -Fx '  .zshrc' >/dev/null && ! printf '%s' "$uc_out" | grep -F 'Toggle numbers' >/dev/null && test "$(cat "$uc_home/.zshrc")" = mine && test "$(/usr/bin/git --git-dir="$uc_home/data/repo.git" rev-parse HEAD)" = "$uc_before"; then pass "update stops on a clash"; else fail "update stops on a clash"; fi
 
+# Incoming files keep this Mac's permissions (a private file stays private) and take
+# the repository's executable bit.
+remote=$TMP/modes.git; new_remote "$remote"; modes_home=$TMP/home-modes; mkdir -p "$modes_home"; expect_ok run_dots "$modes_home" init "$remote" main
+chmod 600 "$modes_home/.config/example/settings"
+remote_edit "$remote" "printf '%s\\n' '.config/example/settings' '.config/example/run.sh' > \"\$1/.config/dots/manifest\"; printf changed > \"\$1/.config/example/settings\"; printf 'echo hi' > \"\$1/.config/example/run.sh\"; chmod +x \"\$1/.config/example/run.sh\"" || exit 1
+run_sync "$modes_home" $'\n' >/dev/null 2>&1
+if test "$(stat -f '%Lp' "$modes_home/.config/example/settings")" = 600 && test "$(cat "$modes_home/.config/example/settings")" = changed && test -x "$modes_home/.config/example/run.sh" && test "$(stat -f '%Lp' "$modes_home/.config/example/run.sh")" = 700; then pass "catching up keeps private permissions and sets the executable bit"; else fail "catching up keeps private permissions and sets the executable bit ($(stat -f '%Lp' "$modes_home/.config/example/settings") $(stat -f '%Lp' "$modes_home/.config/example/run.sh" 2>/dev/null))"; fi
+remote_edit "$remote" "chmod -x \"\$1/.config/example/run.sh\"" || exit 1
+run_sync "$modes_home" '' >/dev/null 2>&1
+if test ! -x "$modes_home/.config/example/run.sh"; then pass "catching up clears the executable bit"; else fail "catching up clears the executable bit"; fi
+# A file deleted here and changed in the repository is asked about; keeping yours keeps it deleted.
+rm -f "$modes_home/.config/example/settings"
+remote_edit "$remote" "printf again > \"\$1/.config/example/settings\"" || exit 1
+del_out=$(run_sync "$modes_home" $'2\n' 2>&1)
+if printf '%s' "$del_out" | grep -F '.config/example/settings: deleted here, changed in the repository' >/dev/null && test ! -e "$modes_home/.config/example/settings" && test "$(/usr/bin/git --git-dir="$modes_home/data/repo.git" rev-parse HEAD)" = "$(/usr/bin/git --git-dir="$remote" rev-parse main)"; then pass "clash: a deletion here can be kept"; else fail "clash: a deletion here can be kept"; fi
+# A file edited while sync is running is not overwritten: a git wrapper edits it just as
+# sync reads the incoming version.
+race_git=$TMP/race-git
+cat >"$race_git" <<'EOF'
+#!/bin/sh
+case " $* " in *' cat-file blob '*) printf 'edited meanwhile\n' >"$DOTS_TEST_RACE_FILE" ;; esac
+exec /usr/bin/git "$@"
+EOF
+chmod +x "$race_git"
+remote=$TMP/race.git; new_remote "$remote"; race_home=$TMP/home-race; mkdir -p "$race_home"; expect_ok run_dots "$race_home" init "$remote" main
+remote_edit "$remote" "printf incoming > \"\$1/.config/example/settings\"" || exit 1
+race_out=$(DOTS_GIT=$race_git DOTS_TEST_RACE_FILE=$race_home/.config/example/settings run_sync "$race_home" '' 2>&1)
+if printf '%s' "$race_out" | grep -F 'could not finish catching up' >/dev/null && test "$(cat "$race_home/.config/example/settings")" = 'edited meanwhile'; then pass "an edit made during sync is not overwritten"; else fail "an edit made during sync is not overwritten"; fi
+# Manifest merge: lines removed here stay removed, lines added on both sides appear once.
+remote=$TMP/manifest-merge.git; new_remote "$remote"
+remote_edit "$remote" "printf '%s\\n' '.config/example/settings' '.zshrc' > \"\$1/.config/dots/manifest\"; printf shell > \"\$1/.zshrc\"" || exit 1
+mm_home=$TMP/home-manifest-merge; mkdir -p "$mm_home"; expect_ok run_dots "$mm_home" init "$remote" main
+printf '%s\n' '.config/example/settings' '.bashrc' '.inputrc' >"$mm_home/.config/dots/manifest"; printf b >"$mm_home/.bashrc"; printf i >"$mm_home/.inputrc"
+remote_edit "$remote" "printf '%s\\n' '.config/example/settings' '.zshrc' '.inputrc' > \"\$1/.config/dots/manifest\"; printf i > \"\$1/.inputrc\"" || exit 1
+run_sync "$mm_home" $'\n' >/dev/null 2>&1
+mm_lines=$(grep -v '^#' "$mm_home/.config/dots/manifest" | tr '\n' ' ')
+if test "$mm_lines" = '.config/example/settings .inputrc .bashrc '; then pass "manifest merge keeps removals and adds each line once"; else fail "manifest merge keeps removals and adds each line once ($mm_lines)"; fi
+# status validates the repository but does not scan it, and refuses unsafe content.
+remote=$TMP/status-checks.git; new_remote "$remote"; sc_home=$TMP/home-status-checks; mkdir -p "$sc_home"; expect_ok run_dots "$sc_home" init "$remote" main
+remote_edit "$remote" "printf DOTS_TEST_SECRET > \"\$1/.config/example/settings\"" || exit 1
+if DOTS_TEST_GITLEAKS_FAIL=1 run_dots "$sc_home" status 2>&1 | grep -F 'changed in the repository, not here yet' >/dev/null; then pass "status does not scan the repository"; else fail "status does not scan the repository"; fi
+remote_edit "$remote" "printf bad > \"\$1/.unapproved\"" || exit 1
+if ! (run_dots "$sc_home" status) >"$TMP/sc.out" 2>&1 && grep -F 'unsafe changes' "$TMP/sc.out" >/dev/null; then pass "status refuses unsafe repository content"; else fail "status refuses unsafe repository content"; fi
 # With nothing new anywhere, sync just says so.
 remote=$TMP/menu-shape.git; new_remote "$remote"; menu_home=$TMP/home-menu-shape; mkdir -p "$menu_home"; expect_ok run_dots "$menu_home" init "$remote" main
 if run_sync "$menu_home" '' 2>&1 | tr -d '\r' | grep -Fx 'this Mac is up to date' >/dev/null; then pass "sync reports up to date"; else fail "sync reports up to date"; fi

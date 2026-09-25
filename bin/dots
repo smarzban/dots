@@ -78,7 +78,7 @@ valid_manifest_path() {
   local LC_ALL=C
   case $line in *[!\ -~]*) return 1 ;; esac
   case $line in
-    '#'*|:*|*'\\'*|.gitleaks.toml|/*|./*|*/|*'//'*|*'..'*|*'?'*|*'*'*|*'['*|*']'*|*'{'*|*'}'*) return 1 ;;
+    '#'*|:*|*'\\'*|*'"'*|.gitleaks.toml|/*|./*|*/|*'//'*|*'..'*|*'?'*|*'*'*|*'['*|*']'*|*'{'*|*'}'*) return 1 ;;
   esac
   case "/$line/" in */./*|*/../*) return 1 ;; esac
   # grep above is line-based, so a newline must be refused explicitly.
@@ -1178,7 +1178,9 @@ live_states() {
 
 # $1 revision, $2 output of "state<TAB>path" lines for every file in it.
 tree_states() {
-  git_repo ls-tree -r "$1" >"$2.raw" || return 1
+  # Validated trees hold no names with newlines, so NUL-separated output can become
+  # lines without Git's quoting.
+  git_repo ls-tree -r -z "$1" | tr '\0' '\n' >"$2.raw" || return 1
   awk -F '\t' '{ split($1, meta, " "); print meta[1] " " meta[3] "\t" $2 }' "$2.raw" >"$2"
   rm -f "$2.raw"
 }
@@ -1280,30 +1282,44 @@ catch_up() {
     printf '%s\n' "$MANIFEST" >>"$cu/backup"
   fi
   if test -s "$cu/backup"; then backup_live_files "$cu/backup" sync || fail "could not back up local files; nothing was changed"; fi
-  # Re-checked just before writing, so an edit made meanwhile is never overwritten.
-  cat "$cu/write" >"$cu/recheck"
-  test "$manifest_merge" = false || printf '%s\n' "$MANIFEST" >>"$cu/recheck"
-  if test -s "$cu/recheck"; then
-    live_states "$cu/recheck" "$cu/recheck-now" || fail "a local file changed during sync; nothing was changed, run dots sync again"
-    awk -F '\t' 'FILENAME == ARGV[1] { was[$2] = $1; next } was[$2] != $1 { bad = 1 } END { exit bad }' "$cu/live" "$cu/recheck-now" ||
-      fail "a local file changed during sync; nothing was changed, run dots sync again${BACKUP_DIR:+ (backup: $BACKUP_DIR)}"
-  fi
+  # Each file is re-checked (safe path, same state as when it was compared) right
+  # before it is written, so an edit made meanwhile is not overwritten. Existing
+  # files keep their permissions apart from the executable bit; new ones are private.
   mkdir -p "$1/cu-files" || return 1
+  test "$manifest_merge" = false || printf '%s\n' "$MANIFEST" >>"$cu/write"
+  : >"$cu/written"
   while IFS= read -r cu_path; do
-    safe_live_path "$cu_path" || fail "unsafe path while writing $cu_path"
-    mkdir -p "$1/cu-files/$(dirname "$cu_path")" "$DOTS_HOME/$(dirname "$cu_path")" || return 1
-    git_repo cat-file blob "$3:$cu_path" >"$1/cu-files/$cu_path" || return 1
-    case $(awk -F '\t' -v p="$cu_path" '$4 == p { print $3; exit }' "$cu/states") in
-      100755*) chmod 755 "$1/cu-files/$cu_path" ;;
-      *) chmod 644 "$1/cu-files/$cu_path" ;;
-    esac
-    cp -p "$1/cu-files/$cu_path" "$DOTS_HOME/$cu_path" || return 1
+    mkdir -p "$1/cu-files/$(dirname "$cu_path")" || return 1
+    if test "$cu_path" = "$MANIFEST" && test "$manifest_merge" = true; then
+      cp "$1/cu-merged-manifest" "$1/cu-files/$cu_path" || return 1
+      cu_exec=no
+    else
+      git_repo cat-file blob "$3:$cu_path" >"$1/cu-files/$cu_path" || return 1
+      case $(awk -F '\t' -v p="$cu_path" '$4 == p { print $3; exit }' "$cu/states") in 100755*) cu_exec=yes ;; *) cu_exec=no ;; esac
+    fi
+    safe_live_path "$cu_path" || return 1
+    mkdir -p "$DOTS_HOME/$(dirname "$cu_path")" || return 1
+    printf '%s\n' "$cu_path" >"$cu/one"
+    live_states "$cu/one" "$cu/one-now" || return 1
+    awk -F '\t' 'FILENAME == ARGV[1] { was[$2] = $1; next } was[$2] != $1 { bad = 1 } END { exit bad }' "$cu/live" "$cu/one-now" || return 1
+    safe_live_path "$cu_path" || return 1
+    cp "$1/cu-files/$cu_path" "$DOTS_HOME/$cu_path" || return 1
+    if test "$cu_exec" = yes; then chmod u+x "$DOTS_HOME/$cu_path"; else chmod a-x "$DOTS_HOME/$cu_path"; fi || return 1
+    printf '%s\n' "$cu_path" >>"$cu/written"
   done <"$cu/write"
-  if test "$manifest_merge" = true; then cp "$1/cu-merged-manifest" "$DOTS_HOME/$MANIFEST" || return 1; fi
   advance_to_remote_revision "$4" "$3" || return 1
   write_selection "$1/use" "$1/skip" "$1/remote-manifest" "$1/pending" || return 1
-  grep -v -x -F -- "$MANIFEST" "$cu/write" >"$cu/brought" || : >"$cu/brought"
+  grep -v -x -F -- "$MANIFEST" "$cu/written" >"$cu/brought" || : >"$cu/brought"
   cat "$cu/local" "$cu/keep" | grep -v -x -F -- "$MANIFEST" >"$cu/kept-edits" || : >"$cu/kept-edits"
+}
+
+# Stop after a failed catch-up, saying what was already written.
+catch_up_failed() {
+  if test -s "$1/cu/written"; then
+    say "already updated from the repository before stopping:" >&2
+    sed 's/^/  /' "$1/cu/written" >&2
+  fi
+  fail "could not finish catching up (a file changed meanwhile, or a write failed); run dots sync again${BACKUP_DIR:+. Backup: $BACKUP_DIR}"
 }
 
 # Print what catching up did, and edits that are still only on this Mac.
@@ -1337,14 +1353,24 @@ status_command() {
   say "branch: $branch"
   if test "$behind" -eq 0; then say "this Mac: up to date"; else say "this Mac: $behind repository update(s) not synced yet (run dots sync)"; fi
   say "files used on this Mac: $(list_count "$temp/selected-manifest") of $(list_count "$temp/manifest-union")"
-  # Files this Mac uses here or in the repository, compared three ways.
+  # The files sync would look at (the repository's files this Mac uses, files added
+  # to the manifest here, and the manifest), compared three ways.
   list_intersect "$temp/remote-manifest" "$temp/use" "$temp/remote-used"
-  list_union "$temp/selected-manifest" "$temp/remote-used" "$temp/status-used"
+  list_union "$temp/remote-used" "$temp/hand-added" "$temp/status-used"
   list_with_manifest "$temp/status-used" "$temp/status-paths"
   classify_paths "$head" "$remote" "$temp/status-paths" "$temp/st" || fail "could not compare files with the repository"
+  # The manifest is combined by sync, never asked about.
+  if path_in_list "$MANIFEST" "$temp/st/clash"; then
+    printf '%s\n' "$MANIFEST" >"$temp/st/manifest-only"
+    list_minus "$temp/st/clash" "$temp/st/manifest-only" "$temp/st/clash.next" && mv -f "$temp/st/clash.next" "$temp/st/clash"
+    printf '%s\n' "$MANIFEST" >>"$temp/st/local"
+  fi
   if test -s "$temp/st/local"; then say "edited here, not in the repository yet:"; sed 's/^/  /' "$temp/st/local"; else say "edits here: none"; fi
   test ! -s "$temp/st/incoming" || { say "changed in the repository, not here yet:"; sed 's/^/  /' "$temp/st/incoming"; }
   test ! -s "$temp/st/clash" || { say "changed both here and in the repository (dots sync will ask):"; sed 's/^/  /' "$temp/st/clash"; }
+  list_intersect "$temp/head-manifest" "$temp/use" "$temp/st-was-used"
+  list_minus "$temp/st-was-used" "$temp/remote-manifest" "$temp/st-dropped"
+  test ! -s "$temp/st-dropped" || { say "no longer shared by the repository (dots sync keeps them on this Mac):"; sed 's/^/  /' "$temp/st-dropped"; }
   list_minus "$temp/remote-manifest" "$temp/use" "$temp/st-unseen-all"
   list_minus "$temp/st-unseen-all" "$temp/skip" "$temp/st-unseen"
   test ! -s "$temp/st-unseen" || { say "new in the repository (dots sync will ask whether to use them here):"; sed 's/^/  /' "$temp/st-unseen"; }
@@ -1397,7 +1423,7 @@ sync_command() {
     cat "$temp/unseen-chosen" >>"$temp/use"
     cat "$temp/newly-skipped" >>"$temp/skip"
   fi
-  catch_up "$temp" "$base" "$remote" "$branch" ask
+  catch_up "$temp" "$base" "$remote" "$branch" ask || catch_up_failed "$temp"
   report_catch_up "$temp"
   if test "$base" = "$remote" && ! test -s "$temp/cu/brought"; then say "this Mac is up to date"; else say "this Mac is now up to date"; fi
   report_local_edits "$temp/cu/kept-edits"
@@ -1459,7 +1485,7 @@ update_command() {
     git_repo diff --cached --quiet || fail "repository index has staged changes; resolve or unstage them first"
     git_repo merge-base --is-ancestor "$base" "$remote" || fail "remote history is not a safe fast-forward"
     pending_arrived "$temp" "$temp/remote-manifest"
-    catch_up "$temp" "$base" "$remote" "$branch" refuse
+    catch_up "$temp" "$base" "$remote" "$branch" refuse || catch_up_failed "$temp"
     report_catch_up "$temp"
     list_minus "$temp/remote-manifest" "$temp/use" "$temp/unseen-used"
     list_minus "$temp/unseen-used" "$temp/skip" "$temp/unseen"
@@ -1580,7 +1606,7 @@ update_command() {
   # Push to the GitHub remote itself: "origin" in this temporary clone is the local data repository.
   "$GIT" -C "$update_workspace" push --quiet "$origin" "$update_branch" || fail "could not push update branch"
   "$GH" pr create --repo "$repo_name" --base "$branch" --head "$update_branch" --title "$title" --body "Created by dots update." || fail "branch was pushed but PR creation failed"
-  say "update PR created, local files and manifest remain unchanged"
+  say "update PR created"
   say "after merging it on GitHub, run: dots sync"
 }
 
