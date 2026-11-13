@@ -954,7 +954,9 @@ if test -n "$hp_ref" && cmp -s "$TMP/hp-format-blob" "$TMP/hp-format" && /usr/bi
 test -n "$hp_ref" && /usr/bin/git --git-dir="$hp_remote" update-ref refs/heads/main "$hp_ref" && /usr/bin/git --git-dir="$hp_remote" update-ref -d "$hp_ref"
 run_sync "$hp_a" '' >/dev/null 2>&1
 hp_a_status=$(run_dots "$hp_a" status 2>&1)
-if cmp -s "$hp_a/.zprofile" "$TMP/hp-a-zprofile" && cmp -s "$hp_a/.inputrc" "$TMP/hp-inputrc" && printf '%s\n' "$hp_a_status" | grep -Fx 'edits here: none' >/dev/null && printf '%s\n' "$hp_a_status" | grep -Fx 'this Mac: up to date' >/dev/null; then pass "home paths: the sending Mac is unchanged and clean"; else fail "home paths: the sending Mac is unchanged and clean"; fi
+/usr/bin/git --git-dir="$hp_a/data/repo.git" show HEAD:.zprofile >"$TMP/hp-a-head" 2>/dev/null
+# Clean although the synced blob holds the placeholder and the live file the home folder.
+if cmp -s "$TMP/hp-a-head" "$TMP/hp-stored" && cmp -s "$hp_a/.zprofile" "$TMP/hp-a-zprofile" && cmp -s "$hp_a/.inputrc" "$TMP/hp-inputrc" && printf '%s\n' "$hp_a_status" | grep -Fx 'edits here: none' >/dev/null && printf '%s\n' "$hp_a_status" | grep -Fx 'this Mac: up to date' >/dev/null; then pass "home paths: the sending Mac is unchanged and clean"; else fail "home paths: the sending Mac is unchanged and clean"; fi
 expect_ok run_dots "$hp_b" init "$hp_remote" main
 hp_b_status=$(run_dots "$hp_b" status 2>&1)
 if cmp -s "$hp_b/.zprofile" "$TMP/hp-b-zprofile" && cmp -s "$hp_b/.inputrc" "$TMP/hp-inputrc" && printf '%s\n' "$hp_b_status" | grep -Fx 'edits here: none' >/dev/null; then pass "home paths: init on another home writes its own home folder"; else fail "home paths: init on another home writes its own home folder"; fi
