@@ -17,6 +17,9 @@ DOTS_DATA=${DOTS_DATA_DIR:-"$DOTS_HOME/.local/share/dots"}
 case $DOTS_DATA in /*) ;; *) DOTS_DATA=$PWD/$DOTS_DATA ;; esac
 REPO="$DOTS_DATA/repo.git"
 GIT=${DOTS_GIT:-/usr/bin/git}
+PERL=${DOTS_PERL:-/usr/bin/perl}
+# Perl only translates home paths; nothing from the environment may change how.
+unset PERL5OPT PERL5LIB PERLLIB PERL5DB PERL_UNICODE
 GITLEAKS=${DOTS_GITLEAKS:-gitleaks}
 GH=${DOTS_GH:-gh}
 # Test and self-hosting overrides. Normal no-argument init derives its owner from gh.
@@ -24,6 +27,13 @@ DEFAULT_REMOTE=${DOTS_DEFAULT_REMOTE:-}
 DEFAULT_GITHUB_REPO=${DOTS_DEFAULT_GITHUB_REPO:-}
 DEFAULT_GITHUB_REPO_NAME=${DOTS_DEFAULT_GITHUB_REPO_NAME:-dotfiles}
 MANIFEST=.config/dots/manifest
+# Repository format marker, written by dots update and never to HOME. Format 2
+# stores this Mac's home folder as PLACEHOLDER; a tree without it is format 1.
+FORMAT_MARKER=.config/dots/format
+PLACEHOLDER=@@DOTS_HOME@@
+# The home folder as it appears in file contents, without a trailing slash.
+TR_HOME=$DOTS_HOME
+while test "${TR_HOME%/}" != "$TR_HOME"; do TR_HOME=${TR_HOME%/}; done
 TAB=$(printf '\t')
 NL='
 '
@@ -54,6 +64,7 @@ require_tool() {
 require_dependencies() {
   require_tool "$GIT"
   require_tool "$GITLEAKS"
+  require_tool "$PERL"
 }
 
 # Runs from HOME: pathspecs are relative to the current folder when that folder is
@@ -96,6 +107,7 @@ validate_manifest_file() {
   while IFS= read -r line || test -n "$line"; do
     case $line in ''|'#'*) continue ;; esac
     valid_manifest_path "$line" || return 1
+    test "$line" != "$FORMAT_MARKER" || return 1
     grep -F -x -- "$line" "$out_file" >/dev/null 2>&1 && return 1
     printf '%s\n' "$line" >>"$out_file" || return 1
   done <"$manifest_file"
@@ -180,6 +192,17 @@ validate_tree() {
     mode=${meta%% *}
     test "$mode" = 100644 -o "$mode" = 100755 || return 1
     case $path in *"$NL"*) return 1 ;; esac
+    # The format marker is the one path outside the manifest, and only in the exact
+    # form this version writes. Anything else came from a newer dots.
+    if test "$path" = "$FORMAT_MARKER"; then
+      vt_want=$(printf '2\n' | git_dir "$gitdir" hash-object --stdin) || return 1
+      vt_blob=${meta##* }
+      if test "$mode" != 100644 || test "$vt_blob" != "$vt_want"; then
+        say "dots: a newer version of dots wrote this repository; upgrade dots on this Mac, then try again" >&2
+        return 1
+      fi
+      continue
+    fi
     printf '%s\n' "$path" >>"$temp/tree-paths"
   done <"$entry_file"
   { cat "$list"; printf '%s\n' "$MANIFEST"; } >"$temp/tree-allowed"
@@ -193,6 +216,84 @@ validate_tree() {
     is_reserved_path "$path" && return 1
   done <"$list"
   return 0
+}
+
+# ── Home paths ──────────────────────────────────────────────
+# The repository stores a file with this Mac's home folder replaced by PLACEHOLDER
+# (its stored form); each Mac writes its own home folder back in (its live form).
+# The home folder is replaced only where it is a whole path: not after a name
+# character or "/", and not before a name character. The manifest is never
+# translated. translate_file stored|live SRC DST copies byte for byte otherwise.
+# Status 3: SRC already contains PLACEHOLDER (stored only), which translating back
+# would silently turn into a home folder.
+translate_file() {
+  DOTS_TR_HOME=$TR_HOME "$PERL" -e '
+    use strict;
+    use warnings;
+    my ($direction, $source, $target) = @ARGV;
+    my $home = $ENV{DOTS_TR_HOME};
+    my $mark = "\@\@DOTS_HOME\@\@";
+    open(my $in, "<:raw", $source) or exit 1;
+    my $data = do { local $/; <$in> };
+    close($in) or exit 1;
+    $data = "" unless defined $data;
+    if ($direction eq "stored") {
+      exit 3 if index($data, $mark) >= 0;
+      $data =~ s{(?<![A-Za-z0-9._/-])\Q$home\E(?![A-Za-z0-9._-])}{$mark}g if length $home;
+    } elsif ($direction eq "live") {
+      $data =~ s{\Q$mark\E}{$home}g;
+    } else {
+      exit 1;
+    }
+    open(my $out, ">:raw", $target) or exit 1;
+    print {$out} $data or exit 1;
+    close($out) or exit 1;
+    exit 0;' "$1" "$2" "$3"
+}
+
+to_stored() { translate_file stored "$1" "$2"; }
+to_live() { translate_file live "$1" "$2"; }
+
+placeholder_refusal() {
+  printf 'dots: %s already contains %s, the text dots stores in place of your home folder. Change that text in the file, then try again.\n' "$1" "$PLACEHOLDER" >&2
+}
+
+# stored_copy path dst: the stored form of a live file. A file that already holds
+# the placeholder is refused, naming only its path. The manifest is copied as is.
+stored_copy() {
+  if test "$1" = "$MANIFEST"; then cat "$DOTS_HOME/$1" >"$2"; return; fi
+  to_stored "$DOTS_HOME/$1" "$2"
+  sc_status=$?
+  test "$sc_status" -ne 3 || placeholder_refusal "$1"
+  test "$sc_status" -eq 0
+}
+
+# live_blob gitdir rev path dst: a repository file as this Mac writes it.
+live_blob() {
+  git_dir "$1" cat-file blob "$2:$3" >"$4.blob" 2>/dev/null || { rm -f "$4.blob"; return 1; }
+  if test "$3" = "$MANIFEST"; then mv -f "$4.blob" "$4"; return; fi
+  to_live "$4.blob" "$4" || { rm -f "$4.blob"; return 1; }
+  rm -f "$4.blob"
+}
+
+# replace_live path src mode: put src at a live path through a temporary file in the
+# same folder, so a failed write leaves the old file whole. Like git checkout, the
+# file is private, executable when mode is 100755.
+replace_live() {
+  safe_live_path "$1" || return 1
+  rl_dir=$(dirname "$DOTS_HOME/$1")
+  mkdir -p "$rl_dir" || return 1
+  rl_tmp=$(mktemp "$rl_dir/.dots-new.XXXXXX") || return 1
+  if cat "$2" >"$rl_tmp" && if test "$3" = 100755; then chmod 700 "$rl_tmp"; else chmod 600 "$rl_tmp"; fi && safe_live_path "$1" && mv -f "$rl_tmp" "$DOTS_HOME/$1"; then
+    return 0
+  fi
+  rm -f "$rl_tmp"
+  return 1
+}
+
+# tree_mode states path: the Git mode of path in tree_states output.
+tree_mode() {
+  case $(awk -F '\t' -v p="$2" '$2 == p { print $1; exit }' "$1") in 100755*) printf '100755' ;; *) printf '100644' ;; esac
 }
 
 # Run gitleaks with exactly its default rules: run_gitleaks dir|git target [flags].
@@ -1007,12 +1108,17 @@ prepare_local_sandbox() {
     elif path_in_list "$path" "$live_paths"; then
       test -f "$DOTS_HOME/$path" && test ! -L "$DOTS_HOME/$path" || return 1
       mkdir -p "$sandbox/$(dirname "$path")" || return 1
-      cp -p "$DOTS_HOME/$path" "$sandbox/$path" || return 1
+      stored_copy "$path" "$sandbox/$path" || return 1
+      # Git keeps only the executable bit, in either direction.
+      if test -x "$DOTS_HOME/$path"; then chmod 755 "$sandbox/$path"; else chmod 644 "$sandbox/$path"; fi || return 1
       printf '%s\n' "$path" >>"$sandbox.copied"
     else
       "$GIT" -C "$sandbox" rm -f --quiet --ignore-unmatch -- "$path" >/dev/null || return 1
     fi
   done <"$all_paths"
+  # Every update commit says its files are in format 2, so older versions refuse it.
+  mkdir -p "$sandbox/$(dirname "$FORMAT_MARKER")" && printf '2\n' >"$sandbox/$FORMAT_MARKER" && chmod 644 "$sandbox/$FORMAT_MARKER" || return 1
+  printf '%s\n' "$FORMAT_MARKER" >>"$sandbox.copied"
   set --
   while IFS= read -r path; do set -- "$@" "$path"; done <"$sandbox.copied"
   rm -f "$sandbox.copied"
@@ -1112,7 +1218,9 @@ init_command() {
     safe_live_path "$path" || fail "candidate path has an unsafe live parent"
     test ! -e "$DOTS_HOME/$path" && test ! -L "$DOTS_HOME/$path" && continue
     test -f "$DOTS_HOME/$path" && test ! -L "$DOTS_HOME/$path" || fail "refusing to replace an existing live path that is not a regular file"
-    git_dir "$candidate_repo" cat-file blob "$revision:$path" 2>/dev/null | cmp -s - "$DOTS_HOME/$path" && continue
+    # Identical means identical once this Mac's home folder is written in.
+    stored_copy "$path" "$temp/probe" || fail "could not compare $path with the repository; nothing was changed"
+    live_blob "$candidate_repo" "$revision" "$path" "$temp/compare" && cmp -s "$temp/compare" "$DOTS_HOME/$path" && continue
     test "$backup_existing" = true || fail "refusing to overwrite an existing live file; rerun with --backup-existing to back it up and use the repository version"
     printf '%s\n' "$path" >>"$temp/backup-paths"
   done <"$temp/candidate-paths"
@@ -1138,10 +1246,13 @@ init_command() {
   git_repo config dots.branch "$branch" || init_abort "could not record branch"
   git_repo update-ref "refs/heads/$branch" "$revision" || init_abort "could not set requested branch"
   git_repo symbolic-ref HEAD "refs/heads/$branch" || init_abort "could not select requested branch"
-  # Checkout only validated, explicit paths. This is never a broad checkout.
-  set --
-  while IFS= read -r path; do set -- "$@" "$path"; done <"$temp/candidate-paths"
-  git_repo checkout --quiet "$revision" -- "$@" || init_abort "checkout failed after preflight; inspect live files before retrying"
+  # Write only validated, explicit paths, in this Mac's live form.
+  tree_states "$revision" "$temp/init-states" || init_abort "could not read the repository files"
+  while IFS= read -r path; do
+    { live_blob "$REPO" "$revision" "$path" "$temp/init-file" &&
+      replace_live "$path" "$temp/init-file" "$(tree_mode "$temp/init-states" "$path")"; } ||
+      init_abort "checkout failed after preflight; inspect live files before retrying"
+  done <"$temp/candidate-paths"
   # The index records every repository file; only chosen ones exist in HOME.
   git_repo read-tree "$revision" || init_abort "could not record the repository index"
   write_selection "$temp/use" "$temp/skip" "$temp/manifest-paths" || init_abort "could not save the file selection"
@@ -1156,24 +1267,30 @@ init_command() {
 # (base), and in the repository (remote). A state is "<mode> <blob>", or "-" when the
 # file is absent; only Git's mode (executable bit) and content count.
 
-# $1 path list, $2 output of "state<TAB>path" lines for this Mac's files.
+# $1 path list, $2 output of "state<TAB>path" lines for this Mac's files. A blob
+# is the hash of the file's stored form, so it compares with repository blobs.
 live_states() {
-  : >"$2.present" && : >"$2.modes" || return 1
+  : >"$2.present" && : >"$2.modes" && : >"$2.stored-paths" || return 1
+  rm -rf "$2.stored" && mkdir "$2.stored" || return 1
+  ls_n=0
   while IFS= read -r ls_path; do
     ls_file=$DOTS_HOME/$ls_path
     if test -L "$ls_file"; then return 1
     elif test -f "$ls_file"; then
+      ls_n=$((ls_n + 1))
+      stored_copy "$ls_path" "$2.stored/$ls_n" || return 1
       printf '%s\n' "$ls_path" >>"$2.present"
+      printf '%s\n' "$2.stored/$ls_n" >>"$2.stored-paths"
       if test -x "$ls_file"; then printf '100755\n'; else printf '100644\n'; fi >>"$2.modes"
     elif test -e "$ls_file"; then return 1
     fi
   done <"$1"
   : >"$2.blobs"
-  if test -s "$2.present"; then git_repo hash-object --no-filters --stdin-paths <"$2.present" >"$2.blobs" || return 1; fi
+  if test -s "$2.present"; then git_dir "$REPO" hash-object --no-filters --stdin-paths <"$2.stored-paths" >"$2.blobs" || return 1; fi
   test "$(list_count "$2.present")" = "$(list_count "$2.blobs")" || return 1
   paste -d ' ' "$2.modes" "$2.blobs" | paste -d "$TAB" - "$2.present" >"$2.known"
   awk -F '\t' 'FILENAME == ARGV[1] { state[$2] = $1; next } { print (($0 in state) ? state[$0] : "-") "\t" $0 }' "$2.known" "$1" >"$2"
-  rm -f "$2.present" "$2.modes" "$2.blobs" "$2.known"
+  rm -rf "$2.present" "$2.modes" "$2.blobs" "$2.known" "$2.stored-paths" "$2.stored"
 }
 
 # $1 revision, $2 output of "state<TAB>path" lines for every file in it.
@@ -1296,7 +1413,7 @@ catch_up() {
       cp "$1/cu-merged-manifest" "$1/cu-files/$cu_path" || return 1
       cu_exec=no
     else
-      git_repo cat-file blob "$3:$cu_path" >"$1/cu-files/$cu_path" || return 1
+      live_blob "$REPO" "$3" "$cu_path" "$1/cu-files/$cu_path" || return 1
       case $(awk -F '\t' -v p="$cu_path" '$4 == p { print $3; exit }' "$cu/states") in 100755*) cu_exec=yes ;; *) cu_exec=no ;; esac
     fi
     safe_live_path "$cu_path" || return 1
@@ -1509,11 +1626,12 @@ update_command() {
   list_union "$temp/shared" "$temp/pending-ticked" "$temp/chosen"
   # Shared files whose content or executable bit differs from the last sync, and
   # which of those were deleted here.
-  set --
-  while IFS= read -r path; do set -- "$@" "$path"; done <"$temp/shared"
+  # Compared in stored form; a path not in the repository yet is not an edit.
   : >"$temp/changed"
-  if test $# -gt 0; then
-    git_repo diff --name-only -z HEAD -- "$@" 2>/dev/null | tr '\0' '\n' >"$temp/changed" || : >"$temp/changed"
+  if test -s "$temp/shared"; then
+    live_states "$temp/shared" "$temp/shared-live" || fail "could not compare files with the repository; nothing was sent"
+    tree_states "$base" "$temp/shared-base" || fail "could not compare files with the repository; nothing was sent"
+    awk -F '\t' 'FILENAME == ARGV[1] { b[$2] = $1; next } ($2 in b) && b[$2] != $1 { print $2 }' "$temp/shared-base" "$temp/shared-live" >"$temp/changed" || fail "could not compare files with the repository; nothing was sent"
   fi
   : >"$temp/missing"
   : >"$temp/notes"
@@ -1537,6 +1655,9 @@ update_command() {
     checklist "$temp/rows" "$temp/chosen" "Choose what this update sends to the repository" || fail "update cancelled, nothing was sent${caught_up:+ (this Mac did catch up with the repository first)}"
   fi
   list_intersect "$temp/chosen" "$temp/candidates" "$temp/added"
+  while IFS= read -r path; do
+    stored_copy "$path" "$temp/probe" || fail "could not read $path; nothing was sent"
+  done <"$temp/added"
   # Unticked unchanged files stop being shared; a ticked deletion removes the file.
   list_minus "$temp/unchanged" "$temp/chosen" "$temp/removed"
   list_intersect "$temp/missing" "$temp/chosen" "$temp/deleted-sent"
@@ -1588,9 +1709,11 @@ update_command() {
   "$GIT" -C "$update_workspace" checkout --quiet "$base" || fail "could not prepare update base"
   configure_sandbox_identity "$update_workspace" || fail "Git author identity is required for an update PR"
   prepare_local_sandbox "$update_workspace" "$temp/head-paths" "$temp/proposed-paths" "$temp/update-paths" "$temp/proposed-manifest" "$temp/proposed-unused" || fail "could not prepare local update"
-  "$GIT" -C "$update_workspace" diff --cached --quiet && { say "nothing to send"; return; }
+  # Adding the format marker alone is not worth a PR; it goes with the next real change.
+  "$GIT" -C "$update_workspace" diff --cached --quiet -- ":(top,exclude)$FORMAT_MARKER" && { say "nothing to send"; return; }
   say "Changes in this PR:"
   "$GIT" -C "$update_workspace" diff --cached --name-status -z --no-renames | while IFS= read -r -d '' us_status && IFS= read -r -d '' us_path; do
+    test "$us_path" != "$FORMAT_MARKER" || continue
     case $us_status in A) us_word=added ;; D) us_word=removed ;; *) us_word=changed ;; esac
     valid_manifest_path "$us_path" || us_path='(a file with an unusual name)'
     printf '  %-8s %s\n' "$us_word" "$us_path"
@@ -1636,7 +1759,8 @@ select_command() {
     safe_live_path "$path" || fail "a chosen file has an unsafe live parent; selection unchanged"
     test -e "$DOTS_HOME/$path" || test -L "$DOTS_HOME/$path" || continue
     test -f "$DOTS_HOME/$path" && test ! -L "$DOTS_HOME/$path" || fail "a chosen file exists locally but is not a regular file; selection unchanged"
-    git_repo cat-file blob "$head:$path" 2>/dev/null | cmp -s - "$DOTS_HOME/$path" || printf '%s\n' "$path" >>"$temp/backup-paths"
+    stored_copy "$path" "$temp/probe" || fail "could not compare $path with the repository; selection unchanged"
+    { live_blob "$REPO" "$head" "$path" "$temp/compare" && cmp -s "$temp/compare" "$DOTS_HOME/$path"; } || printf '%s\n' "$path" >>"$temp/backup-paths"
   done <"$temp/newly-used"
   if test -s "$temp/backup-paths"; then
     say "These local files differ from the repository version:"
@@ -1651,9 +1775,12 @@ select_command() {
     done <"$temp/backup-paths"
   fi
   if test -s "$temp/newly-used"; then
-    set --
-    while IFS= read -r path; do set -- "$@" "$path"; done <"$temp/newly-used"
-    git_repo checkout --quiet "$head" -- "$@" || fail "could not bring in the chosen files${BACKUP_DIR:+ (backup: $BACKUP_DIR)}"
+    tree_states "$head" "$temp/select-states" || fail "could not read the repository files; selection unchanged"
+    while IFS= read -r path; do
+      { live_blob "$REPO" "$head" "$path" "$temp/select-file" &&
+        replace_live "$path" "$temp/select-file" "$(tree_mode "$temp/select-states" "$path")"; } ||
+        fail "could not bring in the chosen files${BACKUP_DIR:+ (backup: $BACKUP_DIR)}"
+    done <"$temp/newly-used"
   fi
   write_selection "$temp/chosen" "$temp/skip" "$temp/head-manifest" "$temp/pending" || fail "could not save the file selection"
   say "this Mac uses $(list_count "$temp/chosen") of $(list_count "$temp/head-manifest") repository file(s)"

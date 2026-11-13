@@ -188,6 +188,9 @@ Patterns are relative to your home folder and `*` also matches `/`. Write out th
 - Paths must be plain files inside your home directory: no absolute paths, `..`, globs, whitespace, or symlinks.
 - Which of those files this Mac uses, and which suggestions it ignored, is saved in `~/.local/share/dots/selection`. It stays on this Mac and is never synced.
 - Before anything is written or pushed, `dots` validates the repository contents against the manifest and scans them with gitleaks. Any problem stops the command without printing file contents.
+- Your home folder is stored in the repository as the placeholder `@@DOTS_HOME@@`, and each Mac writes its own home folder back in. A file naming `/Users/you/bin` works on a Mac whose home folder is `/Users/someone`. A file that already contains the text `@@DOTS_HOME@@` is refused rather than changed.
+- After you upgrade from an earlier version, the first `dots update` lists the files that contain your home folder as edits to send, once, so the repository stores them portably.
+- Repositories written by this version carry a format marker, `.config/dots/format`, which older versions of `dots` refuse. Upgrade `dots` on every Mac.
 
 ## Development
 

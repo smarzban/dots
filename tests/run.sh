@@ -925,5 +925,121 @@ else
   pass "installed gitleaks integration (unavailable, skipped)"
 fi
 
+# ── Home paths are stored as a placeholder ────────────────
+# Homes at different paths; A's name has regex characters, so it must be matched literally.
+hp_a=$TMP/hp/home.a+b; hp_b=$TMP/hq/bob; hp_c=$TMP/hr/carol; hp_old=$TMP/hs/olga
+mkdir -p "$hp_a" "$hp_b" "$hp_c" "$hp_old"
+hp_remote=$TMP/home-paths.git
+run_derived_default_init "$hp_a" "$hp_remote" $'y\n' >/dev/null 2>&1 || exit 1
+expect_ok run_dots "$hp_c" init "$hp_remote" main
+# v0.2.3, run in its own temporary home, connects before the new format arrives.
+hp_v023=$TMP/dots-v0.2.3
+/usr/bin/git -C "$ROOT" show v0.2.3:bin/dots >"$hp_v023" 2>/dev/null && chmod 755 "$hp_v023"
+run_v023() { HOME=$hp_old DOTS_DATA_DIR=$hp_old/data DOTS_GITLEAKS=$MOCK GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid TERM=dumb "$@"; }
+(run_v023 "$hp_v023" init "$hp_remote" main) >/dev/null 2>&1
+# The home folder at the start, mid-line, before ":" and at the end (no final newline);
+# left alone: a longer name, a deeper path, a regex look-alike. Non-UTF-8 bytes are kept.
+hp_shape() { printf '%s/start\nPATH=%s/bin:%s\n%sx stays\n/opt%s/stays\n%s/hp/homeXaab stays\n\377\376 bytes\nend %s' "$1" "$1" "$1" "$hp_a" "$hp_a" "$TMP" "$1"; }
+hp_shape "$hp_a" >"$hp_a/.zprofile"; cp "$hp_a/.zprofile" "$TMP/hp-a-zprofile"
+printf 'set bell-style none' >"$hp_a/.inputrc"; cp "$hp_a/.inputrc" "$TMP/hp-inputrc"
+hp_shape @@DOTS_HOME@@ >"$TMP/hp-stored"; hp_shape "$hp_b" >"$TMP/hp-b-zprofile"; hp_shape "$hp_c" >"$TMP/hp-c-zprofile"
+run_update "$hp_a" "$hp_remote" $'1-2\ny\nShare paths\n' >/dev/null 2>&1
+hp_ref=$(/usr/bin/git --git-dir="$hp_remote" for-each-ref --format='%(refname)' 'refs/heads/dots/update-*' | head -1)
+/usr/bin/git --git-dir="$hp_remote" show "$hp_ref:.zprofile" >"$TMP/hp-blob" 2>/dev/null
+/usr/bin/git --git-dir="$hp_remote" show "$hp_ref:.inputrc" >"$TMP/hp-blob-inputrc" 2>/dev/null
+if test -n "$hp_ref" && cmp -s "$TMP/hp-blob" "$TMP/hp-stored" && cmp -s "$TMP/hp-blob-inputrc" "$TMP/hp-inputrc"; then pass "home paths: update stores the home folder as a placeholder, byte for byte"; else fail "home paths: update stores the home folder as a placeholder, byte for byte"; fi
+printf '2\n' >"$TMP/hp-format"
+/usr/bin/git --git-dir="$hp_remote" show "$hp_ref:.config/dots/format" >"$TMP/hp-format-blob" 2>/dev/null
+if test -n "$hp_ref" && cmp -s "$TMP/hp-format-blob" "$TMP/hp-format" && /usr/bin/git --git-dir="$hp_remote" ls-tree "$hp_ref" -- .config/dots/format | grep -E '^100644 ' >/dev/null && ! /usr/bin/git --git-dir="$hp_remote" show "$hp_ref:.config/dots/manifest" | grep -F format >/dev/null; then pass "home paths: update adds the format marker"; else fail "home paths: update adds the format marker"; fi
+test -n "$hp_ref" && /usr/bin/git --git-dir="$hp_remote" update-ref refs/heads/main "$hp_ref" && /usr/bin/git --git-dir="$hp_remote" update-ref -d "$hp_ref"
+run_sync "$hp_a" '' >/dev/null 2>&1
+hp_a_status=$(run_dots "$hp_a" status 2>&1)
+if cmp -s "$hp_a/.zprofile" "$TMP/hp-a-zprofile" && cmp -s "$hp_a/.inputrc" "$TMP/hp-inputrc" && printf '%s\n' "$hp_a_status" | grep -Fx 'edits here: none' >/dev/null && printf '%s\n' "$hp_a_status" | grep -Fx 'this Mac: up to date' >/dev/null; then pass "home paths: the sending Mac is unchanged and clean"; else fail "home paths: the sending Mac is unchanged and clean"; fi
+expect_ok run_dots "$hp_b" init "$hp_remote" main
+hp_b_status=$(run_dots "$hp_b" status 2>&1)
+if cmp -s "$hp_b/.zprofile" "$TMP/hp-b-zprofile" && cmp -s "$hp_b/.inputrc" "$TMP/hp-inputrc" && printf '%s\n' "$hp_b_status" | grep -Fx 'edits here: none' >/dev/null; then pass "home paths: init on another home writes its own home folder"; else fail "home paths: init on another home writes its own home folder"; fi
+run_sync "$hp_c" $'\n' >/dev/null 2>&1
+if cmp -s "$hp_c/.zprofile" "$TMP/hp-c-zprofile" && run_dots "$hp_c" status 2>&1 | grep -Fx 'edits here: none' >/dev/null; then pass "home paths: sync on another home writes its own home folder"; else fail "home paths: sync on another home writes its own home folder"; fi
+# v0.2.3 refuses the new format and changes nothing.
+cp "$hp_old/.config/dots/manifest" "$TMP/hp-old-manifest" 2>/dev/null
+hp_old_head=$(/usr/bin/git --git-dir="$hp_old/data/repo.git" rev-parse HEAD 2>/dev/null)
+if test -x "$hp_v023" && test -n "$hp_old_head" && ! (run_v023 "$hp_v023" status) >/dev/null 2>&1 && ! (run_v023 expect "$DRIVE" '' "$hp_v023" sync) >/dev/null 2>&1 &&
+  test ! -e "$hp_old/.zprofile" && test ! -e "$hp_old/.inputrc" && test ! -e "$hp_old/.config/dots/format" && cmp -s "$hp_old/.config/dots/manifest" "$TMP/hp-old-manifest" &&
+  test "$(/usr/bin/git --git-dir="$hp_old/data/repo.git" rev-parse HEAD)" = "$hp_old_head"; then pass "home paths: v0.2.3 refuses the new format and changes nothing"; else fail "home paths: v0.2.3 refuses the new format and changes nothing"; fi
+# A shared file that already holds the placeholder text is refused by update, naming only its path.
+cp "$hp_a/.inputrc" "$TMP/hp-inputrc-saved"
+printf 'PRIVATEBODY @@DOTS_HOME@@\n' >>"$hp_a/.inputrc"; cp "$hp_a/.inputrc" "$TMP/hp-inputrc-marked"
+hp_refs=$(/usr/bin/git --git-dir="$hp_remote" for-each-ref | wc -l)
+hp_out=$(run_update "$hp_a" "$hp_remote" $'\nShould not send\n' 2>&1 | tr -d '\r')
+if printf '%s' "$hp_out" | grep -F '.inputrc already contains @@DOTS_HOME@@' >/dev/null && ! printf '%s' "$hp_out" | grep -F -e PRIVATEBODY -e 'Toggle numbers' -e 'PR title' >/dev/null && cmp -s "$hp_a/.inputrc" "$TMP/hp-inputrc-marked" && test "$(/usr/bin/git --git-dir="$hp_remote" for-each-ref | wc -l)" = "$hp_refs"; then pass "home paths: update refuses a shared file holding the placeholder"; else fail "home paths: update refuses a shared file holding the placeholder"; fi
+cp "$TMP/hp-inputrc-saved" "$hp_a/.inputrc"
+# A different marker means a newer dots wrote the repository.
+remote_edit "$hp_remote" "printf '3\\n' > \"\$1/.config/dots/format\"" || exit 1
+if ! (run_dots "$hp_b" status) >"$TMP/hp-newer.out" 2>&1 && grep -F 'newer version of dots' "$TMP/hp-newer.out" >/dev/null; then pass "home paths: another marker asks to upgrade"; else fail "home paths: another marker asks to upgrade"; fi
+
+# A new file holding the placeholder text is refused before anything is saved or sent.
+ph_remote=$TMP/placeholder-new.git; ph_home=$TMP/home-placeholder-new; mkdir -p "$ph_home"
+run_derived_default_init "$ph_home" "$ph_remote" $'y\n' >/dev/null 2>&1 || exit 1
+printf 'alias x=@@DOTS_HOME@@ PRIVATEBODY\n' >"$ph_home/.zshrc"; cp "$ph_home/.zshrc" "$TMP/ph-zshrc"
+ph_out=$(run_update "$ph_home" "$ph_remote" $'1\ny\nShare\n' 2>&1 | tr -d '\r')
+if printf '%s' "$ph_out" | grep -F '.zshrc already contains @@DOTS_HOME@@' >/dev/null && ! printf '%s' "$ph_out" | grep -F -e PRIVATEBODY -e 'PR title' >/dev/null && cmp -s "$ph_home/.zshrc" "$TMP/ph-zshrc" && ! grep -F .zshrc "$ph_home/data/selection" >/dev/null && test -z "$(/usr/bin/git --git-dir="$ph_remote" for-each-ref 'refs/heads/dots/update-*')"; then pass "home paths: update refuses a new file holding the placeholder"; else fail "home paths: update refuses a new file holding the placeholder"; fi
+# sync refuses to overwrite a file holding the placeholder text, even when told to take the repository's version.
+remote=$TMP/placeholder-sync.git; new_remote "$remote"; ps_home=$TMP/home-placeholder-sync; mkdir -p "$ps_home"; expect_ok run_dots "$ps_home" init "$remote" main
+printf 'mine @@DOTS_HOME@@ PRIVATEBODY\n' >"$ps_home/.config/example/settings"; cp "$ps_home/.config/example/settings" "$TMP/ps-settings"
+ps_head=$(/usr/bin/git --git-dir="$ps_home/data/repo.git" rev-parse HEAD)
+remote_edit "$remote" "printf theirs > \"\$1/.config/example/settings\"" || exit 1
+ps_out=$(run_sync "$ps_home" $'1\n' 2>&1 | tr -d '\r')
+if printf '%s' "$ps_out" | grep -F '.config/example/settings already contains @@DOTS_HOME@@' >/dev/null && ! printf '%s' "$ps_out" | grep -F PRIVATEBODY >/dev/null && cmp -s "$ps_home/.config/example/settings" "$TMP/ps-settings" && test "$(/usr/bin/git --git-dir="$ps_home/data/repo.git" rev-parse HEAD)" = "$ps_head" && test ! -e "$ps_home/data/backups"; then pass "home paths: sync refuses to overwrite a file holding the placeholder"; else fail "home paths: sync refuses to overwrite a file holding the placeholder"; fi
+
+# Migration: a repository written with literal home paths becomes portable after one update.
+mg_remote=$TMP/migrate.git; mg_home=$TMP/hm/mig; mkdir -p "$mg_home"
+run_derived_default_init "$mg_home" "$mg_remote" $'y\n' >/dev/null 2>&1 || exit 1
+remote_edit "$mg_remote" "printf '%s\\n' .zprofile > \"\$1/.config/dots/manifest\"; printf 'export P=$mg_home/bin\\n' > \"\$1/.zprofile\"" || exit 1
+run_sync "$mg_home" $'\n' >/dev/null 2>&1
+mg_status=$(run_dots "$mg_home" status 2>&1)
+mg_out=$(run_update "$mg_home" "$mg_remote" $'\nMake home paths portable\n' 2>&1 | tr -d '\r')
+mg_ref=$(/usr/bin/git --git-dir="$mg_remote" for-each-ref --format='%(refname)' 'refs/heads/dots/update-*' | head -1)
+test -n "$mg_ref" && /usr/bin/git --git-dir="$mg_remote" update-ref refs/heads/main "$mg_ref" && /usr/bin/git --git-dir="$mg_remote" update-ref -d "$mg_ref"
+run_sync "$mg_home" '' >/dev/null 2>&1
+mg_after=$(run_dots "$mg_home" status 2>&1)
+if printf '%s\n' "$mg_status" | grep -A1 -F 'edited here' | grep -Fx '  .zprofile' >/dev/null && printf '%s' "$mg_out" | grep -F '.zprofile  (changed)' >/dev/null &&
+  test "$(/usr/bin/git --git-dir="$mg_remote" show main:.zprofile)" = 'export P=@@DOTS_HOME@@/bin' && test "$(/usr/bin/git --git-dir="$mg_remote" show main:.config/dots/format)" = 2 &&
+  test "$(cat "$mg_home/.zprofile")" = "export P=$mg_home/bin" && printf '%s\n' "$mg_after" | grep -Fx 'edits here: none' >/dev/null && printf '%s\n' "$mg_after" | grep -Fx 'this Mac: up to date' >/dev/null; then pass "home paths: literal paths migrate with one update"; else fail "home paths: literal paths migrate with one update"; fi
+
+# init and select adopt a live file that differs from the repository only by the home folder.
+remote=$TMP/adopt.git; new_remote "$remote"
+remote_edit "$remote" "printf '%s\\n' .config/example/settings .zprofile > \"\$1/.config/dots/manifest\"; printf 'export P=@@DOTS_HOME@@/bin\\n' > \"\$1/.zprofile\"" || exit 1
+ad_home=$TMP/hi/ivy; mkdir -p "$ad_home"; printf 'export P=%s/bin\n' "$ad_home" >"$ad_home/.zprofile"; cp "$ad_home/.zprofile" "$TMP/ad-zprofile"
+if expect_ok run_dots "$ad_home" init "$remote" main && test ! -e "$ad_home/data/backups" && cmp -s "$ad_home/.zprofile" "$TMP/ad-zprofile"; then pass "home paths: init adopts a file that differs only by the home folder"; else fail "home paths: init adopts a file that differs only by the home folder"; fi
+sl_home=$TMP/hj/sel; mkdir -p "$sl_home"
+run_dots_pty "$sl_home" $'1\n' init "$remote" main >/dev/null 2>&1
+printf 'export P=%s/bin\n' "$sl_home" >"$sl_home/.zprofile"; cp "$sl_home/.zprofile" "$TMP/sl-zprofile"
+sl_out=$(run_dots_pty "$sl_home" $'1\n' select 2>&1)
+if grep -Fx 'use .zprofile' "$sl_home/data/selection" >/dev/null && ! printf '%s' "$sl_out" | grep -F 'differ from the repository' >/dev/null && test ! -e "$sl_home/data/backups" && cmp -s "$sl_home/.zprofile" "$TMP/sl-zprofile"; then pass "home paths: select adopts a file that differs only by the home folder"; else fail "home paths: select adopts a file that differs only by the home folder"; fi
+# A manifest may not list the format marker.
+remote=$TMP/reserved-format.git; new_remote "$remote"
+remote_edit "$remote" "printf '%s\\n' .config/example/settings .config/dots/format > \"\$1/.config/dots/manifest\"; printf '2\\n' > \"\$1/.config/dots/format\"" || exit 1
+rf_home=$TMP/home-reserved-format; mkdir -p "$rf_home"
+if expect_fail run_dots "$rf_home" init "$remote" main && test ! -e "$rf_home/.config/dots/format"; then pass "home paths: a manifest listing the format marker is refused"; else fail "home paths: a manifest listing the format marker is refused"; fi
+
+# gitleaks still blocks a secret in a file that also names the home folder; without it the file goes through translated.
+gl_remote=$TMP/home-secret.git; gl_home=$TMP/hk/gina; mkdir -p "$gl_home"
+run_derived_default_init "$gl_home" "$gl_remote" $'y\n' >/dev/null 2>&1 || exit 1
+printf 'export P=%s/bin\nkey=DOTS_TEST_SECRET\n' "$gl_home" >"$gl_home/.zshrc"
+gl_out=$(DOTS_TEST_GITLEAKS_FAIL=1 run_update "$gl_home" "$gl_remote" $'1\ny\nShare\n' 2>&1)
+gl_blocked=no
+printf '%s' "$gl_out" | grep -F 'nothing was pushed' >/dev/null && test -z "$(/usr/bin/git --git-dir="$gl_remote" for-each-ref 'refs/heads/dots/update-*')" && gl_blocked=yes
+printf 'export P=%s/bin\n' "$gl_home" >"$gl_home/.zshrc"
+DOTS_TEST_GITLEAKS_FAIL=1 run_update "$gl_home" "$gl_remote" $'\ny\nShare\n' >/dev/null 2>&1
+gl_ref=$(/usr/bin/git --git-dir="$gl_remote" for-each-ref --format='%(refname)' 'refs/heads/dots/update-*' | head -1)
+if test "$gl_blocked" = yes && test -n "$gl_ref" && test "$(/usr/bin/git --git-dir="$gl_remote" show "$gl_ref:.zshrc")" = 'export P=@@DOTS_HOME@@/bin'; then pass "home paths: update scans a file with a home path before pushing"; else fail "home paths: update scans a file with a home path before pushing"; fi
+remote=$TMP/home-secret-sync.git; new_remote "$remote"; gs_home=$TMP/hl/gus; mkdir -p "$gs_home"; expect_ok run_dots "$gs_home" init "$remote" main
+remote_edit "$remote" "printf '@@DOTS_HOME@@/x DOTS_TEST_SECRET\\n' > \"\$1/.config/example/settings\"" || exit 1
+gs_blocked=no
+! DOTS_TEST_GITLEAKS_FAIL=1 run_sync "$gs_home" '' >/dev/null 2>&1 && test "$(cat "$gs_home/.config/example/settings")" = base && gs_blocked=yes
+remote_edit "$remote" "printf '@@DOTS_HOME@@/x\\n' > \"\$1/.config/example/settings\"" || exit 1
+DOTS_TEST_GITLEAKS_FAIL=1 run_sync "$gs_home" '' >/dev/null 2>&1
+if test "$gs_blocked" = yes && test "$(cat "$gs_home/.config/example/settings")" = "$gs_home/x"; then pass "home paths: sync scans incoming files before writing them"; else fail "home paths: sync scans incoming files before writing them"; fi
+
 printf '%s tests passed, %s failed\n' "$PASS" "$FAIL"
 test "$FAIL" -eq 0
