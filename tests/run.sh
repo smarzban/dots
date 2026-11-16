@@ -1090,5 +1090,29 @@ pj_out=$(run_dots_pty "$pj_home" $'1\ny\n' select 2>&1)
 if grep -Fx 'skip .zprofile' "$TMP/pj-selection" >/dev/null && printf '%s' "$pj_out" | grep -F '.zprofile already contains @@DOTS_HOME@@' >/dev/null && ! printf '%s' "$pj_out" | grep -F PRIVATEBODY >/dev/null &&
   cmp -s "$pj_home/.zprofile" "$TMP/pj-zprofile" && cmp -s "$pj_home/data/selection" "$TMP/pj-selection" && test ! -e "$pj_home/data/backups"; then pass "home paths: select refuses to replace a file holding the placeholder"; else fail "home paths: select refuses to replace a file holding the placeholder"; fi
 
+# init and select write the repository's executable bit; update sends this Mac's.
+remote=$TMP/exec-modes.git; new_remote "$remote"
+remote_edit "$remote" "printf '%s\\n' .config/example/settings .config/example/run.sh .config/example/plain.sh > \"\$1/.config/dots/manifest\"; printf 'exec @@DOTS_HOME@@/bin/x\\n' > \"\$1/.config/example/run.sh\"; chmod 755 \"\$1/.config/example/run.sh\"; printf 'cd @@DOTS_HOME@@\\n' > \"\$1/.config/example/plain.sh\"; chmod 644 \"\$1/.config/example/plain.sh\"" || exit 1
+em_home=$TMP/home-exec-init; mkdir -p "$em_home"
+expect_ok run_dots "$em_home" init "$remote" main
+if test -x "$em_home/.config/example/run.sh" && test "$(stat -f '%Lp' "$em_home/.config/example/run.sh")" = 700 && test "$(cat "$em_home/.config/example/run.sh")" = "exec $em_home/bin/x" &&
+  test ! -x "$em_home/.config/example/plain.sh" && test "$(stat -f '%Lp' "$em_home/.config/example/plain.sh")" = 600; then pass "home paths: init writes the executable bit"; else fail "home paths: init writes the executable bit"; fi
+# Rows: plain.sh (1), run.sh (2), settings (3). init skips the first two; select brings them in.
+es_home=$TMP/home-exec-select; mkdir -p "$es_home"
+run_dots_pty "$es_home" $'1-2\n' init "$remote" main >/dev/null 2>&1
+es_skipped=no; test ! -e "$es_home/.config/example/run.sh" && test ! -e "$es_home/.config/example/plain.sh" && es_skipped=yes
+run_dots_pty "$es_home" $'1-2\n' select >/dev/null 2>&1
+if test "$es_skipped" = yes && test -x "$es_home/.config/example/run.sh" && test "$(stat -f '%Lp' "$es_home/.config/example/run.sh")" = 700 && test "$(cat "$es_home/.config/example/run.sh")" = "exec $es_home/bin/x" &&
+  test ! -x "$es_home/.config/example/plain.sh" && test "$(stat -f '%Lp' "$es_home/.config/example/plain.sh")" = 600; then pass "home paths: select writes the executable bit"; else fail "home paths: select writes the executable bit"; fi
+eu_remote=$TMP/exec-update.git; eu_home=$TMP/home-exec-update; mkdir -p "$eu_home"
+run_derived_default_init "$eu_home" "$eu_remote" $'y\n' >/dev/null 2>&1 || exit 1
+remote_edit "$eu_remote" "printf '%s\\n' .config/example/run.sh .config/example/plain.sh > \"\$1/.config/dots/manifest\"; mkdir -p \"\$1/.config/example\"; printf 'exec @@DOTS_HOME@@/bin/x\\n' > \"\$1/.config/example/run.sh\"; chmod 755 \"\$1/.config/example/run.sh\"; printf 'cd @@DOTS_HOME@@\\n' > \"\$1/.config/example/plain.sh\"; chmod 644 \"\$1/.config/example/plain.sh\"" || exit 1
+run_sync "$eu_home" $'\n' >/dev/null 2>&1
+chmod -x "$eu_home/.config/example/run.sh"; chmod +x "$eu_home/.config/example/plain.sh"
+run_update "$eu_home" "$eu_remote" $'\nFlip modes\n' >/dev/null 2>&1
+eu_ref=$(/usr/bin/git --git-dir="$eu_remote" for-each-ref --format='%(refname)' 'refs/heads/dots/update-*' | head -1)
+eu_tree=$(/usr/bin/git --git-dir="$eu_remote" ls-tree "$eu_ref" -- .config/example/run.sh .config/example/plain.sh 2>/dev/null | awk '{ print $1 " " $4 }' | tr '\n' '|')
+if test -n "$eu_ref" && test "$eu_tree" = '100755 .config/example/plain.sh|100644 .config/example/run.sh|' && test "$(/usr/bin/git --git-dir="$eu_remote" show "$eu_ref:.config/example/plain.sh")" = 'cd @@DOTS_HOME@@'; then pass "home paths: update sends the executable bit"; else fail "home paths: update sends the executable bit ($eu_tree)"; fi
+
 printf '%s tests passed, %s failed\n' "$PASS" "$FAIL"
 test "$FAIL" -eq 0
