@@ -941,6 +941,14 @@ else
 fi
 if DOTS_RELEASE_BASE_URL="file://$assets" DOTS_BIN_DIR="$TMP/sha-installed" PATH=$sha_bin "$ROOT/install.sh" >/dev/null 2>&1 && test -x "$TMP/sha-installed/dots"; then pass "installer verifies with sha256sum when shasum is missing"; else fail "installer verifies with sha256sum when shasum is missing"; fi
 if ! DOTS_RELEASE_BASE_URL="file://$assets" DOTS_BIN_DIR="$TMP/none-installed" PATH=$none_bin "$ROOT/install.sh" >/dev/null 2>&1 && test ! -e "$TMP/none-installed/dots"; then pass "installer refuses without a checksum tool"; else fail "installer refuses without a checksum tool"; fi
+# Packaging on such a system writes the checksum with sha256sum. The folder holds
+# only the tools package.sh runs, and no shasum.
+pkg_bin=$TMP/package-sha-bin; mkdir -p "$pkg_bin"
+for tool in git dirname rm mkdir cp chmod; do ln -s "$(command -v "$tool")" "$pkg_bin/$tool"; done
+ln -s "$sha_bin/sha256sum" "$pkg_bin/sha256sum"
+rm -rf "$package_repo/dist"
+if PATH=$pkg_bin "$package_repo/scripts/package.sh" v0.0.0-test >/dev/null 2>&1 && (cd "$package_repo/dist" && sha256_of --check dots.sha256) >/dev/null 2>&1 &&
+  awk 'END { exit !(NR == 1 && $2 == "dots") }' "$package_repo/dist/dots.sha256"; then pass "release packaging with sha256sum when shasum is missing"; else fail "release packaging with sha256sum when shasum is missing"; fi
 # The PATH advice names the user's shell startup file: zsh's login file on macOS,
 # and on Linux the file a new terminal's shell reads. A stand-in uname picks the
 # platform, so both are checked on any host.
