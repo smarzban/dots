@@ -7,7 +7,14 @@ DESTINATION=${DOTS_BIN_DIR:-"$HOME/.local/bin"}
 VERSION=${DOTS_VERSION:-latest}
 
 command -v curl >/dev/null 2>&1 || { printf '%s\n' 'dots installer: curl is required' >&2; exit 1; }
-command -v shasum >/dev/null 2>&1 || { printf '%s\n' 'dots installer: shasum is required' >&2; exit 1; }
+# macOS has shasum; a minimal Linux system may have only GNU sha256sum.
+if command -v shasum >/dev/null 2>&1; then
+  sha256() { shasum -a 256 "$1"; }
+elif command -v sha256sum >/dev/null 2>&1; then
+  sha256() { sha256sum "$1"; }
+else
+  printf '%s\n' 'dots installer: shasum or sha256sum is required' >&2; exit 1
+fi
 
 temp=$(mktemp -d "${TMPDIR:-/tmp}/dots-install.XXXXXX") || exit 1
 trap 'rm -rf "$temp"' EXIT HUP INT TERM
@@ -24,7 +31,7 @@ fi
 curl --fail --location --silent --show-error "$base/dots" -o "$temp/dots"
 curl --fail --location --silent --show-error "$base/dots.sha256" -o "$temp/dots.sha256"
 expected=$(awk 'NR == 1 { print $1 }' "$temp/dots.sha256")
-actual=$(shasum -a 256 "$temp/dots" | awk '{ print $1 }')
+actual=$(sha256 "$temp/dots" | awk '{ print $1 }')
 test -n "$expected" && test "$expected" = "$actual" || { printf '%s\n' 'dots installer: checksum verification failed' >&2; exit 1; }
 
 mkdir -p "$DESTINATION"
@@ -33,6 +40,17 @@ printf 'Installed dots to %s/dots\n' "$DESTINATION"
 
 # The shell only finds commands in PATH folders, and a fresh Mac does not list
 # ~/.local/bin, so say how to run dots rather than leave "command not found".
+# The advice names the startup file of the user's shell: zsh's on macOS, where
+# it is the default; on Linux, bash's, zsh's, or else the POSIX ~/.profile.
+if test "$(uname -s 2>/dev/null)" = Darwin; then
+  startup=.zprofile restart='exec zsh -l'
+else
+  case ${SHELL:-} in
+    bash|*/bash) startup=.bashrc restart='exec bash' ;;
+    zsh|*/zsh) startup=.zprofile restart='exec zsh -l' ;;
+    *) startup=.profile restart='. ~/.profile' ;;
+  esac
+fi
 # PATH entries are compared without trailing slashes, and an empty entry means the
 # current folder, as the shell treats it.
 strip_slashes() {
@@ -66,7 +84,7 @@ else
   # Copy-paste commands only for plain folder names; anything else is described.
   case $destination in
     *[!A-Za-z0-9._/-]*)
-      printf 'Run dots by its full path, or add that folder to PATH in ~/.zprofile.\n' ;;
+      printf 'Run dots by its full path, or add that folder to PATH in ~/%s.\n' "$startup" ;;
     *)
       case $destination in
         "$HOME"/*) shown="\$HOME/${destination#"$HOME"/}" ;;
@@ -74,6 +92,6 @@ else
       esac
       printf 'Either:\n'
       printf '  run it by full path:  %s/dots init\n' "$destination"
-      printf '  or add it to PATH:    echo '"'"'export PATH="%s:$PATH"'"'"' >> ~/.zprofile && exec zsh -l\n' "$shown" ;;
+      printf '  or add it to PATH:    echo '"'"'export PATH="%s:$PATH"'"'"' >> ~/%s && %s\n' "$shown" "$startup" "$restart" ;;
   esac
 fi

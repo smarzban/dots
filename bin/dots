@@ -16,7 +16,15 @@ DOTS_DATA=${DOTS_DATA_DIR:-"$DOTS_HOME/.local/share/dots"}
 # Git below runs from HOME, so a relative data folder is made absolute first.
 case $DOTS_DATA in /*) ;; *) DOTS_DATA=$PWD/$DOTS_DATA ;; esac
 REPO="$DOTS_DATA/repo.git"
-GIT=${DOTS_GIT:-/usr/bin/git}
+# macOS uses Apple's Git; Linux has no fixed place for it, so it is found on PATH
+# once here. A missing Git stays "git" so that the check below names it.
+if test -n "${DOTS_GIT:-}"; then
+  GIT=$DOTS_GIT
+elif test "$(uname -s 2>/dev/null)" = Darwin; then
+  GIT=/usr/bin/git
+else
+  GIT=$(command -v git 2>/dev/null) || GIT=git
+fi
 PERL=${DOTS_PERL:-/usr/bin/perl}
 # Perl only translates home paths; nothing from the environment may change how.
 unset PERL5OPT PERL5LIB PERLLIB PERL5DB PERL_UNICODE
@@ -44,11 +52,11 @@ say() { printf '%s\n' "$*"; }
 fail() { printf 'dots: %s\n' "$*" >&2; exit 1; }
 usage() { cat <<'EOF'
 Usage:
-  dots status                  show whether this Mac is up to date and what you edited here
-  dots sync                    bring this Mac up to date with the repository
+  dots status                  show whether this machine is up to date and what you edited here
+  dots sync                    bring this machine up to date with the repository
   dots update                  send your edits and shared-file changes as a pull request
-  dots select                  choose which repository files this Mac uses
-  dots init [remote] [branch]  connect this Mac to your dotfiles repository (once per Mac)
+  dots select                  choose which repository files this machine uses
+  dots init [remote] [branch]  connect this machine to your dotfiles repository (once per machine)
     --backup-existing          back up differing local files, then use the repository's
     --discover                 only list the files dots would suggest
 EOF
@@ -198,7 +206,7 @@ validate_tree() {
       vt_want=$(printf '2\n' | git_dir "$gitdir" hash-object --stdin) || return 1
       vt_blob=${meta##* }
       if test "$mode" != 100644 || test "$vt_blob" != "$vt_want"; then
-        say "dots: a newer version of dots wrote this repository; upgrade dots on this Mac, then try again" >&2
+        say "dots: a newer version of dots wrote this repository; upgrade dots on this machine, then try again" >&2
         return 1
       fi
       continue
@@ -490,7 +498,7 @@ write_selection() {
     : >"$ignore" && selection_list ignore "$ignore" || { rm -f "$tmp" "$tmp.ignore"; return 1; }
   fi
   {
-    printf '%s\n' '# dots selection v1: repository files this Mac uses. Change with: dots select'
+    printf '%s\n' '# dots selection v1: repository files this machine uses. Change with: dots select'
     while IFS= read -r path; do
       if path_in_list "$path" "$use"; then printf 'use %s\n' "$path"; fi
     done <"$manifest"
@@ -574,8 +582,9 @@ github_repository_from_gh() {
 enable_gh_git_credentials() {
   # We ignore a managed ~/.gitconfig, but gh's credential helper is still needed
   # for the account-derived HTTPS remote. The empty value first clears helpers from
-  # the system config (the macOS Keychain helper fails when the Keychain will not
-  # answer a background process), so only gh is asked. Git 2.18+ supports this.
+  # the system config (on macOS the Keychain helper fails when the Keychain will not
+  # answer a background process; a Linux system may name a desktop keyring), so
+  # only gh is asked. Git 2.18+ supports this.
   GIT_CONFIG_COUNT=2
   GIT_CONFIG_KEY_0=credential.helper
   GIT_CONFIG_VALUE_0=
@@ -678,13 +687,14 @@ filter_candidate_names() {
 }
 
 # Keep small text files only (1 byte to DISCOVER_MAX_BYTES, no NUL bytes); large or
-# binary files are data, not configuration. Batched: one stat call for sizes and one
-# grep call listing files that contain a NUL (in the C locale, [^\x01-\xff] matches
-# only that byte), joined by name, so a file that vanishes meanwhile is dropped.
+# binary files are data, not configuration. Batched: one perl call for sizes (stat
+# flags differ between BSD and GNU) and one grep call listing files that contain a
+# NUL (in the C locale, [^\x01-\xff] matches only that byte), joined by name, so a
+# file that vanishes meanwhile is dropped.
 keep_small_text_files() {
   : >"$2"
   test -s "$1" || return 0
-  (cd "$DOTS_HOME" && tr '\n' '\0' <"$1" | xargs -0 stat -f "%z$TAB%N" 2>/dev/null) >"$2.sizes"
+  (cd "$DOTS_HOME" && "$PERL" -ne 'chomp; my @s = lstat $_ or next; print "$s[7]\t$_\n"' <"$1" 2>/dev/null) >"$2.sizes"
   (cd "$DOTS_HOME" && tr '\n' '\0' <"$1" | LC_ALL=C xargs -0 grep -l -a -e "$(printf '[^\001-\377]')" -- 2>/dev/null) >"$2.nul"
   awk -F '\t' -v max="$DISCOVER_MAX_BYTES" '
     FILENAME == ARGV[1] { if ($1 ~ /^[0-9]+$/) size[substr($0, length($1) + 2)] = $1 + 0; next }
@@ -1006,9 +1016,11 @@ checklist_tui() {
   exec 3<>/dev/tty || return 1
   CL_STTY=$(stty -g <&3)
   CL_ACTIVE=1
-  # Restore the terminal however the command ends.
+  # Restore the terminal however the command ends. A signal only exits: bash 5 puts
+  # back the terminal state "read -s -n 1" saved (raw) after a signal trap has run,
+  # so the restore must happen later, in the EXIT trap.
   trap 'checklist_stop; rm -rf "$temp"' EXIT
-  trap 'checklist_stop; rm -rf "$temp"; exit 130' HUP INT TERM
+  trap 'exit 130' HUP INT TERM
   stty -echo -icanon min 1 time 0 <&3
   printf '\033[?1049h\033[?25l\033[2J' >&3
   cl_status=0
@@ -1138,6 +1150,8 @@ init_command() {
   if test "${1:-}" = --discover; then
     shift
     test $# -eq 0 || { usage >&2; exit 2; }
+    require_tool "$GIT"
+    require_tool "$PERL"
     temp=$(mktemp_dir); trap 'rm -rf "$temp"' EXIT HUP INT TERM
     preview_candidates "$temp"
     exit 0
@@ -1145,6 +1159,7 @@ init_command() {
   backup_existing=false
   if test "${1:-}" = --backup-existing; then backup_existing=true; shift; fi
   test $# -le 2 || { usage >&2; exit 2; }
+  require_dependencies
   auto_default=false
   if test $# -eq 0 && test -e "$REPO"; then
     # Repeating init must not require gh merely to rediscover an existing remote.
@@ -1169,7 +1184,6 @@ init_command() {
   fi
   requested_branch=${2:-}
   test -n "$requested_branch" && safe_branch "$requested_branch"
-  require_dependencies
   if test -e "$REPO"; then
     ensure_initialized
     existing_remote=$(git_repo remote get-url origin 2>/dev/null || true)
@@ -1203,12 +1217,12 @@ init_command() {
   git_dir "$candidate_repo" fetch --no-tags origin "refs/heads/$branch:refs/heads/$branch" >/dev/null 2>&1 || fail "could not fetch requested branch"
   revision=$(git_dir "$candidate_repo" rev-parse "refs/heads/$branch" 2>/dev/null) || fail "requested branch has no revision"
   validate_tree "$candidate_repo" "$revision" "$temp/manifest-paths" "$temp" || fail "candidate manifest or repository tree is unsafe"
-  scan_git_revision "$candidate_repo" "$revision" || scan_fail $? "nothing was changed on this Mac. The scan covers the repository's whole history, so remove the secret from every commit (or start from a clean repository), then run dots init again"
+  scan_git_revision "$candidate_repo" "$revision" || scan_fail $? "nothing was changed on this machine. The scan covers the repository's whole history, so remove the secret from every commit (or start from a clean repository), then run dots init again"
   # Choose which repository files this Mac uses. Without a terminal, all are used.
   cp "$temp/manifest-paths" "$temp/use" || fail "could not prepare file selection"
   if test -s "$temp/manifest-paths" && test -t 0 && test -t 1; then
     build_rows "$temp/manifest-paths" "$temp/rows"
-    checklist "$temp/rows" "$temp/use" "Choose which files to bring to this Mac" || { say "init cancelled, nothing was changed"; exit 0; }
+    checklist "$temp/rows" "$temp/use" "Choose which files to bring to this machine" || { say "init cancelled, nothing was changed"; exit 0; }
   fi
   list_minus "$temp/manifest-paths" "$temp/use" "$temp/skip"
   # Every chosen target, including the manifest, must be absent or already identical,
@@ -1259,7 +1273,7 @@ init_command() {
   write_selection "$temp/use" "$temp/skip" "$temp/manifest-paths" || init_abort "could not save the file selection"
   git_repo config dots.initialized true || init_abort "could not finalize initialization"
   skipped=$(list_count "$temp/skip")
-  test "$skipped" -eq 0 || say "not using $skipped repository file(s) on this Mac; change with: dots select"
+  test "$skipped" -eq 0 || say "not using $skipped repository file(s) on this machine; change with: dots select"
   say "initialized $branch at $revision"
 }
 
@@ -1363,7 +1377,7 @@ clash_reason() {
 catch_up() {
   cu=$1/cu
   list_intersect "$1/remote-manifest" "$1/use" "$1/cu-used"
-  validate_live_paths "$1/cu-used" || fail "a file this Mac uses has an unsafe path on disk; nothing was changed"
+  validate_live_paths "$1/cu-used" || fail "a file this machine uses has an unsafe path on disk; nothing was changed"
   list_with_manifest "$1/cu-used" "$1/cu-paths"
   classify_paths "$2" "$3" "$1/cu-paths" "$cu" || fail "could not compare files with the repository; nothing was changed"
   # The manifest is merged, never asked about.
@@ -1380,7 +1394,7 @@ catch_up() {
       sed 's/^/  /' "$cu/clash" >&2
       fail "run dots sync to choose which version to keep, then dots update"
     fi
-    say "Some files changed both here and in the repository since this Mac last synced."
+    say "Some files changed both here and in the repository since this machine last synced."
     # Answers come from the terminal on fd 4; the loop itself reads the file list.
     exec 4<&0
     while IFS= read -r cu_path; do
@@ -1459,7 +1473,7 @@ report_catch_up() {
   test ! -s "$1/cu/brought" || { say "brought in from the repository:"; sed 's/^/  /' "$1/cu/brought"; }
   list_intersect "$1/head-manifest" "$1/use" "$1/cu-was-used"
   list_minus "$1/cu-was-used" "$1/remote-manifest" "$1/cu-dropped"
-  test ! -s "$1/cu-dropped" || { say "no longer shared by the repository (kept on this Mac):"; sed 's/^/  /' "$1/cu-dropped"; }
+  test ! -s "$1/cu-dropped" || { say "no longer shared by the repository (kept on this machine):"; sed 's/^/  /' "$1/cu-dropped"; }
 }
 
 report_local_edits() {
@@ -1483,8 +1497,8 @@ status_command() {
   validate_tree "$REPO" "$remote" "$temp/remote-manifest" "$temp" || fail "the repository has unsafe changes; dots sync will refuse them"
   behind=$(git_repo rev-list --count "$head..$remote" 2>/dev/null) || fail "cannot compare with the repository"
   say "branch: $branch"
-  if test "$behind" -eq 0; then say "this Mac: up to date"; else say "this Mac: $behind repository update(s) not synced yet (run dots sync)"; fi
-  say "files used on this Mac: $(list_count "$temp/selected-manifest") of $(list_count "$temp/manifest-union")"
+  if test "$behind" -eq 0; then say "this machine: up to date"; else say "this machine: $behind repository update(s) not synced yet (run dots sync)"; fi
+  say "files used on this machine: $(list_count "$temp/selected-manifest") of $(list_count "$temp/manifest-union")"
   # The files sync would look at (the repository's files this Mac uses, files added
   # to the manifest here, and the manifest), compared three ways.
   list_intersect "$temp/remote-manifest" "$temp/use" "$temp/remote-used"
@@ -1502,7 +1516,7 @@ status_command() {
   test ! -s "$temp/st/clash" || { say "changed both here and in the repository (dots sync will ask):"; sed 's/^/  /' "$temp/st/clash"; }
   list_intersect "$temp/head-manifest" "$temp/use" "$temp/st-was-used"
   list_minus "$temp/st-was-used" "$temp/remote-manifest" "$temp/st-dropped"
-  test ! -s "$temp/st-dropped" || { say "no longer shared by the repository (dots sync keeps them on this Mac):"; sed 's/^/  /' "$temp/st-dropped"; }
+  test ! -s "$temp/st-dropped" || { say "no longer shared by the repository (dots sync keeps them on this machine):"; sed 's/^/  /' "$temp/st-dropped"; }
   list_minus "$temp/remote-manifest" "$temp/use" "$temp/st-unseen-all"
   list_minus "$temp/st-unseen-all" "$temp/skip" "$temp/st-unseen"
   test ! -s "$temp/st-unseen" || { say "new in the repository (dots sync will ask whether to use them here):"; sed 's/^/  /' "$temp/st-unseen"; }
@@ -1550,14 +1564,14 @@ sync_command() {
   if test -s "$temp/unseen"; then
     build_rows "$temp/unseen" "$temp/unseen-rows"
     cp "$temp/unseen" "$temp/unseen-chosen"
-    checklist "$temp/unseen-rows" "$temp/unseen-chosen" "New files in the repository: choose which to use on this Mac" || fail "sync cancelled, nothing was changed"
+    checklist "$temp/unseen-rows" "$temp/unseen-chosen" "New files in the repository: choose which to use on this machine" || fail "sync cancelled, nothing was changed"
     list_minus "$temp/unseen" "$temp/unseen-chosen" "$temp/newly-skipped"
     cat "$temp/unseen-chosen" >>"$temp/use"
     cat "$temp/newly-skipped" >>"$temp/skip"
   fi
   catch_up "$temp" "$base" "$remote" "$branch" ask || catch_up_failed "$temp"
   report_catch_up "$temp"
-  if test "$base" = "$remote" && ! test -s "$temp/cu/brought"; then say "this Mac is up to date"; else say "this Mac is now up to date"; fi
+  if test "$base" = "$remote" && ! test -s "$temp/cu/brought"; then say "this machine is up to date"; else say "this machine is now up to date"; fi
   report_local_edits "$temp/cu/kept-edits"
 }
 
@@ -1662,10 +1676,10 @@ update_command() {
   : >"$temp/rows"
   labelled_rows "$temp/changed" "edits to send (untick to leave an edit out of this PR)" "$temp/rows" "$temp/notes"
   labelled_rows "$temp/fresh-candidates" "new files (tick to start sharing)" "$temp/rows"
-  labelled_rows "$temp/unchanged" "shared files (untick to stop sharing on every Mac)" "$temp/rows"
+  labelled_rows "$temp/unchanged" "shared files (untick to stop sharing on every machine)" "$temp/rows"
   labelled_rows "$temp/ignored-candidates" "previously ignored (tick to start sharing)" "$temp/rows"
   if test -s "$temp/rows"; then
-    checklist "$temp/rows" "$temp/chosen" "Choose what this update sends to the repository" || fail "update cancelled, nothing was sent${caught_up:+ (this Mac did catch up with the repository first)}"
+    checklist "$temp/rows" "$temp/chosen" "Choose what this update sends to the repository" || fail "update cancelled, nothing was sent${caught_up:+ (this machine did catch up with the repository first)}"
   fi
   list_intersect "$temp/chosen" "$temp/candidates" "$temp/added"
   while IFS= read -r path; do
@@ -1679,7 +1693,7 @@ update_command() {
   list_minus "$temp/changed" "$temp/chosen" "$temp/held"
   if test -s "$temp/added" || test -s "$temp/removed"; then
     test ! -s "$temp/added" || { say "Start sharing:"; sed 's/^/  /' "$temp/added"; }
-    test ! -s "$temp/removed" || { say "Stop sharing on every Mac (files on this Mac are kept):"; sed 's/^/  /' "$temp/removed"; }
+    test ! -s "$temp/removed" || { say "Stop sharing on every machine (files on this machine are kept):"; sed 's/^/  /' "$temp/removed"; }
     printf 'Continue? [y/N] ' >&2
     IFS= read -r answer || fail "update cancelled"
     case $answer in
@@ -1761,7 +1775,7 @@ select_command() {
   list_intersect "$temp/head-manifest" "$temp/use" "$temp/chosen"
   cp "$temp/chosen" "$temp/before" || fail "could not prepare file selection"
   build_rows "$temp/head-manifest" "$temp/rows"
-  checklist "$temp/rows" "$temp/chosen" "Choose which repository files this Mac uses" || { say "selection unchanged"; return 0; }
+  checklist "$temp/rows" "$temp/chosen" "Choose which repository files this machine uses" || { say "selection unchanged"; return 0; }
   list_minus "$temp/chosen" "$temp/before" "$temp/newly-used"
   list_minus "$temp/head-manifest" "$temp/chosen" "$temp/skip"
   head=$(head_revision) || fail "cannot resolve current revision"
@@ -1796,7 +1810,7 @@ select_command() {
     done <"$temp/newly-used"
   fi
   write_selection "$temp/chosen" "$temp/skip" "$temp/head-manifest" "$temp/pending" || fail "could not save the file selection"
-  say "this Mac uses $(list_count "$temp/chosen") of $(list_count "$temp/head-manifest") repository file(s)"
+  say "this machine uses $(list_count "$temp/chosen") of $(list_count "$temp/head-manifest") repository file(s)"
 }
 
 case ${1:-} in

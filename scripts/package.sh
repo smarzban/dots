@@ -16,6 +16,11 @@ rm -rf "$DIST"
 mkdir -p "$DIST"
 cp "$ROOT/bin/dots" "$DIST/dots"
 chmod 755 "$DIST/dots"
-(cd "$DIST" && shasum -a 256 dots >dots.sha256)
+# Both write "<hash>  dots", which install.sh reads.
+if command -v shasum >/dev/null 2>&1; then
+  (cd "$DIST" && shasum -a 256 dots >dots.sha256)
+else
+  (cd "$DIST" && sha256sum dots >dots.sha256)
+fi
 cp "$ROOT/install.sh" "$DIST/install.sh"
 printf 'Release assets for %s are in %s\n' "$VERSION" "$DIST"

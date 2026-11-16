@@ -4,6 +4,10 @@ set -u
 # Tests drive the numbered prompts; the arrow-key checklist has its own expect test.
 DOTS_PLAIN_PROMPTS=1
 export DOTS_PLAIN_PROMPTS
+# Git here ignores the caller's global config, as dots does, so a host's
+# init.defaultBranch or identity cannot decide a result.
+GIT_CONFIG_GLOBAL=/dev/null
+export GIT_CONFIG_GLOBAL
 
 ROOT=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
 DOTS=$ROOT/bin/dots
@@ -18,6 +22,10 @@ pass() { printf 'ok - %s\n' "$1"; PASS=$((PASS + 1)); }
 fail() { printf 'not ok - %s\n' "$1" >&2; FAIL=$((FAIL + 1)); }
 expect_ok() { "$@" >/dev/null 2>&1; }
 expect_fail() { ! "$@" >/dev/null 2>&1; }
+# Permission bits in octal (such as 600), the same on BSD and GNU userlands.
+mode_of() { /usr/bin/perl -e 'my @s = lstat $ARGV[0] or exit 1; printf "%o\n", $s[2] & 07777' "$1"; }
+# A file's SHA-256 in the "<hash>  <name>" form, with whichever tool this system has.
+sha256_of() { if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$@"; else sha256sum "$@"; fi; }
 
 make_mock_gitleaks() {
   MOCK=$TMP/mock-gitleaks
@@ -63,7 +71,7 @@ new_remote() {
   printf '%s\n' '.config/example/settings' >"$seed/.config/dots/manifest"
   printf '%s\n' 'base' >"$seed/.config/example/settings"
   /usr/bin/git -C "$seed" add -A && /usr/bin/git -C "$seed" commit -qm seed && /usr/bin/git -C "$seed" branch -M main
-  /usr/bin/git init -q --bare "$remote" && /usr/bin/git -C "$seed" remote add origin "$remote" && /usr/bin/git -C "$seed" push -q origin main
+  /usr/bin/git init -q --bare "$remote" && /usr/bin/git --git-dir="$remote" symbolic-ref HEAD refs/heads/main && /usr/bin/git -C "$seed" remote add origin "$remote" && /usr/bin/git -C "$seed" push -q origin main
 }
 
 remote_edit() {
@@ -73,7 +81,7 @@ remote_edit() {
   /usr/bin/git clone -q "$remote" "$work" || return 1
   /usr/bin/git -C "$work" checkout -q main
   /bin/sh -c "$command" sh "$work" || return 1
-  /usr/bin/git -C "$work" add -A && /usr/bin/git -C "$work" commit -qm edit && /usr/bin/git -C "$work" push -q origin main
+  /usr/bin/git -C "$work" add -A && /usr/bin/git -C "$work" -c user.name=test -c user.email=test@example.invalid commit -qm edit && /usr/bin/git -C "$work" push -q origin main
 }
 
 make_mock_gh() {
@@ -85,7 +93,7 @@ case "$1:$2" in
   auth:status) test "${DOTS_TEST_GH_UNAUTH:-0}" = 0 ;;
   api:user) printf '%s\n' example ;;
   repo:view) if [ "${DOTS_TEST_GH_UNAUTH:-0}" = 1 ]; then exit 1; elif [ "${DOTS_TEST_GH_PUBLIC:-0}" = 1 ]; then printf '%s\n' false; elif [ "${DOTS_TEST_GH_REPO_EXISTS:-0}" = 1 ]; then printf '%s\n' true; else exit 1; fi ;;
-  repo:create) printf '%s\n' "$*" >>"$DOTS_TEST_GH_LOG"; /usr/bin/git init -q --bare "$DOTS_TEST_GH_REMOTE" ;;
+  repo:create) printf '%s\n' "$*" >>"$DOTS_TEST_GH_LOG"; /usr/bin/git init -q --bare "$DOTS_TEST_GH_REMOTE" && /usr/bin/git --git-dir="$DOTS_TEST_GH_REMOTE" symbolic-ref HEAD refs/heads/main ;;
   pr:create) printf '%s\n' "$*" >>"$DOTS_TEST_GH_LOG"; test "${DOTS_TEST_GH_PR_FAIL:-0}" = 0 ;;
   pr:list)
     printf '%s\n' "$*" >>"$DOTS_TEST_GH_LOG"
@@ -119,42 +127,45 @@ esac
 exec /usr/bin/git "$@"
 EOF
   chmod 755 "$MOCK_GH" "$MOCK_GIT"
+  # dots enables gh's credential helper only when a gh command is on PATH.
+  MOCK_GH_BIN=$TMP/mock-gh-bin
+  mkdir -p "$MOCK_GH_BIN" && ln -s "$MOCK_GH" "$MOCK_GH_BIN/gh"
 }
 
 run_dots() {
   home=$1
   shift
-  HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid "$DOTS" "$@"
+  HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.invalid "$DOTS" "$@"
 }
 
 run_sync() {
   home=$1
   input=$2
   # BSD script supplies a pseudo-terminal, needed by the intentional sync guard.
-  HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid TERM=dumb expect "$DRIVE" "$input" "$DOTS" sync
+  HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.invalid TERM=dumb expect "$DRIVE" "$input" "$DOTS" sync
 }
 
 run_discover() {
   home=$1
   input=$2
-  HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid TERM=dumb expect "$DRIVE" "$input" "$DOTS" init --discover
+  HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.invalid TERM=dumb expect "$DRIVE" "$input" "$DOTS" init --discover
 }
 
 run_default_init() {
   home=$1
   remote=$2
-  HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK DOTS_GH=$MOCK_GH DOTS_DEFAULT_REMOTE=$remote DOTS_DEFAULT_GITHUB_REPO=smarzban/dotfiles DOTS_TEST_GH_REMOTE=$remote GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid TERM=dumb expect "$DRIVE" $'y\n' "$DOTS" init
+  HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK DOTS_GH=$MOCK_GH DOTS_DEFAULT_REMOTE=$remote DOTS_DEFAULT_GITHUB_REPO=smarzban/dotfiles DOTS_TEST_GH_REMOTE=$remote GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.invalid TERM=dumb expect "$DRIVE" $'y\n' "$DOTS" init
 }
 
 run_existing_default_init() {
   home=$1
   remote=$2
-  HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK DOTS_DEFAULT_REMOTE=$remote DOTS_DEFAULT_GITHUB_REPO=example/dotfiles GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid "$DOTS" init
+  HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK DOTS_DEFAULT_REMOTE=$remote DOTS_DEFAULT_GITHUB_REPO=example/dotfiles GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.invalid "$DOTS" init
 }
 
 run_public_default_init() {
   home=$1
-  DOTS_TEST_GH_PUBLIC=1 HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK DOTS_GH=$MOCK_GH GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid "$DOTS" init
+  DOTS_TEST_GH_PUBLIC=1 HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK DOTS_GH=$MOCK_GH GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.invalid "$DOTS" init
 }
 
 run_derived_default_init() {
@@ -163,7 +174,7 @@ run_derived_default_init() {
   response=$3
   log=$TMP/gh-create.log
   : >"$log"
-  HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK DOTS_GH=$MOCK_GH DOTS_GIT=$MOCK_GIT DOTS_TEST_GH_REMOTE=$remote DOTS_TEST_GH_LOG=$log GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid TERM=dumb expect "$DRIVE" "$response" "$DOTS" init
+  HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK DOTS_GH=$MOCK_GH DOTS_GIT=$MOCK_GIT DOTS_TEST_GH_REMOTE=$remote DOTS_TEST_GH_LOG=$log GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.invalid TERM=dumb expect "$DRIVE" "$response" "$DOTS" init
 }
 
 run_update() {
@@ -172,14 +183,14 @@ run_update() {
   input=$3
   log=$TMP/gh-update.log
   : >"$log"
-  DOTS_TEST_GH_REPO_EXISTS=1 HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK DOTS_GH=$MOCK_GH DOTS_GIT=$MOCK_GIT DOTS_TEST_GH_REMOTE=$remote DOTS_TEST_GH_LOG=$log GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid TERM=dumb expect "$DRIVE" "$input" "$DOTS" update
+  PATH=$MOCK_GH_BIN:$PATH DOTS_TEST_GH_REPO_EXISTS=1 HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK DOTS_GH=$MOCK_GH DOTS_GIT=$MOCK_GIT DOTS_TEST_GH_REMOTE=$remote DOTS_TEST_GH_LOG=$log GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.invalid TERM=dumb expect "$DRIVE" "$input" "$DOTS" update
 }
 
 run_dots_pty() {
   home=$1
   input=$2
   shift 2
-  HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid TERM=dumb expect "$DRIVE" "$input" "$DOTS" "$@"
+  HOME=$home DOTS_DATA_DIR=$home/data DOTS_GITLEAKS=$MOCK GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.invalid TERM=dumb expect "$DRIVE" "$input" "$DOTS" "$@"
 }
 
 make_mock_gitleaks
@@ -229,7 +240,7 @@ home=$TMP/home-collision-hint; mkdir -p "$home/.config/example"; printf old >"$h
 if run_dots "$home" init "$remote" main 2>&1 | grep -F -- --backup-existing >/dev/null; then pass "collision error names --backup-existing"; else fail "collision error names --backup-existing"; fi
 if expect_ok run_dots "$home" init --backup-existing "$remote" main && test "$(cat "$home/.config/example/settings")" = base; then pass "backup-existing applies repository version"; else fail "backup-existing applies repository version"; fi
 backup=$(find "$home/data/backups" -path '*/.config/example/settings' -type f 2>/dev/null | head -1)
-if test -n "$backup" && test "$(cat "$backup")" = old && test "$(stat -f %Lp "$(dirname "$(dirname "$(dirname "$backup")")")")" = 700; then pass "backup-existing keeps a private backup"; else fail "backup-existing keeps a private backup"; fi
+if test -n "$backup" && test "$(cat "$backup")" = old && test "$(mode_of "$(dirname "$(dirname "$(dirname "$backup")")")")" = 700; then pass "backup-existing keeps a private backup"; else fail "backup-existing keeps a private backup"; fi
 # A checkout failure after backup names the backup and leaves init retryable.
 home=$TMP/home-backup-retry; mkdir -p "$home/.config/example"; printf old >"$home/.config/example/settings"; chmod 555 "$home/.config/example"
 failure=$(run_dots "$home" init --backup-existing "$remote" main 2>&1); chmod 755 "$home/.config/example"
@@ -373,7 +384,7 @@ if run_sync "$TMP/home-clash-take" $'1\n' >/dev/null 2>&1 && test "$(cat "$TMP/h
 # 2 keeps yours as an edit on top of the latest revision, ready for update.
 keep_sync=$(run_sync "$TMP/home-clash-keep" $'2\n' 2>&1)
 keep_status=$(run_dots "$TMP/home-clash-keep" status 2>&1)
-if test "$(cat "$TMP/home-clash-keep/.config/example/settings")" = two && test "$(/usr/bin/git --git-dir="$TMP/home-clash-keep/data/repo.git" rev-parse HEAD)" = "$clash_remote" && printf '%s' "$keep_status" | grep -Fx 'this Mac: up to date' >/dev/null && printf '%s\n' "$keep_status" | grep -A1 -F 'edited here, not in the repository yet' | grep -F '.config/example/settings' >/dev/null && printf '%s' "$keep_sync" | grep -F 'run dots update' >/dev/null; then pass "clash: keep yours stays up to date with your edit"; else fail "clash: keep yours stays up to date with your edit"; fi
+if test "$(cat "$TMP/home-clash-keep/.config/example/settings")" = two && test "$(/usr/bin/git --git-dir="$TMP/home-clash-keep/data/repo.git" rev-parse HEAD)" = "$clash_remote" && printf '%s' "$keep_status" | grep -Fx 'this machine: up to date' >/dev/null && printf '%s\n' "$keep_status" | grep -A1 -F 'edited here, not in the repository yet' | grep -F '.config/example/settings' >/dev/null && printf '%s' "$keep_sync" | grep -F 'run dots update' >/dev/null; then pass "clash: keep yours stays up to date with your edit"; else fail "clash: keep yours stays up to date with your edit"; fi
 # A leftover merge folder from an older version is refused, and --continue explains the change.
 mkdir -p "$TMP/home-clash-keep/data/conflict-workspace"
 if ! run_sync "$TMP/home-clash-keep" '' 2>&1 | grep -F 'unfinished merge from an older dots version' >/dev/null; then fail "old merge folder is refused"; else pass "old merge folder is refused"; fi
@@ -417,7 +428,7 @@ if printf '%s' "$held_out" | grep -F 'nothing to send' >/dev/null && ! printf '%
 mv "$update_home/.zshrc" "$TMP/zshrc.kept"
 deleted_out=$(run_update "$update_home" "$remote" $'\ny\nStop sharing shell\n' 2>&1 | tr -d '\r')
 deleted_ref=$(/usr/bin/git --git-dir="$remote" for-each-ref --sort=-refname --format='%(refname)' 'refs/heads/dots/update-*' | head -1)
-if printf '%s' "$deleted_out" | grep -E '\[x\] \.zshrc  \(deleted here\)$' >/dev/null && printf '%s' "$deleted_out" | grep -F 'Stop sharing on every Mac' >/dev/null && ! /usr/bin/git --git-dir="$remote" show "$deleted_ref:.config/dots/manifest" | grep -Fx .zshrc >/dev/null && ! /usr/bin/git --git-dir="$remote" cat-file -e "$deleted_ref:.zshrc" 2>/dev/null; then pass "update sends a local deletion as stop sharing"; else fail "update sends a local deletion as stop sharing"; fi
+if printf '%s' "$deleted_out" | grep -E '\[x\] \.zshrc  \(deleted here\)$' >/dev/null && printf '%s' "$deleted_out" | grep -F 'Stop sharing on every machine' >/dev/null && ! /usr/bin/git --git-dir="$remote" show "$deleted_ref:.config/dots/manifest" | grep -Fx .zshrc >/dev/null && ! /usr/bin/git --git-dir="$remote" cat-file -e "$deleted_ref:.zshrc" 2>/dev/null; then pass "update sends a local deletion as stop sharing"; else fail "update sends a local deletion as stop sharing"; fi
 # Declining that confirmation keeps the file shared and sends the other edits.
 printf 'input\n' >"$update_home/.inputrc"
 declined_out=$(run_update "$update_home" "$remote" $'\nn\nDecline\n' 2>&1 | tr -d '\r')
@@ -435,9 +446,9 @@ pick_home=$TMP/home-select-pick; mkdir -p "$pick_home"
 run_dots_pty "$pick_home" $'1\n' init "$remote" main >/dev/null 2>&1
 if test ! -e "$pick_home/.zshrc" && test -f "$pick_home/.config/example/settings" && grep -Fx 'skip .zshrc' "$pick_home/data/selection" >/dev/null; then pass "init brings only the chosen files"; else fail "init brings only the chosen files"; fi
 status=$(run_dots "$pick_home" status 2>&1)
-if printf '%s\n' "$status" | grep -Fx 'files used on this Mac: 1 of 2' >/dev/null && printf '%s\n' "$status" | grep -Fx 'edits here: none' >/dev/null; then pass "status ignores files this Mac does not use"; else fail "status ignores files this Mac does not use"; fi
+if printf '%s\n' "$status" | grep -Fx 'files used on this machine: 1 of 2' >/dev/null && printf '%s\n' "$status" | grep -Fx 'edits here: none' >/dev/null; then pass "status ignores files this machine does not use"; else fail "status ignores files this machine does not use"; fi
 remote_edit "$remote" "printf 'repo shell 2\\n' > \"\$1/.zshrc\"" || exit 1
-if run_sync "$pick_home" '' >/dev/null 2>&1 && test ! -e "$pick_home/.zshrc" && test "$(/usr/bin/git --git-dir="$pick_home/data/repo.git" rev-parse HEAD)" = "$(/usr/bin/git --git-dir="$remote" rev-parse main)"; then pass "sync skips files this Mac does not use"; else fail "sync skips files this Mac does not use"; fi
+if run_sync "$pick_home" '' >/dev/null 2>&1 && test ! -e "$pick_home/.zshrc" && test "$(/usr/bin/git --git-dir="$pick_home/data/repo.git" rev-parse HEAD)" = "$(/usr/bin/git --git-dir="$remote" rev-parse main)"; then pass "sync skips files this machine does not use"; else fail "sync skips files this machine does not use"; fi
 printf 'mine\n' >"$pick_home/.zshrc"
 if run_dots_pty "$pick_home" $'1\ny\n' select >/dev/null 2>&1 && test "$(cat "$pick_home/.zshrc")" = 'repo shell 2' && grep -Fx 'use .zshrc' "$pick_home/data/selection" >/dev/null; then pass "select brings in a newly chosen file"; else fail "select brings in a newly chosen file"; fi
 backup=$(find "$pick_home/data/backups" -path '*select-*/.zshrc' -type f 2>/dev/null | head -1)
@@ -450,7 +461,7 @@ if run_sync "$pick_home" '' >/dev/null 2>&1 && test ! -e "$pick_home/.config/exa
 if run_sync "$all_home" $'\n' >/dev/null 2>&1 && test "$(cat "$all_home/.config/example/extra")" = more; then pass "accepted repository files are applied"; else fail "accepted repository files are applied"; fi
 # Without a saved selection (an older install), every repository file counts as used.
 mv "$all_home/data/selection" "$TMP/selection.saved"
-if run_dots "$all_home" status 2>&1 | grep -Fx 'files used on this Mac: 3 of 3' >/dev/null; then pass "missing selection uses every file"; else fail "missing selection uses every file"; fi
+if run_dots "$all_home" status 2>&1 | grep -Fx 'files used on this machine: 3 of 3' >/dev/null; then pass "missing selection uses every file"; else fail "missing selection uses every file"; fi
 mv "$TMP/selection.saved" "$all_home/data/selection"
 # The arrow-key checklist: Space unticks the first page's file, Right changes page, Enter confirms; q cancels.
 if command -v expect >/dev/null 2>&1; then
@@ -494,17 +505,19 @@ EXPECT
 set timeout 20
 set key [lindex $argv 0]
 set stty_init "rows 30 columns 100"
-spawn -noecho /bin/sh -c "\"[lindex $argv 1]\" init \"[lindex $argv 2]\" main; stty -a"
+spawn -noecho /bin/bash -c "\"[lindex $argv 1]\" init \"[lindex $argv 2]\" main; echo STTY-BEGIN; stty -a; echo STTY-END"
 expect {
   "selected" {}
   timeout { exit 1 }
 }
 if {$key eq "Q"} { send "q" } else { send "\003" }
+# BSD and GNU stty -a lay settings out differently; both write "-icanon" and "-echo"
+# for a switched-off flag.
 expect {
-  -re {lflags:[^\r\n]*} { set flags $expect_out(0,string) }
+  -re {STTY-BEGIN(.*)STTY-END} { set flags " [string map {"\r" " " "\n" " " ";" " "} $expect_out(1,string)] " }
   timeout { exit 1 }
 }
-if {[string match "*-icanon*" $flags] || [string match "*-echo *" $flags]} { exit 1 }
+if {[string match "* -icanon *" $flags] || [string match "* -echo *" $flags]} { exit 1 }
 expect {
   eof {}
   timeout { exit 1 }
@@ -566,7 +579,7 @@ expect {
 }
 exit 0
 EXPECT
-  if DOTS_TEST_GH_REPO_EXISTS=1 HOME=$ignore_home DOTS_DATA_DIR=$ignore_home/data DOTS_GITLEAKS=$MOCK DOTS_GH=$MOCK_GH DOTS_GIT=$MOCK_GIT DOTS_TEST_GH_REMOTE=$remote DOTS_TEST_GH_LOG=$TMP/gh-update.log DOTS_PLAIN_PROMPTS=0 TERM=xterm-256color expect "$ignored_script" "$DOTS" update >/dev/null 2>&1; then pass "checklist shows a previously ignored page"; else fail "checklist shows a previously ignored page"; fi
+  if PATH=$MOCK_GH_BIN:$PATH DOTS_TEST_GH_REPO_EXISTS=1 HOME=$ignore_home DOTS_DATA_DIR=$ignore_home/data DOTS_GITLEAKS=$MOCK DOTS_GH=$MOCK_GH DOTS_GIT=$MOCK_GIT DOTS_TEST_GH_REMOTE=$remote DOTS_TEST_GH_LOG=$TMP/gh-update.log DOTS_PLAIN_PROMPTS=0 TERM=xterm-256color expect "$ignored_script" "$DOTS" update >/dev/null 2>&1; then pass "checklist shows a previously ignored page"; else fail "checklist shows a previously ignored page"; fi
 else
   pass "previously ignored page (expect unavailable, skipped)"
 fi
@@ -636,7 +649,7 @@ printf 'shell\n' >"$om_home/.zshrc"; printf '.zshrc\n' >>"$om_home/.config/dots/
 remote_edit "$remote" "printf '%s\\n' '.config/example/settings' '.zshrc' > \"\$1/.config/dots/manifest\"; printf 'shell\\n' > \"\$1/.zshrc\"" || exit 1
 om_out=$(run_sync "$om_home" '' 2>&1)
 om_status=$(run_dots "$om_home" status 2>&1)
-if ! printf '%s' "$om_out" | grep -F -e 'Choose [1-2]' -e 'edited here' >/dev/null && printf '%s' "$om_status" | grep -Fx 'this Mac: up to date' >/dev/null && printf '%s' "$om_status" | grep -Fx 'edits here: none' >/dev/null && test ! -e "$om_home/data/backups"; then pass "sync skips the menu for changes already merged"; else fail "sync skips the menu for changes already merged"; fi
+if ! printf '%s' "$om_out" | grep -F -e 'Choose [1-2]' -e 'edited here' >/dev/null && printf '%s' "$om_status" | grep -Fx 'this machine: up to date' >/dev/null && printf '%s' "$om_status" | grep -Fx 'edits here: none' >/dev/null && test ! -e "$om_home/data/backups"; then pass "sync skips the menu for changes already merged"; else fail "sync skips the menu for changes already merged"; fi
 # A mode-only change (chmod +x) is a real local change, not already merged.
 chmod +x "$om_home/.zshrc"
 remote_edit "$remote" "printf again > \"\$1/.config/example/settings\"" || exit 1
@@ -690,7 +703,7 @@ test -n "$own_ref" && /usr/bin/git --git-dir="$own_remote" update-ref refs/heads
 printf vim >"$own_home/.vimrc"
 own_out=$(run_update "$own_home" "$own_remote" '' 2>&1 | tr -d '\r')
 own_order=$(printf '%s\n' "$own_out" | awk '/^(edits to send|new files|shared files|previously ignored) \(.*\):$/ { h = $0; sub(/ \(.*/, "", h); printf "%s:|", h } /^ *[0-9]+  \[/ { row = $0; sub(/^ *[0-9]+  /, "", row); printf "%s|", row }')
-if test "$own_order" = 'new files:|[ ] .vimrc|shared files:|[x] .zshrc|'; then pass "update checks the Mac again after catching up"; else fail "update checks the Mac again after catching up ($own_order)"; fi
+if test "$own_order" = 'new files:|[ ] .vimrc|shared files:|[x] .zshrc|'; then pass "update checks this machine again after catching up"; else fail "update checks this machine again after catching up ($own_order)"; fi
 # With a file changed on both sides, update stops and names it, changing nothing.
 uc_remote=$TMP/update-clash.git; uc_home=$TMP/home-update-clash; mkdir -p "$uc_home"
 run_derived_default_init "$uc_home" "$uc_remote" $'y\n' >/dev/null 2>&1 || exit 1
@@ -708,7 +721,7 @@ remote=$TMP/modes.git; new_remote "$remote"; modes_home=$TMP/home-modes; mkdir -
 chmod 600 "$modes_home/.config/example/settings"
 remote_edit "$remote" "printf '%s\\n' '.config/example/settings' '.config/example/run.sh' > \"\$1/.config/dots/manifest\"; printf changed > \"\$1/.config/example/settings\"; printf 'echo hi' > \"\$1/.config/example/run.sh\"; chmod +x \"\$1/.config/example/run.sh\"" || exit 1
 run_sync "$modes_home" $'\n' >/dev/null 2>&1
-if test "$(stat -f '%Lp' "$modes_home/.config/example/settings")" = 600 && test "$(cat "$modes_home/.config/example/settings")" = changed && test -x "$modes_home/.config/example/run.sh" && test "$(stat -f '%Lp' "$modes_home/.config/example/run.sh")" = 700; then pass "catching up keeps private permissions and sets the executable bit"; else fail "catching up keeps private permissions and sets the executable bit ($(stat -f '%Lp' "$modes_home/.config/example/settings") $(stat -f '%Lp' "$modes_home/.config/example/run.sh" 2>/dev/null))"; fi
+if test "$(mode_of "$modes_home/.config/example/settings")" = 600 && test "$(cat "$modes_home/.config/example/settings")" = changed && test -x "$modes_home/.config/example/run.sh" && test "$(mode_of "$modes_home/.config/example/run.sh")" = 700; then pass "catching up keeps private permissions and sets the executable bit"; else fail "catching up keeps private permissions and sets the executable bit ($(mode_of "$modes_home/.config/example/settings") $(mode_of "$modes_home/.config/example/run.sh" 2>/dev/null))"; fi
 remote_edit "$remote" "chmod -x \"\$1/.config/example/run.sh\"" || exit 1
 run_sync "$modes_home" '' >/dev/null 2>&1
 if test ! -x "$modes_home/.config/example/run.sh"; then pass "catching up clears the executable bit"; else fail "catching up clears the executable bit"; fi
@@ -747,7 +760,7 @@ remote_edit "$remote" "printf bad > \"\$1/.unapproved\"" || exit 1
 if ! (run_dots "$sc_home" status) >"$TMP/sc.out" 2>&1 && grep -F 'unsafe changes' "$TMP/sc.out" >/dev/null; then pass "status refuses unsafe repository content"; else fail "status refuses unsafe repository content"; fi
 # With nothing new anywhere, sync just says so.
 remote=$TMP/menu-shape.git; new_remote "$remote"; menu_home=$TMP/home-menu-shape; mkdir -p "$menu_home"; expect_ok run_dots "$menu_home" init "$remote" main
-if run_sync "$menu_home" '' 2>&1 | tr -d '\r' | grep -Fx 'this Mac is up to date' >/dev/null; then pass "sync reports up to date"; else fail "sync reports up to date"; fi
+if run_sync "$menu_home" '' 2>&1 | tr -d '\r' | grep -Fx 'this machine is up to date' >/dev/null; then pass "sync reports up to date"; else fail "sync reports up to date"; fi
 
 # Paths resolve against HOME whatever the current folder, including a folder inside HOME.
 remote=$TMP/any-folder.git; new_remote "$remote"; af_home=$TMP/home-any-folder; mkdir -p "$af_home/projects/sub"; expect_ok run_dots "$af_home" init "$remote" main
@@ -774,7 +787,7 @@ run_dots_pty "$keep_home" $'\n' select >/dev/null 2>&1
 remote_edit "$remote" "printf changed > \"\$1/.config/example/settings\"" || exit 1
 if grep -Fx 'pending .zshrc' "$keep_home/data/selection" >/dev/null && run_sync "$keep_home" '' >/dev/null 2>&1 && grep -Fx 'pending .zshrc' "$keep_home/data/selection" >/dev/null; then pass "pending entries survive select and sync"; else fail "pending entries survive select and sync"; fi
 printf '%s\n' '.config/example/settings' '.zshrc' >"$keep_home/.config/dots/manifest"; printf shell >"$keep_home/.zshrc"
-if run_dots "$keep_home" status 2>&1 | grep -Fx 'files used on this Mac: 2 of 2' >/dev/null; then pass "pending files in the manifest count as used"; else fail "pending files in the manifest count as used"; fi
+if run_dots "$keep_home" status 2>&1 | grep -Fx 'files used on this machine: 2 of 2' >/dev/null; then pass "pending files in the manifest count as used"; else fail "pending files in the manifest count as used"; fi
 # A merged own file edited since its PR is confirmed before replacing, instead of blocking sync.
 edit_remote=$TMP/update-edited.git; edit_home=$TMP/home-update-edited; mkdir -p "$edit_home"
 run_derived_default_init "$edit_home" "$edit_remote" $'y\n' >/dev/null 2>&1 || exit 1
@@ -829,12 +842,12 @@ merge_home=$TMP/home-merge-unused; mkdir -p "$merge_home"
 run_dots_pty "$merge_home" $'1\n' init "$remote" main >/dev/null 2>&1
 printf 'local\n' >"$merge_home/.config/example/settings"
 remote_edit "$remote" "printf 'shell 2\\n' > \"\$1/.zshrc\"" || exit 1
-if run_sync "$merge_home" '' >/dev/null 2>&1 && test ! -e "$merge_home/.zshrc" && test "$(cat "$merge_home/.config/example/settings")" = local && test "$(/usr/bin/git --git-dir="$merge_home/data/repo.git" show HEAD:.zshrc)" = 'shell 2'; then pass "catching up leaves files this Mac does not use"; else fail "catching up leaves files this Mac does not use"; fi
+if run_sync "$merge_home" '' >/dev/null 2>&1 && test ! -e "$merge_home/.zshrc" && test "$(cat "$merge_home/.config/example/settings")" = local && test "$(/usr/bin/git --git-dir="$merge_home/data/repo.git" show HEAD:.zshrc)" = 'shell 2'; then pass "catching up leaves files this machine does not use"; else fail "catching up leaves files this machine does not use"; fi
 # select can stop using a file: later repository changes leave the local copy alone.
 remote=$TMP/select-stop.git; new_remote "$remote"; stop_home=$TMP/home-select-stop; mkdir -p "$stop_home"; expect_ok run_dots "$stop_home" init "$remote" main
 if run_dots_pty "$stop_home" $'1\n' select >/dev/null 2>&1 && grep -Fx 'skip .config/example/settings' "$stop_home/data/selection" >/dev/null; then pass "select stops using a file"; else fail "select stops using a file"; fi
 remote_edit "$remote" "printf changed > \"\$1/.config/example/settings\"" || exit 1
-if run_sync "$stop_home" '' >/dev/null 2>&1 && test "$(cat "$stop_home/.config/example/settings")" = base; then pass "sync leaves files this Mac stopped using"; else fail "sync leaves files this Mac stopped using"; fi
+if run_sync "$stop_home" '' >/dev/null 2>&1 && test "$(cat "$stop_home/.config/example/settings")" = base; then pass "sync leaves files this machine stopped using"; else fail "sync leaves files this machine stopped using"; fi
 # Declining select's backup confirmation changes nothing.
 printf 'mine\n' >"$stop_home/.config/example/settings"
 run_dots_pty "$stop_home" $'1\nn\n' select >/dev/null 2>&1
@@ -877,7 +890,7 @@ if expect_fail run_dots "$reserved_home" init "$remote" main; then pass "reposit
 remote=$TMP/status-divergence.git; new_remote "$remote"; status_home=$TMP/home-status-divergence; mkdir -p "$status_home"; expect_ok run_dots "$status_home" init "$remote" main
 remote_edit "$remote" "printf remote > \"\$1/.config/example/settings\"" || exit 1
 status=$(run_dots "$status_home" status 2>&1)
-if printf '%s\n' "$status" | grep -Fx 'this Mac: 1 repository update(s) not synced yet (run dots sync)' >/dev/null && printf '%s\n' "$status" | grep -A1 -F 'changed in the repository, not here yet' | grep -Fx '  .config/example/settings' >/dev/null; then pass "status shows repository changes"; else fail "status shows repository changes"; fi
+if printf '%s\n' "$status" | grep -Fx 'this machine: 1 repository update(s) not synced yet (run dots sync)' >/dev/null && printf '%s\n' "$status" | grep -A1 -F 'changed in the repository, not here yet' | grep -Fx '  .config/example/settings' >/dev/null; then pass "status shows repository changes"; else fail "status shows repository changes"; fi
 
 # An incoming file this Mac already chose (for example shared by its own update, then
 # edited again) cannot overwrite a differing live file.
@@ -900,10 +913,10 @@ if expect_fail run_dots "$symlink_home" status; then pass "live symlink refused"
 
 # Packaging emits all release assets and a portable checksum filename.
 package_repo=$TMP/package-repo; /usr/bin/git clone -q "$ROOT" "$package_repo"; /usr/bin/git -C "$package_repo" config user.name test; /usr/bin/git -C "$package_repo" config user.email test@example.invalid; cp "$ROOT/scripts/package.sh" "$package_repo/scripts/package.sh"; /usr/bin/git -C "$package_repo" add scripts/package.sh; /usr/bin/git -C "$package_repo" commit -qm 'package test'; /usr/bin/git -C "$package_repo" tag v0.0.0-test
-if "$package_repo/scripts/package.sh" v0.0.0-test >/dev/null 2>&1 && test -x "$package_repo/dist/dots" && test -x "$package_repo/dist/install.sh" && (cd "$package_repo/dist" && shasum -a 256 --check dots.sha256) >/dev/null 2>&1; then pass "release packaging"; else fail "release packaging"; fi
+if "$package_repo/scripts/package.sh" v0.0.0-test >/dev/null 2>&1 && test -x "$package_repo/dist/dots" && test -x "$package_repo/dist/install.sh" && (cd "$package_repo/dist" && sha256_of --check dots.sha256) >/dev/null 2>&1; then pass "release packaging"; else fail "release packaging"; fi
 
 # The installer verifies release checksums before copying a binary.
-assets=$TMP/release-assets; destination=$TMP/installed-bin; mkdir -p "$assets"; printf '#!/bin/sh\necho dots\n' >"$assets/dots"; shasum -a 256 "$assets/dots" >"$assets/dots.sha256"
+assets=$TMP/release-assets; destination=$TMP/installed-bin; mkdir -p "$assets"; printf '#!/bin/sh\necho dots\n' >"$assets/dots"; sha256_of "$assets/dots" >"$assets/dots.sha256"
 if DOTS_RELEASE_BASE_URL="file://$assets" DOTS_BIN_DIR="$destination" "$ROOT/install.sh" >/dev/null 2>&1 && test -x "$destination/dots"; then pass "installer checksum success"; else fail "installer checksum success"; fi
 # The installer says how to run dots when its folder is not on PATH, and nothing extra when it is.
 off_path=$(DOTS_RELEASE_BASE_URL="file://$assets" DOTS_BIN_DIR="$TMP/off-path-bin" PATH=/usr/bin:/bin "$ROOT/install.sh" 2>&1)
@@ -914,13 +927,38 @@ mkdir -p "$TMP/shadow-bin"; cp "$DOTS" "$TMP/shadow-bin/dots"
 shadow=$(DOTS_RELEASE_BASE_URL="file://$assets" DOTS_BIN_DIR="$TMP/on-path-bin" PATH="$TMP/shadow-bin:$TMP/on-path-bin:/usr/bin:/bin" "$ROOT/install.sh" 2>&1)
 quoted=$(DOTS_RELEASE_BASE_URL="file://$assets" DOTS_BIN_DIR="$TMP/it's here" PATH=/usr/bin:/bin "$ROOT/install.sh" 2>&1)
 if test "$(printf '%s\n' "$slash_path" | wc -l | tr -d ' ')" = 1 && printf '%s' "$shadow" | grep -F "$TMP/shadow-bin/dots comes first" >/dev/null && printf '%s' "$quoted" | grep -F 'add that folder to PATH' >/dev/null && ! printf '%s' "$quoted" | grep -F 'echo ' >/dev/null; then pass "installer handles trailing slashes, shadowing, and unusual names"; else fail "installer handles trailing slashes, shadowing, and unusual names"; fi
+# A system without shasum (minimal Linux) verifies with sha256sum, and one with
+# neither refuses. Each folder holds only the tools install.sh runs.
+sha_bin=$TMP/sha-bin; none_bin=$TMP/no-sha-bin; mkdir -p "$sha_bin" "$none_bin"
+for tool in curl awk mktemp rm mkdir install uname; do
+  ln -s "$(command -v "$tool")" "$sha_bin/$tool"; ln -s "$(command -v "$tool")" "$none_bin/$tool"
+done
+if command -v sha256sum >/dev/null 2>&1; then
+  ln -s "$(command -v sha256sum)" "$sha_bin/sha256sum"
+else
+  printf '%s\n' '#!/bin/sh' 'exec /usr/bin/perl -MDigest::SHA -e '"'"'print Digest::SHA->new(256)->addfile($ARGV[0])->hexdigest, "  $ARGV[0]\n"'"'"' "$1"' >"$sha_bin/sha256sum"
+  chmod 755 "$sha_bin/sha256sum"
+fi
+if DOTS_RELEASE_BASE_URL="file://$assets" DOTS_BIN_DIR="$TMP/sha-installed" PATH=$sha_bin "$ROOT/install.sh" >/dev/null 2>&1 && test -x "$TMP/sha-installed/dots"; then pass "installer verifies with sha256sum when shasum is missing"; else fail "installer verifies with sha256sum when shasum is missing"; fi
+if ! DOTS_RELEASE_BASE_URL="file://$assets" DOTS_BIN_DIR="$TMP/none-installed" PATH=$none_bin "$ROOT/install.sh" >/dev/null 2>&1 && test ! -e "$TMP/none-installed/dots"; then pass "installer refuses without a checksum tool"; else fail "installer refuses without a checksum tool"; fi
+# The PATH advice names the user's shell startup file on Linux; macOS keeps zsh's.
+advice() { DOTS_RELEASE_BASE_URL="file://$assets" DOTS_BIN_DIR="$TMP/advice-bin" SHELL=$1 PATH=/usr/bin:/bin "$ROOT/install.sh" 2>&1 | grep -F 'add it to PATH'; }
+advice_bash=$(advice /bin/bash); advice_zsh=$(advice /usr/bin/zsh); advice_dash=$(advice /bin/dash)
+if test "$(uname -s)" = Darwin; then
+  printf '%s\n' "$advice_bash" "$advice_zsh" "$advice_dash" | grep -c -F '>> ~/.zprofile && exec zsh -l' | grep -Fx 3 >/dev/null && advice_ok=yes || advice_ok=no
+else
+  printf '%s' "$advice_bash" | grep -F '>> ~/.bashrc && exec bash' >/dev/null && printf '%s' "$advice_zsh" | grep -F '>> ~/.zprofile && exec zsh -l' >/dev/null &&
+    printf '%s' "$advice_dash" | grep -F '>> ~/.profile && . ~/.profile' >/dev/null && advice_ok=yes || advice_ok=no
+fi
+if test "$advice_ok" = yes; then pass "installer PATH advice names the shell's startup file"; else fail "installer PATH advice names the shell's startup file"; fi
 printf tampered >"$assets/dots"
 if ! DOTS_RELEASE_BASE_URL="file://$assets" DOTS_BIN_DIR="$TMP/unsafe-bin" "$ROOT/install.sh" >/dev/null 2>&1 && test ! -e "$TMP/unsafe-bin/dots"; then pass "installer checksum refusal"; else fail "installer checksum refusal"; fi
+if ! DOTS_RELEASE_BASE_URL="file://$assets" DOTS_BIN_DIR="$TMP/sha-unsafe" PATH=$sha_bin "$ROOT/install.sh" >/dev/null 2>&1 && test ! -e "$TMP/sha-unsafe/dots"; then pass "installer checksum refusal with sha256sum"; else fail "installer checksum refusal with sha256sum"; fi
 
 # A real installed gitleaks is exercised for one clean init when available.
 if command -v gitleaks >/dev/null 2>&1; then
   remote=$TMP/real-scan.git; new_remote "$remote"; realhome=$TMP/home-real; mkdir -p "$realhome"
-  if HOME=$realhome DOTS_DATA_DIR=$realhome/data GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid "$DOTS" init "$remote" main >/dev/null 2>&1; then pass "installed gitleaks integration"; else fail "installed gitleaks integration"; fi
+  if HOME=$realhome DOTS_DATA_DIR=$realhome/data GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.invalid "$DOTS" init "$remote" main >/dev/null 2>&1; then pass "installed gitleaks integration"; else fail "installed gitleaks integration"; fi
 else
   pass "installed gitleaks integration (unavailable, skipped)"
 fi
@@ -935,7 +973,7 @@ expect_ok run_dots "$hp_c" init "$hp_remote" main
 # v0.2.3, run in its own temporary home, connects before the new format arrives.
 hp_v023=$TMP/dots-v0.2.3
 /usr/bin/git -C "$ROOT" show v0.2.3:bin/dots >"$hp_v023" 2>/dev/null && chmod 755 "$hp_v023"
-run_v023() { HOME=$hp_old DOTS_DATA_DIR=$hp_old/data DOTS_GITLEAKS=$MOCK GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid TERM=dumb "$@"; }
+run_v023() { HOME=$hp_old DOTS_DATA_DIR=$hp_old/data DOTS_GITLEAKS=$MOCK GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.invalid TERM=dumb "$@"; }
 (run_v023 "$hp_v023" init "$hp_remote" main) >/dev/null 2>&1
 # The home folder at the start, mid-line, before ":" and at the end (no final newline);
 # left alone: a longer name, a deeper path, a regex look-alike. Non-UTF-8 bytes are kept.
@@ -956,7 +994,7 @@ run_sync "$hp_a" '' >/dev/null 2>&1
 hp_a_status=$(run_dots "$hp_a" status 2>&1)
 /usr/bin/git --git-dir="$hp_a/data/repo.git" show HEAD:.zprofile >"$TMP/hp-a-head" 2>/dev/null
 # Clean although the synced blob holds the placeholder and the live file the home folder.
-if cmp -s "$TMP/hp-a-head" "$TMP/hp-stored" && cmp -s "$hp_a/.zprofile" "$TMP/hp-a-zprofile" && cmp -s "$hp_a/.inputrc" "$TMP/hp-inputrc" && printf '%s\n' "$hp_a_status" | grep -Fx 'edits here: none' >/dev/null && printf '%s\n' "$hp_a_status" | grep -Fx 'this Mac: up to date' >/dev/null; then pass "home paths: the sending Mac is unchanged and clean"; else fail "home paths: the sending Mac is unchanged and clean"; fi
+if cmp -s "$TMP/hp-a-head" "$TMP/hp-stored" && cmp -s "$hp_a/.zprofile" "$TMP/hp-a-zprofile" && cmp -s "$hp_a/.inputrc" "$TMP/hp-inputrc" && printf '%s\n' "$hp_a_status" | grep -Fx 'edits here: none' >/dev/null && printf '%s\n' "$hp_a_status" | grep -Fx 'this machine: up to date' >/dev/null; then pass "home paths: the sending Mac is unchanged and clean"; else fail "home paths: the sending Mac is unchanged and clean"; fi
 expect_ok run_dots "$hp_b" init "$hp_remote" main
 hp_b_status=$(run_dots "$hp_b" status 2>&1)
 if cmp -s "$hp_b/.zprofile" "$TMP/hp-b-zprofile" && cmp -s "$hp_b/.inputrc" "$TMP/hp-inputrc" && printf '%s\n' "$hp_b_status" | grep -Fx 'edits here: none' >/dev/null; then pass "home paths: init on another home writes its own home folder"; else fail "home paths: init on another home writes its own home folder"; fi
@@ -1006,7 +1044,7 @@ run_sync "$mg_home" '' >/dev/null 2>&1
 mg_after=$(run_dots "$mg_home" status 2>&1)
 if printf '%s\n' "$mg_status" | grep -A1 -F 'edited here' | grep -Fx '  .zprofile' >/dev/null && printf '%s' "$mg_out" | grep -F '.zprofile  (changed)' >/dev/null &&
   test "$(/usr/bin/git --git-dir="$mg_remote" show main:.zprofile)" = 'export P=@@DOTS_HOME@@/bin' && test "$(/usr/bin/git --git-dir="$mg_remote" show main:.config/dots/format)" = 2 &&
-  test "$(cat "$mg_home/.zprofile")" = "export P=$mg_home/bin" && printf '%s\n' "$mg_after" | grep -Fx 'edits here: none' >/dev/null && printf '%s\n' "$mg_after" | grep -Fx 'this Mac: up to date' >/dev/null; then pass "home paths: literal paths migrate with one update"; else fail "home paths: literal paths migrate with one update"; fi
+  test "$(cat "$mg_home/.zprofile")" = "export P=$mg_home/bin" && printf '%s\n' "$mg_after" | grep -Fx 'edits here: none' >/dev/null && printf '%s\n' "$mg_after" | grep -Fx 'this machine: up to date' >/dev/null; then pass "home paths: literal paths migrate with one update"; else fail "home paths: literal paths migrate with one update"; fi
 
 # init and select adopt a live file that differs from the repository only by the home folder.
 remote=$TMP/adopt.git; new_remote "$remote"
@@ -1096,15 +1134,15 @@ remote=$TMP/exec-modes.git; new_remote "$remote"
 remote_edit "$remote" "printf '%s\\n' .config/example/settings .config/example/run.sh .config/example/plain.sh > \"\$1/.config/dots/manifest\"; printf 'exec @@DOTS_HOME@@/bin/x\\n' > \"\$1/.config/example/run.sh\"; chmod 755 \"\$1/.config/example/run.sh\"; printf 'cd @@DOTS_HOME@@\\n' > \"\$1/.config/example/plain.sh\"; chmod 644 \"\$1/.config/example/plain.sh\"" || exit 1
 em_home=$TMP/home-exec-init; mkdir -p "$em_home"
 expect_ok run_dots "$em_home" init "$remote" main
-if test -x "$em_home/.config/example/run.sh" && test "$(stat -f '%Lp' "$em_home/.config/example/run.sh")" = 700 && test "$(cat "$em_home/.config/example/run.sh")" = "exec $em_home/bin/x" &&
-  test ! -x "$em_home/.config/example/plain.sh" && test "$(stat -f '%Lp' "$em_home/.config/example/plain.sh")" = 600; then pass "home paths: init writes the executable bit"; else fail "home paths: init writes the executable bit"; fi
+if test -x "$em_home/.config/example/run.sh" && test "$(mode_of "$em_home/.config/example/run.sh")" = 700 && test "$(cat "$em_home/.config/example/run.sh")" = "exec $em_home/bin/x" &&
+  test ! -x "$em_home/.config/example/plain.sh" && test "$(mode_of "$em_home/.config/example/plain.sh")" = 600; then pass "home paths: init writes the executable bit"; else fail "home paths: init writes the executable bit"; fi
 # Rows: plain.sh (1), run.sh (2), settings (3). init skips the first two; select brings them in.
 es_home=$TMP/home-exec-select; mkdir -p "$es_home"
 run_dots_pty "$es_home" $'1-2\n' init "$remote" main >/dev/null 2>&1
 es_skipped=no; test ! -e "$es_home/.config/example/run.sh" && test ! -e "$es_home/.config/example/plain.sh" && es_skipped=yes
 run_dots_pty "$es_home" $'1-2\n' select >/dev/null 2>&1
-if test "$es_skipped" = yes && test -x "$es_home/.config/example/run.sh" && test "$(stat -f '%Lp' "$es_home/.config/example/run.sh")" = 700 && test "$(cat "$es_home/.config/example/run.sh")" = "exec $es_home/bin/x" &&
-  test ! -x "$es_home/.config/example/plain.sh" && test "$(stat -f '%Lp' "$es_home/.config/example/plain.sh")" = 600; then pass "home paths: select writes the executable bit"; else fail "home paths: select writes the executable bit"; fi
+if test "$es_skipped" = yes && test -x "$es_home/.config/example/run.sh" && test "$(mode_of "$es_home/.config/example/run.sh")" = 700 && test "$(cat "$es_home/.config/example/run.sh")" = "exec $es_home/bin/x" &&
+  test ! -x "$es_home/.config/example/plain.sh" && test "$(mode_of "$es_home/.config/example/plain.sh")" = 600; then pass "home paths: select writes the executable bit"; else fail "home paths: select writes the executable bit"; fi
 eu_remote=$TMP/exec-update.git; eu_home=$TMP/home-exec-update; mkdir -p "$eu_home"
 run_derived_default_init "$eu_home" "$eu_remote" $'y\n' >/dev/null 2>&1 || exit 1
 remote_edit "$eu_remote" "printf '%s\\n' .config/example/run.sh .config/example/plain.sh > \"\$1/.config/dots/manifest\"; mkdir -p \"\$1/.config/example\"; printf 'exec @@DOTS_HOME@@/bin/x\\n' > \"\$1/.config/example/run.sh\"; chmod 755 \"\$1/.config/example/run.sh\"; printf 'cd @@DOTS_HOME@@\\n' > \"\$1/.config/example/plain.sh\"; chmod 644 \"\$1/.config/example/plain.sh\"" || exit 1
@@ -1114,6 +1152,37 @@ run_update "$eu_home" "$eu_remote" $'\nFlip modes\n' >/dev/null 2>&1
 eu_ref=$(/usr/bin/git --git-dir="$eu_remote" for-each-ref --format='%(refname)' 'refs/heads/dots/update-*' | head -1)
 eu_tree=$(/usr/bin/git --git-dir="$eu_remote" ls-tree "$eu_ref" -- .config/example/run.sh .config/example/plain.sh 2>/dev/null | awk '{ print $1 " " $4 }' | tr '\n' '|')
 if test -n "$eu_ref" && test "$eu_tree" = '100755 .config/example/plain.sh|100644 .config/example/run.sh|' && test "$(/usr/bin/git --git-dir="$eu_remote" show "$eu_ref:.config/example/plain.sh")" = 'cd @@DOTS_HOME@@'; then pass "home paths: update sends the executable bit"; else fail "home paths: update sends the executable bit ($eu_tree)"; fi
+
+# ── Platform ──────────────────────────────────────────────
+# Which Git runs: Apple's /usr/bin/git on macOS, the first git on PATH elsewhere,
+# and DOTS_GIT on both. Each wrapper logs its calls and runs the real Git.
+gs_remote=$TMP/git-select.git; new_remote "$gs_remote"; gs_bin=$TMP/git-select-bin; mkdir -p "$gs_bin"
+for gs_name in path override; do
+  printf '%s\n' '#!/bin/sh' "printf '%s\\n' \"\$*\" >>\"$TMP/git-$gs_name.log\"" 'exec /usr/bin/git "$@"' >"$TMP/git-$gs_name"; chmod 755 "$TMP/git-$gs_name"
+  : >"$TMP/git-$gs_name.log"
+done
+ln -s "$TMP/git-path" "$gs_bin/git"
+gs_home=$TMP/home-git-path; mkdir -p "$gs_home"
+PATH=$gs_bin:$PATH HOME=$gs_home DOTS_DATA_DIR=$gs_home/data DOTS_GITLEAKS=$MOCK "$DOTS" init "$gs_remote" main >/dev/null 2>&1; gs_default=$?
+if test "$(uname -s)" = Darwin; then gs_want=empty; else gs_want=used; fi
+if test -s "$TMP/git-path.log"; then gs_got=used; else gs_got=empty; fi
+if test "$gs_default" -eq 0 && test "$gs_got" = "$gs_want"; then pass "the default Git suits the platform"; else fail "the default Git suits the platform ($gs_got)"; fi
+: >"$TMP/git-path.log"
+gs_home=$TMP/home-git-override; mkdir -p "$gs_home"
+if PATH=$gs_bin:$PATH HOME=$gs_home DOTS_DATA_DIR=$gs_home/data DOTS_GITLEAKS=$MOCK DOTS_GIT=$TMP/git-override "$DOTS" init "$gs_remote" main >/dev/null 2>&1 &&
+  test -s "$TMP/git-override.log" && test ! -s "$TMP/git-path.log"; then pass "DOTS_GIT overrides the default Git"; else fail "DOTS_GIT overrides the default Git"; fi
+# A missing Git is named, not reported as something else.
+gs_home=$TMP/home-git-missing; mkdir -p "$gs_home"
+gs_out=$(HOME=$gs_home DOTS_DATA_DIR=$gs_home/data DOTS_GITLEAKS=$MOCK DOTS_GIT=$TMP/no-such-git "$DOTS" init "$gs_remote" main 2>&1)
+if test $? -ne 0 && printf '%s' "$gs_out" | grep -F "required dependency is unavailable: $TMP/no-such-git" >/dev/null && test ! -e "$gs_home/data/repo.git"; then pass "a missing Git is named"; else fail "a missing Git is named"; fi
+gs_out=$(HOME=$gs_home DOTS_DATA_DIR=$gs_home/data DOTS_GITLEAKS=$MOCK DOTS_PERL=$TMP/no-such-perl "$DOTS" init --discover 2>&1)
+if test $? -ne 0 && printf '%s' "$gs_out" | grep -F "required dependency is unavailable: $TMP/no-such-perl" >/dev/null; then pass "a missing perl is named"; else fail "a missing perl is named"; fi
+# A global Git configuration (a managed ~/.gitconfig, or Git's XDG file) never reaches
+# dots' own Git: here it would point the remote at a folder that does not exist.
+gc_remote=$TMP/global-config.git; new_remote "$gc_remote"; gc_home=$TMP/home-global-config; mkdir -p "$gc_home/.config/git"
+printf '[url "file:///nonexistent/"]\n\tinsteadOf = %s\n' "$gc_remote" >"$gc_home/.gitconfig"; cp "$gc_home/.gitconfig" "$gc_home/.config/git/config"
+if env -u GIT_CONFIG_GLOBAL HOME=$gc_home DOTS_DATA_DIR=$gc_home/data DOTS_GITLEAKS=$MOCK "$DOTS" init "$gc_remote" main >/dev/null 2>&1 &&
+  test "$(cat "$gc_home/.config/example/settings")" = base; then pass "a global Git configuration has no effect"; else fail "a global Git configuration has no effect"; fi
 
 printf '%s tests passed, %s failed\n' "$PASS" "$FAIL"
 test "$FAIL" -eq 0
