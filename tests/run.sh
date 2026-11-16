@@ -1057,5 +1057,22 @@ test -n "$bd_ref" && /usr/bin/git --git-dir="$bd_remote" update-ref refs/heads/m
 expect_ok run_dots "$bd_b" init "$bd_remote" main
 if test -n "$bd_ref" && cmp -s "$TMP/bd-blob" "$TMP/bd-stored" && cmp -s "$bd_b/.zprofile" "$TMP/bd-b-zprofile"; then pass "home paths: a home folder followed by a name character is left alone"; else fail "home paths: a home folder followed by a name character is left alone"; fi
 
+# A format-1 file naming the home folder, unedited here and changed in the repository,
+# is incoming, not a clash: status, update and sync all treat it so.
+mc_remote=$TMP/migrate-catch-up.git; mc_home=$TMP/hp2/mia; mkdir -p "$mc_home"
+run_derived_default_init "$mc_home" "$mc_remote" $'y\n' >/dev/null 2>&1 || exit 1
+remote_edit "$mc_remote" "printf '%s\\n' .zprofile > \"\$1/.config/dots/manifest\"; printf 'export P=$mc_home/bin\\n' > \"\$1/.zprofile\"" || exit 1
+run_sync "$mc_home" $'\n' >/dev/null 2>&1
+remote_edit "$mc_remote" "printf 'export P=$mc_home/sbin\\n' > \"\$1/.zprofile\"" || exit 1
+mc_status=$(run_dots "$mc_home" status 2>&1)
+mc_update=$(run_update "$mc_home" "$mc_remote" '' 2>&1 | tr -d '\r')
+mc_after_update=$(cat "$mc_home/.zprofile")
+remote_edit "$mc_remote" "printf 'export P=$mc_home/lib\\n' > \"\$1/.zprofile\"" || exit 1
+mc_sync=$(run_sync "$mc_home" '' 2>&1 | tr -d '\r')
+if printf '%s\n' "$mc_status" | grep -A1 -F 'changed in the repository, not here yet' | grep -Fx '  .zprofile' >/dev/null && ! printf '%s' "$mc_status" | grep -F 'changed both' >/dev/null &&
+  ! printf '%s' "$mc_update" | grep -F 'changed both' >/dev/null && test "$mc_after_update" = "export P=$mc_home/sbin" &&
+  ! printf '%s' "$mc_sync" | grep -F -e 'changed both' -e 'Choose [1-2]' >/dev/null && test "$(cat "$mc_home/.zprofile")" = "export P=$mc_home/lib" &&
+  test "$(/usr/bin/git --git-dir="$mc_home/data/repo.git" rev-parse HEAD)" = "$(/usr/bin/git --git-dir="$mc_remote" rev-parse main)"; then pass "home paths: a format-1 file changed only in the repository is brought in"; else fail "home paths: a format-1 file changed only in the repository is brought in"; fi
+
 printf '%s tests passed, %s failed\n' "$PASS" "$FAIL"
 test "$FAIL" -eq 0

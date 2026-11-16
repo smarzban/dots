@@ -1270,8 +1270,9 @@ init_command() {
 
 # $1 path list, $2 output of "state<TAB>path" lines for this Mac's files. A blob
 # is the hash of the file's stored form, so it compares with repository blobs.
+# $2.raw holds the same states for the files as they are on disk (untranslated).
 live_states() {
-  : >"$2.present" && : >"$2.modes" && : >"$2.stored-paths" || return 1
+  : >"$2.present" && : >"$2.modes" && : >"$2.stored-paths" && : >"$2.live-paths" || return 1
   rm -rf "$2.stored" && mkdir "$2.stored" || return 1
   ls_n=0
   while IFS= read -r ls_path; do
@@ -1282,16 +1283,23 @@ live_states() {
       stored_copy "$ls_path" "$2.stored/$ls_n" || return 1
       printf '%s\n' "$ls_path" >>"$2.present"
       printf '%s\n' "$2.stored/$ls_n" >>"$2.stored-paths"
+      printf '%s\n' "$ls_file" >>"$2.live-paths"
       if test -x "$ls_file"; then printf '100755\n'; else printf '100644\n'; fi >>"$2.modes"
     elif test -e "$ls_file"; then return 1
     fi
   done <"$1"
-  : >"$2.blobs"
-  if test -s "$2.present"; then git_dir "$REPO" hash-object --no-filters --stdin-paths <"$2.stored-paths" >"$2.blobs" || return 1; fi
+  : >"$2.blobs" && : >"$2.raw-blobs" || return 1
+  if test -s "$2.present"; then
+    git_dir "$REPO" hash-object --no-filters --stdin-paths <"$2.stored-paths" >"$2.blobs" || return 1
+    git_dir "$REPO" hash-object --no-filters --stdin-paths <"$2.live-paths" >"$2.raw-blobs" || return 1
+  fi
   test "$(list_count "$2.present")" = "$(list_count "$2.blobs")" || return 1
+  test "$(list_count "$2.present")" = "$(list_count "$2.raw-blobs")" || return 1
   paste -d ' ' "$2.modes" "$2.blobs" | paste -d "$TAB" - "$2.present" >"$2.known"
   awk -F '\t' 'FILENAME == ARGV[1] { state[$2] = $1; next } { print (($0 in state) ? state[$0] : "-") "\t" $0 }' "$2.known" "$1" >"$2"
-  rm -rf "$2.present" "$2.modes" "$2.blobs" "$2.known" "$2.stored-paths" "$2.stored"
+  paste -d ' ' "$2.modes" "$2.raw-blobs" | paste -d "$TAB" - "$2.present" >"$2.known"
+  awk -F '\t' 'FILENAME == ARGV[1] { state[$2] = $1; next } { print (($0 in state) ? state[$0] : "-") "\t" $0 }' "$2.known" "$1" >"$2.raw"
+  rm -rf "$2.present" "$2.modes" "$2.blobs" "$2.raw-blobs" "$2.known" "$2.stored-paths" "$2.live-paths" "$2.stored"
 }
 
 # $1 revision, $2 output of "state<TAB>path" lines for every file in it.
@@ -1308,6 +1316,9 @@ tree_states() {
 # classify base remote paths dir: writes dir/{same,incoming,local,clash} path lists,
 # dir/live (this Mac's states, for re-checking later), and dir/states
 # ("live<TAB>base<TAB>remote<TAB>path").
+# A file whose untranslated content is the base blob, which the repository changed,
+# is incoming: a format-1 repository stores home paths literally, so this Mac did
+# not edit it. Otherwise the stored forms are compared.
 classify_paths() {
   mkdir -p "$4" || return 1
   live_states "$3" "$4/live" || return 1
@@ -1316,13 +1327,14 @@ classify_paths() {
   awk -F '\t' -v dir="$4" '
     FILENAME == ARGV[1] { b[$2] = $1; next }
     FILENAME == ARGV[2] { r[$2] = $1; next }
+    FILENAME == ARGV[3] { raw[$2] = $1; next }
     {
       l = $1; p = $2
       bs = (p in b) ? b[p] : "-"; rs = (p in r) ? r[p] : "-"
-      if (l == rs) c = "same"; else if (l == bs) c = "incoming"; else if (rs == bs) c = "local"; else c = "clash"
+      if (l == rs) c = "same"; else if (l == bs) c = "incoming"; else if (raw[p] == bs && rs != bs) c = "incoming"; else if (rs == bs) c = "local"; else c = "clash"
       print p > (dir "/" c)
       print l "\t" bs "\t" rs "\t" p > (dir "/states")
-    }' "$4/base" "$4/remote" "$4/live" || return 1
+    }' "$4/base" "$4/remote" "$4/live.raw" "$4/live" || return 1
   for cp_kind in same incoming local clash states; do test -f "$4/$cp_kind" || : >"$4/$cp_kind"; done
 }
 
