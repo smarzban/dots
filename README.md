@@ -1,11 +1,11 @@
 # dots
 
-Keep a hand-picked list of dotfiles in sync across your Macs through a private GitHub repository.
+Keep a hand-picked list of dotfiles in sync across your Macs and Linux machines through a private GitHub repository.
 
-`dots` is a single-file Bash CLI for macOS. You choose exactly which files in your home directory are tracked, changes reach the repository as pull requests, and every other Mac pulls them with one command.
+`dots` is a single-file Bash CLI for macOS and Linux. You choose exactly which files in your home directory are tracked, changes reach the repository as pull requests, and every other machine pulls them with one command.
 
 - **Explicit allowlist.** Only the files listed in `~/.config/dots/manifest`, plus the manifest itself, are ever tracked. No directories, globs, or symlinks.
-- **Each Mac picks its own files.** Choose which shared files to bring to each Mac, and change your mind later with `dots select`.
+- **Each machine picks its own files.** Choose which shared files to bring to each machine, and change your mind later with `dots select`.
 - **Your real home is the working tree.** Files stay where your tools expect them. No symlink farm, no copies.
 - **Changes go through pull requests.** `dots update` opens a PR, so you review every change before it lands.
 - **Secret scanning built in.** Incoming and outgoing content is scanned with [gitleaks](https://github.com/gitleaks/gitleaks) before anything is written or pushed.
@@ -14,13 +14,28 @@ Keep a hand-picked list of dotfiles in sync across your Macs through a private G
 
 ## Requirements
 
-- macOS, with Apple's Command Line Tools (for `/usr/bin/git`)
+- macOS, or Linux (Ubuntu or Debian)
+- Git and Perl: on macOS, Apple's Command Line Tools (for `/usr/bin/git`); on Linux, the `git` on your `PATH` and `/usr/bin/perl`
 - [gitleaks](https://github.com/gitleaks/gitleaks)
 - [GitHub CLI](https://cli.github.com/) (`gh`), signed in
+
+On macOS:
 
 ```sh
 xcode-select --install
 brew install gitleaks gh
+gh auth login
+```
+
+On Linux, install Git, Perl and `expect` (used by the test suite) from apt:
+
+```sh
+sudo apt-get install git perl expect curl
+```
+
+gitleaks is not in apt; download its Linux release binary for your architecture (`x64` or `arm64`) from [its releases](https://github.com/gitleaks/gitleaks/releases), check it against the release's checksums file, and put `gitleaks` on your `PATH`. Install `gh` from [GitHub's apt repository](https://github.com/cli/cli/blob/trunk/docs/install_linux.md), then sign in:
+
+```sh
 gh auth login
 ```
 
@@ -30,7 +45,7 @@ gh auth login
 curl -fsSL https://github.com/smarzban/dots/releases/latest/download/install.sh | sh
 ```
 
-The installer verifies the release checksum and puts `dots` in `~/.local/bin`. A fresh Mac doesn't have that folder on its `PATH`; the installer then prints the full-path command to run first and the line to add it to `PATH`.
+The same command installs on macOS and Linux. The installer verifies the release checksum (with `shasum` or `sha256sum`) and puts `dots` in `~/.local/bin`. A fresh Mac doesn't have that folder on its `PATH`, and neither may a Linux shell; the installer then prints the full-path command to run first and the line to add it to `PATH`, naming your shell's startup file.
 
 To pin a version or choose another directory, set `DOTS_VERSION` or `DOTS_BIN_DIR`:
 
@@ -38,7 +53,7 @@ To pin a version or choose another directory, set `DOTS_VERSION` or `DOTS_BIN_DI
 curl -fsSL https://github.com/smarzban/dots/releases/latest/download/install.sh | DOTS_VERSION=v0.1.0 DOTS_BIN_DIR="$HOME/bin" sh
 ```
 
-## Quickstart: your first Mac
+## Quickstart: your first machine
 
 1. Preview which files `dots` would suggest. This changes nothing:
 
@@ -46,7 +61,7 @@ curl -fsSL https://github.com/smarzban/dots/releases/latest/download/install.sh 
    dots init --discover
    ```
 
-2. Create the private `<your-account>/dotfiles` repository and connect this Mac. `dots` asks before creating it:
+2. Create the private `<your-account>/dotfiles` repository and connect this machine. `dots` asks before creating it:
 
    ```sh
    dots init
@@ -65,13 +80,13 @@ curl -fsSL https://github.com/smarzban/dots/releases/latest/download/install.sh 
    dots update
    ```
 
-5. Review and merge the pull request on GitHub, then bring this Mac up to date:
+5. Review and merge the pull request on GitHub, then bring this machine up to date:
 
    ```sh
    dots sync
    ```
 
-## Add another Mac
+## Add another machine
 
 Install `dots` and its requirements, then connect to the same repository:
 
@@ -79,9 +94,9 @@ Install `dots` and its requirements, then connect to the same repository:
 dots init
 ```
 
-`init` shows a checklist of the files in the repository, all ticked. Untick any you don't want on this Mac. The choice is remembered for every later sync, and you can change it any time with `dots select`.
+`init` shows a checklist of the files in the repository, all ticked. Untick any you don't want on this machine. The choice is remembered for every later sync, and you can change it any time with `dots select`.
 
-If some chosen files already exist on this Mac, identical ones are adopted as they are. To replace differing ones with the repository version, keeping a backup in `~/.local/share/dots/backups/`, run:
+If some chosen files already exist on this machine, identical ones are adopted as they are. To replace differing ones with the repository version, keeping a backup in `~/.local/share/dots/backups/`, run:
 
 ```sh
 dots init --backup-existing
@@ -90,22 +105,22 @@ dots init --backup-existing
 ## Commands
 
 **`dots status`**
-Shows whether this Mac is up to date, which files you've edited here and not sent yet, and which files changed in the repository and aren't here yet. Changes nothing.
+Shows whether this machine is up to date, which files you've edited here and not sent yet, and which files changed in the repository and aren't here yet. Changes nothing.
 
 **`dots sync`**
-Brings this Mac up to date with the repository. Run it whenever another Mac shared something. Your edits are kept, and it only asks about a file when the repository changed that same file too (see [When a file changed on both sides](#when-a-file-changed-on-both-sides)).
+Brings this machine up to date with the repository. Run it whenever another machine shared something. Your edits are kept, and it only asks about a file when the repository changed that same file too (see [When a file changed on both sides](#when-a-file-changed-on-both-sides)).
 
 **`dots update`**
-Sends your changes to the repository as a pull request: edits to files you already share, new files you want to start sharing, and files you want to stop sharing. Nothing reaches the repository until you merge the PR on GitHub. Your files on this Mac only change if the repository has something new, which `update` brings in first, as `sync` would. See [The update checklist](#the-update-checklist).
+Sends your changes to the repository as a pull request: edits to files you already share, new files you want to start sharing, and files you want to stop sharing. Nothing reaches the repository until you merge the PR on GitHub. Your files on this machine only change if the repository has something new, which `update` brings in first, as `sync` would. See [The update checklist](#the-update-checklist).
 
 **`dots select`**
-Chooses which of the repository's files this Mac uses. Use it when a shared file doesn't belong on this Mac (a work setting on your personal Mac, say): untick it here, and this Mac stops syncing it while other Macs keep it. Tick it again later to bring it back. Only affects this Mac.
+Chooses which of the repository's files this machine uses. Use it when a shared file doesn't belong on this machine (a work setting on your personal Mac, say): untick it here, and this machine stops syncing it while other machines keep it. Tick it again later to bring it back. Only affects this machine.
 
 **`dots init`**
-Connects a Mac to your dotfiles repository, once per Mac. On your first Mac it creates the private `<your-account>/dotfiles` repository; on the others it asks which of its files to bring in. You can pass a different repository and branch: `dots init <remote> [branch]`.
+Connects a machine to your dotfiles repository, once per machine. On your first machine it creates the private `<your-account>/dotfiles` repository; on the others it asks which of its files to bring in. You can pass a different repository and branch: `dots init <remote> [branch]`.
 
 **`dots init --backup-existing`**
-Like `init`, for a Mac that already has its own versions of your dotfiles: differing files are backed up to `~/.local/share/dots/backups/`, then replaced with the repository version.
+Like `init`, for a machine that already has its own versions of your dotfiles: differing files are backed up to `~/.local/share/dots/backups/`, then replaced with the repository version.
 
 **`dots init --discover`**
 Lists the files `dots` would suggest sharing. Changes nothing.
@@ -116,12 +131,12 @@ Lists the files `dots` would suggest sharing. Changes nothing.
 
 | Page | What's on it | Ticked means |
 |---|---|---|
-| Edits to send | Shared files you changed (or deleted) on this Mac | Send this edit. Untick to leave it out of this PR; your file stays as it is and shows up again next time. |
+| Edits to send | Shared files you changed (or deleted) on this machine | Send this edit. Untick to leave it out of this PR; your file stays as it is and shows up again next time. |
 | New files | Files you haven't shared yet | Start sharing this file. |
-| Shared files | Files you share and haven't changed | Keep sharing. Untick to stop sharing it on every Mac (the file stays on disk). |
+| Shared files | Files you share and haven't changed | Keep sharing. Untick to stop sharing it on every machine (the file stays on disk). |
 | Previously ignored | New files you left unticked before | Start sharing this file. |
 
-After you confirm, `dots` lists exactly what the PR contains and asks for a title. If the repository has changes this Mac doesn't have yet (for example your last PR, just merged), `update` brings them in first, as `sync` would. If a file changed on both sides, it stops and asks you to run `dots sync`.
+After you confirm, `dots` lists exactly what the PR contains and asks for a title. If the repository has changes this machine doesn't have yet (for example your last PR, just merged), `update` brings them in first, as `sync` would. If a file changed on both sides, it stops and asks you to run `dots sync`.
 
 Keys: Up/Down move, Left/Right change page, Space ticks, `a`/`n` tick all or none on the page, Enter confirms, `q` cancels. Without a full terminal, or with `DOTS_PLAIN_PROMPTS=1`, you get a numbered list instead: type numbers such as `1,3-5` to toggle them.
 
@@ -139,11 +154,11 @@ Keys: Up/Down move, Left/Right change page, Space ticks, `a`/`n` tick all or non
 When it asks, you choose per file:
 
 1. **Use the repository's version.** Yours is backed up to `~/.local/share/dots/backups/` first.
-2. **Keep yours.** This Mac still catches up with everything else, and your version stays as an edit. Send it with `dots update` if it should replace the repository's, or keep it on this Mac.
+2. **Keep yours.** This machine still catches up with everything else, and your version stays as an edit. Send it with `dots update` if it should replace the repository's, or keep it on this machine.
 
 Your list of shared files (the manifest) is never asked about: lines added on either side are combined.
 
-When another Mac starts sharing a new file, `sync` asks whether to use it here. If you already have a different copy, it asks about it as above.
+When another machine starts sharing a new file, `sync` asks whether to use it here. If you already have a different copy, it asks about it as above.
 
 ## Which files are suggested
 
@@ -161,7 +176,7 @@ Only small text files (up to 64 KB) are suggested. Always left out:
 
 Whatever you tick is still scanned with gitleaks, using its default rules, before it is pushed.
 
-To tune the suggestions, create `~/.config/dots/discover` with one rule per line, then share it like any other file so every Mac gets the same suggestions:
+To tune the suggestions, create `~/.config/dots/discover` with one rule per line, then share it like any other file so every machine gets the same suggestions:
 
 ```text
 # Folders deeper than the scan looks
@@ -186,22 +201,25 @@ Patterns are relative to your home folder and `*` also matches `/`. Write out th
   ```
 
 - Paths must be plain files inside your home directory: no absolute paths, `..`, globs, whitespace, or symlinks.
-- Which of those files this Mac uses, and which suggestions it ignored, is saved in `~/.local/share/dots/selection`. It stays on this Mac and is never synced.
+- Which of those files this machine uses, and which suggestions it ignored, is saved in `~/.local/share/dots/selection`. It stays on this machine and is never synced.
 - Before anything is written or pushed, `dots` validates the repository contents against the manifest and scans them with gitleaks. Any problem stops the command without printing file contents.
-- Your home folder is stored in the repository as the placeholder `@@DOTS_HOME@@`, and each Mac writes its own home folder back in. A file naming `/Users/you/bin` works on a Mac whose home folder is `/Users/someone`. A file that already contains the text `@@DOTS_HOME@@` is refused rather than changed.
+- Your home folder is stored in the repository as the placeholder `@@DOTS_HOME@@`, and each machine writes its own home folder back in. A file naming `/Users/you/bin` works on a Mac whose home folder is `/Users/someone`, and on a Linux machine whose home folder is `/home/you`. A file that already contains the text `@@DOTS_HOME@@` is refused rather than changed.
 - After you upgrade from an earlier version, the first `dots update` lists the files that contain your home folder as edits to send, once, so the repository stores them portably.
-- Repositories written by this version carry a format marker, `.config/dots/format`, which older versions of `dots` refuse. Upgrade `dots` on every Mac.
+- Repositories written by this version carry a format marker, `.config/dots/format`, which older versions of `dots` refuse. Upgrade `dots` on every machine.
 
 ## Development
 
-Keep `bin/dots` compatible with macOS `/bin/bash` 3.2. Tests use temporary home directories and local remotes only.
+Keep `bin/dots` compatible with macOS `/bin/bash` 3.2 and BSD tools, and with Linux (bash 5, GNU tools): use only flags both share. Tests use temporary home directories and local remotes only.
 
 ```sh
 /bin/bash -n bin/dots
-shellcheck -S warning bin/dots
+shellcheck -S warning bin/dots install.sh
 tests/run.sh
+tests/linux.sh
 git diff --check
 ```
+
+`tests/linux.sh` runs the same suite in a throwaway `ubuntu:24.04` Docker container, as a non-root user with no global Git identity. It needs Docker and network access for apt. It copies in a bundle of this repository with its tags, plus your working tree's tracked files, so uncommitted edits are tested too.
 
 To publish a release, tag the commit, build the assets, and upload `dist/dots`, `dist/dots.sha256`, and `dist/install.sh` to the GitHub release:
 
