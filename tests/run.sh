@@ -1074,5 +1074,21 @@ if printf '%s\n' "$mc_status" | grep -A1 -F 'changed in the repository, not here
   ! printf '%s' "$mc_sync" | grep -F -e 'changed both' -e 'Choose [1-2]' >/dev/null && test "$(cat "$mc_home/.zprofile")" = "export P=$mc_home/lib" &&
   test "$(/usr/bin/git --git-dir="$mc_home/data/repo.git" rev-parse HEAD)" = "$(/usr/bin/git --git-dir="$mc_remote" rev-parse main)"; then pass "home paths: a format-1 file changed only in the repository is brought in"; else fail "home paths: a format-1 file changed only in the repository is brought in"; fi
 
+# init --backup-existing and select refuse a live file holding the placeholder text,
+# naming only its path and changing nothing.
+remote=$TMP/placeholder-init.git; new_remote "$remote"
+remote_edit "$remote" "printf '%s\\n' .config/example/settings .zprofile > \"\$1/.config/dots/manifest\"; printf 'export P=@@DOTS_HOME@@/bin\\n' > \"\$1/.zprofile\"" || exit 1
+pi_home=$TMP/home-placeholder-init; mkdir -p "$pi_home"
+printf 'mine @@DOTS_HOME@@ PRIVATEBODY\n' >"$pi_home/.zprofile"; cp "$pi_home/.zprofile" "$TMP/pi-zprofile"
+pi_out=$(run_dots "$pi_home" init --backup-existing "$remote" main 2>&1); pi_status=$?
+if test "$pi_status" -ne 0 && printf '%s' "$pi_out" | grep -F '.zprofile already contains @@DOTS_HOME@@' >/dev/null && ! printf '%s' "$pi_out" | grep -F PRIVATEBODY >/dev/null &&
+  cmp -s "$pi_home/.zprofile" "$TMP/pi-zprofile" && test ! -e "$pi_home/data/repo.git" && test ! -e "$pi_home/data/backups" && test ! -e "$pi_home/.config/example/settings"; then pass "home paths: init refuses to replace a file holding the placeholder"; else fail "home paths: init refuses to replace a file holding the placeholder"; fi
+pj_home=$TMP/home-placeholder-select; mkdir -p "$pj_home"
+run_dots_pty "$pj_home" $'1\n' init "$remote" main >/dev/null 2>&1
+printf 'mine @@DOTS_HOME@@ PRIVATEBODY\n' >"$pj_home/.zprofile"; cp "$pj_home/.zprofile" "$TMP/pj-zprofile"; cp "$pj_home/data/selection" "$TMP/pj-selection"
+pj_out=$(run_dots_pty "$pj_home" $'1\ny\n' select 2>&1)
+if grep -Fx 'skip .zprofile' "$TMP/pj-selection" >/dev/null && printf '%s' "$pj_out" | grep -F '.zprofile already contains @@DOTS_HOME@@' >/dev/null && ! printf '%s' "$pj_out" | grep -F PRIVATEBODY >/dev/null &&
+  cmp -s "$pj_home/.zprofile" "$TMP/pj-zprofile" && cmp -s "$pj_home/data/selection" "$TMP/pj-selection" && test ! -e "$pj_home/data/backups"; then pass "home paths: select refuses to replace a file holding the placeholder"; else fail "home paths: select refuses to replace a file holding the placeholder"; fi
+
 printf '%s tests passed, %s failed\n' "$PASS" "$FAIL"
 test "$FAIL" -eq 0
