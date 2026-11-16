@@ -941,15 +941,18 @@ else
 fi
 if DOTS_RELEASE_BASE_URL="file://$assets" DOTS_BIN_DIR="$TMP/sha-installed" PATH=$sha_bin "$ROOT/install.sh" >/dev/null 2>&1 && test -x "$TMP/sha-installed/dots"; then pass "installer verifies with sha256sum when shasum is missing"; else fail "installer verifies with sha256sum when shasum is missing"; fi
 if ! DOTS_RELEASE_BASE_URL="file://$assets" DOTS_BIN_DIR="$TMP/none-installed" PATH=$none_bin "$ROOT/install.sh" >/dev/null 2>&1 && test ! -e "$TMP/none-installed/dots"; then pass "installer refuses without a checksum tool"; else fail "installer refuses without a checksum tool"; fi
-# The PATH advice names the user's shell startup file on Linux; macOS keeps zsh's.
-advice() { DOTS_RELEASE_BASE_URL="file://$assets" DOTS_BIN_DIR="$TMP/advice-bin" SHELL=$1 PATH=/usr/bin:/bin "$ROOT/install.sh" 2>&1 | grep -F 'add it to PATH'; }
-advice_bash=$(advice /bin/bash); advice_zsh=$(advice /usr/bin/zsh); advice_dash=$(advice /bin/dash)
-if test "$(uname -s)" = Darwin; then
-  printf '%s\n' "$advice_bash" "$advice_zsh" "$advice_dash" | grep -c -F '>> ~/.zprofile && exec zsh -l' | grep -Fx 3 >/dev/null && advice_ok=yes || advice_ok=no
-else
-  printf '%s' "$advice_bash" | grep -F '>> ~/.bashrc && exec bash' >/dev/null && printf '%s' "$advice_zsh" | grep -F '>> ~/.zprofile && exec zsh -l' >/dev/null &&
-    printf '%s' "$advice_dash" | grep -F '>> ~/.profile && . ~/.profile' >/dev/null && advice_ok=yes || advice_ok=no
-fi
+# The PATH advice names the user's shell startup file: zsh's login file on macOS,
+# and on Linux the file a new terminal's shell reads. A stand-in uname picks the
+# platform, so both are checked on any host.
+advice_os=$TMP/advice-os; mkdir -p "$advice_os"
+advice() { printf '#!/bin/sh\necho %s\n' "$1" >"$advice_os/uname"; chmod 755 "$advice_os/uname"; DOTS_RELEASE_BASE_URL="file://$assets" DOTS_BIN_DIR="$TMP/advice-bin" SHELL=$2 PATH=$advice_os:/usr/bin:/bin "$ROOT/install.sh" 2>&1 | grep -F 'add it to PATH'; }
+advice_ok=yes
+for advice_shell in /bin/bash /usr/bin/zsh /bin/dash; do
+  advice Darwin "$advice_shell" | grep -E '>> ~/\.zprofile && exec zsh -l$' >/dev/null || advice_ok=no
+done
+advice Linux /bin/bash | grep -E '>> ~/\.bashrc && exec bash$' >/dev/null || advice_ok=no
+advice Linux /usr/bin/zsh | grep -E '>> ~/\.zshrc && exec zsh$' >/dev/null || advice_ok=no
+advice Linux /bin/dash | grep -E '>> ~/\.profile && \. ~/\.profile$' >/dev/null || advice_ok=no
 if test "$advice_ok" = yes; then pass "installer PATH advice names the shell's startup file"; else fail "installer PATH advice names the shell's startup file"; fi
 printf tampered >"$assets/dots"
 if ! DOTS_RELEASE_BASE_URL="file://$assets" DOTS_BIN_DIR="$TMP/unsafe-bin" "$ROOT/install.sh" >/dev/null 2>&1 && test ! -e "$TMP/unsafe-bin/dots"; then pass "installer checksum refusal"; else fail "installer checksum refusal"; fi

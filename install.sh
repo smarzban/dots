@@ -42,12 +42,14 @@ printf 'Installed dots to %s/dots\n' "$DESTINATION"
 # ~/.local/bin, so say how to run dots rather than leave "command not found".
 # The advice names the startup file of the user's shell: zsh's on macOS, where
 # it is the default; on Linux, bash's, zsh's, or else the POSIX ~/.profile.
+# macOS terminals start login shells, which read ~/.zprofile; Linux terminals
+# start non-login ones, which read ~/.zshrc and ~/.bashrc instead.
 if test "$(uname -s 2>/dev/null)" = Darwin; then
   startup=.zprofile restart='exec zsh -l'
 else
   case ${SHELL:-} in
     bash|*/bash) startup=.bashrc restart='exec bash' ;;
-    zsh|*/zsh) startup=.zprofile restart='exec zsh -l' ;;
+    zsh|*/zsh) startup=.zshrc restart='exec zsh' ;;
     *) startup=.profile restart='. ~/.profile' ;;
   esac
 fi
