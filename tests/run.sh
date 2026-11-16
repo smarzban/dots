@@ -1174,7 +1174,8 @@ for gs_name in path override; do
 done
 ln -s "$TMP/git-path" "$gs_bin/git"
 gs_home=$TMP/home-git-path; mkdir -p "$gs_home"
-PATH=$gs_bin:$PATH HOME=$gs_home DOTS_DATA_DIR=$gs_home/data DOTS_GITLEAKS=$MOCK "$DOTS" init "$gs_remote" main >/dev/null 2>&1; gs_default=$?
+# The caller's own DOTS_GIT or DOTS_PERL must not stand in for the default.
+env -u DOTS_GIT -u DOTS_PERL PATH=$gs_bin:$PATH HOME=$gs_home DOTS_DATA_DIR=$gs_home/data DOTS_GITLEAKS=$MOCK "$DOTS" init "$gs_remote" main >/dev/null 2>&1; gs_default=$?
 if test "$(uname -s)" = Darwin; then gs_want=empty; else gs_want=used; fi
 if test -s "$TMP/git-path.log"; then gs_got=used; else gs_got=empty; fi
 if test "$gs_default" -eq 0 && test "$gs_got" = "$gs_want"; then pass "the default Git suits the platform"; else fail "the default Git suits the platform ($gs_got)"; fi
