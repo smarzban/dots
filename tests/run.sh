@@ -1043,11 +1043,12 @@ remote_edit "$remote" "printf '@@DOTS_HOME@@/x\\n' > \"\$1/.config/example/setti
 DOTS_TEST_GITLEAKS_FAIL=1 run_sync "$gs_home" '' >/dev/null 2>&1
 if test "$gs_blocked" = yes && test "$(cat "$gs_home/.config/example/settings")" = "$gs_home/x"; then pass "home paths: sync scans incoming files before writing them"; else fail "home paths: sync scans incoming files before writing them"; fi
 
-# The home folder followed by a name character (_ ~ + @ or a byte from 0x80) is a longer
-# name and stays as it is; followed by "/", a quote or the end of the file it is translated.
+# The home folder next to a name character (_ ~ + @ or a byte from 0x80) is part of a
+# longer name and stays as it is; between a space or quote and "/", a quote or the end
+# of the file it is translated.
 bd_remote=$TMP/home-boundary.git; bd_a=$TMP/hn/ann; bd_b=$TMP/ho/ben; mkdir -p "$bd_a" "$bd_b"
 run_derived_default_init "$bd_a" "$bd_remote" $'y\n' >/dev/null 2>&1 || exit 1
-bd_shape() { printf '%s_old %s~ %s+ %s@ %s\303\251 x\n%s/ok "%s" %s' "$1" "$1" "$1" "$1" "$1" "$2" "$2" "$2"; }
+bd_shape() { printf '%s_old %s~ %s+ %s@ %s\303\251 x\n~%s/x +%s/x @%s/x \303\251%s/x\n%s/ok "%s" %s' "$1" "$1" "$1" "$1" "$1" "$1" "$1" "$1" "$1" "$2" "$2" "$2"; }
 bd_shape "$bd_a" "$bd_a" >"$bd_a/.zprofile"
 bd_shape "$bd_a" @@DOTS_HOME@@ >"$TMP/bd-stored"; bd_shape "$bd_a" "$bd_b" >"$TMP/bd-b-zprofile"
 run_update "$bd_a" "$bd_remote" $'1\ny\nShare\n' >/dev/null 2>&1
