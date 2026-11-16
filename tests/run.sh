@@ -1043,5 +1043,19 @@ remote_edit "$remote" "printf '@@DOTS_HOME@@/x\\n' > \"\$1/.config/example/setti
 DOTS_TEST_GITLEAKS_FAIL=1 run_sync "$gs_home" '' >/dev/null 2>&1
 if test "$gs_blocked" = yes && test "$(cat "$gs_home/.config/example/settings")" = "$gs_home/x"; then pass "home paths: sync scans incoming files before writing them"; else fail "home paths: sync scans incoming files before writing them"; fi
 
+# The home folder followed by a name character (_ ~ + @ or a byte from 0x80) is a longer
+# name and stays as it is; followed by "/", a quote or the end of the file it is translated.
+bd_remote=$TMP/home-boundary.git; bd_a=$TMP/hn/ann; bd_b=$TMP/ho/ben; mkdir -p "$bd_a" "$bd_b"
+run_derived_default_init "$bd_a" "$bd_remote" $'y\n' >/dev/null 2>&1 || exit 1
+bd_shape() { printf '%s_old %s~ %s+ %s@ %s\303\251 x\n%s/ok "%s" %s' "$1" "$1" "$1" "$1" "$1" "$2" "$2" "$2"; }
+bd_shape "$bd_a" "$bd_a" >"$bd_a/.zprofile"
+bd_shape "$bd_a" @@DOTS_HOME@@ >"$TMP/bd-stored"; bd_shape "$bd_a" "$bd_b" >"$TMP/bd-b-zprofile"
+run_update "$bd_a" "$bd_remote" $'1\ny\nShare\n' >/dev/null 2>&1
+bd_ref=$(/usr/bin/git --git-dir="$bd_remote" for-each-ref --format='%(refname)' 'refs/heads/dots/update-*' | head -1)
+test -n "$bd_ref" && /usr/bin/git --git-dir="$bd_remote" update-ref refs/heads/main "$bd_ref" && /usr/bin/git --git-dir="$bd_remote" update-ref -d "$bd_ref"
+/usr/bin/git --git-dir="$bd_remote" show main:.zprofile >"$TMP/bd-blob" 2>/dev/null
+expect_ok run_dots "$bd_b" init "$bd_remote" main
+if test -n "$bd_ref" && cmp -s "$TMP/bd-blob" "$TMP/bd-stored" && cmp -s "$bd_b/.zprofile" "$TMP/bd-b-zprofile"; then pass "home paths: a home folder followed by a name character is left alone"; else fail "home paths: a home folder followed by a name character is left alone"; fi
+
 printf '%s tests passed, %s failed\n' "$PASS" "$FAIL"
 test "$FAIL" -eq 0

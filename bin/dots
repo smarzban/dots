@@ -222,7 +222,8 @@ validate_tree() {
 # The repository stores a file with this Mac's home folder replaced by PLACEHOLDER
 # (its stored form); each Mac writes its own home folder back in (its live form).
 # The home folder is replaced only where it is a whole path: not after a name
-# character or "/", and not before a name character. The manifest is never
+# character or "/", and not before a name character. Name characters are
+# A-Z a-z 0-9 . _ ~ + @ - and every byte from 0x80 up. The manifest is never
 # translated. translate_file stored|live SRC DST copies byte for byte otherwise.
 # Status 3: SRC already contains PLACEHOLDER (stored only), which translating back
 # would silently turn into a home folder.
@@ -239,7 +240,7 @@ translate_file() {
     $data = "" unless defined $data;
     if ($direction eq "stored") {
       exit 3 if index($data, $mark) >= 0;
-      $data =~ s{(?<![A-Za-z0-9._/-])\Q$home\E(?![A-Za-z0-9._-])}{$mark}g if length $home;
+      $data =~ s{(?<![A-Za-z0-9._~+\@\x80-\xff/-])\Q$home\E(?![A-Za-z0-9._~+\@\x80-\xff-])}{$mark}g if length $home;
     } elsif ($direction eq "live") {
       $data =~ s{\Q$mark\E}{$home}g;
     } else {
